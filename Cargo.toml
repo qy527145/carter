@@ -2,6 +2,8 @@
 name = "carter"
 version = "0.1.0"
 edition = "2024"
+description = "Carter — a Rust agent CLI with an interactive TUI, multi-provider LLM support, skills, and MCP integration."
+license = "Apache-2.0"
 
 [dependencies]
 genai = "0.6.5"
