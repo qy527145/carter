@@ -3,6 +3,7 @@
 
 mod event;
 pub mod genai_provider;
+mod llm_log;
 
 pub use event::{Event, StopReason, ToolCall, Usage};
 
@@ -38,7 +39,7 @@ pub enum Message {
 }
 
 /// 工具规格（下发给模型的工具声明）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
