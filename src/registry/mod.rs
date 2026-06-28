@@ -52,9 +52,11 @@ pub fn resolve_model(
         ))
     })?;
 
-    // 用户面绑定覆盖：provider 指向 config 的 [providers.X]；api_name 下发给端点。
+    // 用户面绑定覆盖：key = 用户引用（provider/model）；provider 指向 config 的 [providers.X]；
+    // api_name 下发给端点 —— 省略时默认取**配置块名**（model_name），便于直接用真实模型名做块名。
+    info.key = reference.to_string();
     info.provider = provider_name.to_string();
-    info.api_name = entry.api_name.clone().unwrap_or_else(|| model_id.to_string());
+    info.api_name = entry.api_name.clone().unwrap_or_else(|| model_name.to_string());
     if entry.default_reasoning.is_some() {
         info.default_reasoning = entry.default_reasoning.clone();
     }
@@ -91,6 +93,7 @@ kind = "anthropic"
     fn resolves_with_overrides() {
         let cfg = config_with_model();
         let info = resolve_model(&cfg, CACHE, "ws/sonnet").unwrap();
+        assert_eq!(info.key, "ws/sonnet");
         assert_eq!(info.provider, "ws");
         assert_eq!(info.api_name, "claude-sonnet-4-6");
         assert_eq!(info.context_window, 200000);
@@ -98,17 +101,19 @@ kind = "anthropic"
     }
 
     #[test]
-    fn api_name_defaults_to_model_id() {
+    fn api_name_defaults_to_block_name() {
+        // 直接用真实模型名做块名、省略 api_name → api_name 取块名。
         let toml = r#"
 [providers.p]
 kind = "anthropic"
 
-  [providers.p.models.s]
+  [providers.p.models.claude-sonnet-4-6]
   meta = "anthropic/claude-sonnet-4-5"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let info = resolve_model(&cfg, CACHE, "p/s").unwrap();
-        assert_eq!(info.api_name, "claude-sonnet-4-5");
+        let info = resolve_model(&cfg, CACHE, "p/claude-sonnet-4-6").unwrap();
+        assert_eq!(info.api_name, "claude-sonnet-4-6");
+        assert_eq!(info.key, "p/claude-sonnet-4-6");
     }
 
     #[test]

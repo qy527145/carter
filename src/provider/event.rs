@@ -50,7 +50,7 @@ impl Usage {
 }
 
 /// 工具调用。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

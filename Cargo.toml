@@ -1,6 +1,6 @@
 [package]
 name = "carter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Carter — a Rust agent CLI with an interactive TUI, multi-provider LLM support, skills, and MCP integration."
 license = "Apache-2.0"
@@ -20,9 +20,13 @@ futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 会话 id。仅 src/session/ 使用。
+uuid = { version = "1", features = ["v4"] }
 glob = "0.3"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
+# 生成 shell 补全脚本（carter completion <shell>）。
+clap_complete = "4"
 unicode-width = "0.2"
 anyhow = "1"
 thiserror = "2"

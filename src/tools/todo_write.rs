@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use super::{Tool, ToolResult};
 
 /// 单条待办的状态。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
     Pending,
     InProgress,
@@ -26,7 +27,7 @@ impl TodoStatus {
 }
 
 /// 一条待办项（注意力复诵用）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     /// 祈使形描述（待办内容）。
     pub content: String,

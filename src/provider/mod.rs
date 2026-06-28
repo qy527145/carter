@@ -26,7 +26,7 @@ pub struct ChatRequest {
 
 /// 会话消息。
 #[allow(dead_code)] // System 变体预留给 system prompt 注入
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Message {
     System(String),
     User(String),

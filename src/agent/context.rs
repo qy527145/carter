@@ -96,6 +96,13 @@ pub async fn compact(
         rebuilt.extend(recent);
         let after = estimate_tokens(&rebuilt);
         thread.messages = rebuilt;
+        // 落盘压缩后的全量快照（resume 重放据此整体替换，见 docs/04）。
+        if let Some(rec) = thread.recorder() {
+            rec.record(crate::session::RecordKind::Compacted {
+                tier: tier.to_string(),
+                messages: thread.messages.clone(),
+            });
+        }
         ui.emit(UiEvent::Notice(format!(
             "[compact] {tier} rolling summary applied: ~{after} tokens (est)"
         )));

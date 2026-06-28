@@ -207,6 +207,13 @@ pub async fn run_turn(
         // 串行执行每个工具调用，结果按序回灌。
         for tc in &pending_calls {
             ui.emit(tool_call_started(tc));
+            // 写前检查点：对文件类工具，先快照目标文件当前内容（供 /rewind）。
+            let paths = super::checkpoint::mutating_paths(&tc.name, &tc.args);
+            if !paths.is_empty() {
+                thread
+                    .checkpoints
+                    .snapshot(format!("{} {}", tc.name, paths[0].display()), &paths);
+            }
             let result = tools.dispatch(&tc.name, tc.args.clone()).await;
             let first = result.content.lines().next().unwrap_or("");
             ui.emit(UiEvent::ToolResult {
@@ -216,7 +223,7 @@ pub async fn run_turn(
             // todo_write 特判：成功则把 todo 写入 Thread.todos（工具本身只校验+回显）。
             if tc.name == "todo_write" && result.ok {
                 if let Ok(todos) = parse_todos(&tc.args) {
-                    thread.todos = todos;
+                    thread.set_todos(todos);
                     ui.emit(UiEvent::TodoUpdated(thread.todos.clone()));
                 }
             }
