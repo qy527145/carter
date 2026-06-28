@@ -7,6 +7,7 @@ mod edit_file;
 mod glob_tool;
 mod grep;
 mod read_file;
+mod save_memory;
 mod todo_write;
 mod write_file;
 
@@ -72,6 +73,7 @@ impl ToolRegistry {
                 Box::new(glob_tool::Glob),
                 Box::new(grep::Grep),
                 Box::new(todo_write::TodoWrite),
+                Box::new(save_memory::SaveMemory),
             ],
         }
     }

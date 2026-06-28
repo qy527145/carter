@@ -26,6 +26,16 @@ pub fn skills_dir() -> PathBuf {
     carter_home().join("skills")
 }
 
+/// `<root>/system.md`（自定义系统提示词文件的约定位置；存在则覆盖内置人设）。
+pub fn system_prompt_path() -> PathBuf {
+    carter_home().join("system.md")
+}
+
+/// `<root>/CARTER.md`（全局记忆文件；多层记忆注入的最外层）。
+pub fn global_memory_path() -> PathBuf {
+    carter_home().join("CARTER.md")
+}
+
 /// `<root>/carter.log`（运行日志；TUI 模式下 tracing 写此处而非终端）。
 pub fn log_path() -> PathBuf {
     carter_home().join("carter.log")

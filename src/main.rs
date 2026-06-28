@@ -4,6 +4,8 @@ mod config;
 mod cost;
 mod error;
 mod mcp;
+mod memory;
+mod prompt;
 mod provider;
 mod registry;
 mod session;
@@ -64,6 +66,14 @@ struct RunArgs {
     /// 模型引用 `provider/model`（缺省取配置 agent.model）。
     #[arg(long)]
     model: Option<String>,
+
+    /// 自定义系统提示词文件（覆盖内置「特工卡特」人设 + 配置里的 agent.system_prompt_file）。
+    #[arg(long, value_name = "PATH")]
+    system_prompt_file: Option<String>,
+
+    /// 本次运行不注入多层记忆（CARTER.md / AGENTS.md）。
+    #[arg(long)]
+    no_memory: bool,
 
     /// 关闭思考内容输出。
     #[arg(long)]
@@ -148,7 +158,7 @@ async fn run() -> Result<std::process::ExitCode> {
 
     // 尽早加载配置：先设环境变量（代理等，须早于任何 HTTP 客户端 / models.dev 抓取），
     // 再据此初始化 tracing（含可选的请求调试日志）。
-    let config = Config::load()?;
+    let mut config = Config::load()?;
     apply_env(&config.env);
     init_tracing();
 
@@ -168,6 +178,11 @@ async fn run() -> Result<std::process::ExitCode> {
 
     let args = cli.run;
 
+    // CLI `--system-prompt-file` 覆盖配置里的 agent.system_prompt_file（优先级最高）。
+    if let Some(path) = &args.system_prompt_file {
+        config.agent.system_prompt_file = Some(path.clone());
+    }
+
     // 模型元数据：读 ~/.carter/models.json 缓存（缺失给友好提示）。
     let cache_json = fetch::read_cache()?;
 
@@ -186,22 +201,27 @@ async fn run() -> Result<std::process::ExitCode> {
 
     let show_thinking = config.reasoning.show_thinking && !args.no_thinking;
 
-    // Skills 目录：发现后注入 system prompt；正文由 `skill` 工具按需加载。
+    // Skills 目录：发现后注入 system；正文由 `skill` 工具按需加载。
     let skills_dir = crate::config::paths::skills_dir();
     let skill_metas = if config.skills.enabled {
         skills::discover(&skills_dir)
     } else {
         Vec::new()
     };
-    let system_prompt = if skill_metas.is_empty() {
-        None
-    } else {
-        Some(skills::render_catalog(&skill_metas))
-    };
 
     // 会话解析：resume/fork/continue/新建。在模式分发前完成，oneshot 与 TUI 共用。
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let (thread, session_meta) = resolve_session(&cwd, &model_name, &args)?;
+
+    // system 分段数组（按序：人设 + skills + 多层记忆 + 运行环境）。供 oneshot 与 TUI 共用。
+    let system = assemble_system(
+        &config,
+        &cwd,
+        &model.key,
+        session_meta.git.as_ref(),
+        &skill_metas,
+        !args.no_memory,
+    );
 
     // 模式分发：有 prompt 或 --no-tui → 一次性 stdout；否则交互式 TUI REPL。
     if args.prompt.is_some() || args.no_tui {
@@ -215,7 +235,7 @@ async fn run() -> Result<std::process::ExitCode> {
             fast_model,
             config,
             show_thinking,
-            system_prompt,
+            system,
         )
         .await
     } else {
@@ -230,11 +250,41 @@ async fn run() -> Result<std::process::ExitCode> {
             cache_json,
             show_thinking,
             model_name,
-            system_prompt,
+            system,
             skill_metas,
         )
         .await
     }
+}
+
+/// 组装 system 分段数组：人设（内置或自定义文件）→ skills 目录 → 多层记忆 → 运行环境。
+/// 每段非空才入数组；底座据此发往 wire 的 system 数组。`memory_enabled=false` 跳过记忆段。
+fn assemble_system(
+    config: &Config,
+    cwd: &std::path::Path,
+    model_label: &str,
+    git: Option<&session::GitInfo>,
+    skill_metas: &[crate::skills::SkillMeta],
+    memory_enabled: bool,
+) -> Vec<String> {
+    let mut system: Vec<String> = Vec::new();
+    system.push(crate::prompt::base(config));
+    if !skill_metas.is_empty() {
+        system.push(crate::skills::render_catalog(skill_metas));
+    }
+    if memory_enabled {
+        let memory = crate::memory::load(cwd);
+        if !memory.is_empty() {
+            system.push(memory);
+        }
+    }
+    system.push(crate::prompt::project_info(
+        cwd,
+        model_label,
+        git,
+        crate::session::now_ms(),
+    ));
+    system
 }
 
 /// 解析模型引用 → (ModelInfo, provider)。按 model.provider 查 `[providers.*]`，
@@ -427,6 +477,7 @@ fn build_tools(
     provider: Arc<dyn LlmProvider>,
     model: crate::registry::ModelInfo,
     agent_cfg: crate::config::AgentConfig,
+    base_system: String,
     cancel: CancelToken,
     mcp_tools: Vec<Box<dyn crate::tools::Tool>>,
 ) -> ToolRegistry {
@@ -436,7 +487,13 @@ fn build_tools(
             crate::config::paths::skills_dir(),
         )));
     }
-    tools.push(Box::new(TaskTool::new(provider, model, agent_cfg, cancel)));
+    tools.push(Box::new(TaskTool::new(
+        provider,
+        model,
+        agent_cfg,
+        base_system,
+        cancel,
+    )));
     for t in mcp_tools {
         tools.push(t);
     }
@@ -453,13 +510,15 @@ async fn run_oneshot(
     fast_model: crate::registry::ModelInfo,
     config: Config,
     show_thinking: bool,
-    system_prompt: Option<String>,
+    system: Vec<String>,
 ) -> Result<std::process::ExitCode> {
     // 续接时 thread 已含历史；追加本次 prompt（并落盘）。
     thread.append_user(prompt);
+    // 子 agent 复用人设段（system[0]）作为其 base system。
+    let base_system = system.first().cloned().unwrap_or_default();
     let run_opts = RunOptions {
         show_thinking,
-        system_prompt,
+        system,
         compact_model: Some(crate::agent::CompactModel {
             provider: fast_provider,
             model: fast_model,
@@ -472,6 +531,7 @@ async fn run_oneshot(
         provider.clone(),
         model.clone(),
         config.agent.clone(),
+        base_system,
         cancel.clone(),
         mcp_tools,
     );
@@ -508,7 +568,7 @@ async fn run_tui(
     cache_json: String,
     show_thinking: bool,
     model_label: String,
-    system_prompt: Option<String>,
+    system: Vec<String>,
     skill_metas: Vec<crate::skills::SkillMeta>,
 ) -> Result<std::process::ExitCode> {
     use tokio::sync::mpsc::unbounded_channel;
@@ -588,9 +648,11 @@ async fn run_tui(
     let agent_cancel = cancel.clone();
     let agent_task = tokio::spawn(async move {
         let mut thread = thread;
+        // 子 agent 复用人设段（system[0]）作为其 base system。
+        let base_system = system.first().cloned().unwrap_or_default();
         let run_opts = RunOptions {
             show_thinking,
-            system_prompt,
+            system,
             compact_model: Some(crate::agent::CompactModel {
                 provider: fast_provider.clone(),
                 model: fast_model.clone(),
@@ -601,6 +663,7 @@ async fn run_tui(
             provider.clone(),
             model.clone(),
             config.agent.clone(),
+            base_system,
             agent_cancel.clone(),
             mcp_tools,
         );

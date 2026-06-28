@@ -4,7 +4,7 @@
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest as GenaiChatRequest, ChatStreamEvent,
+    CacheControl, ChatMessage, ChatOptions, ChatRequest as GenaiChatRequest, ChatStreamEvent,
     ReasoningEffort as GenaiReasoning, StopReason as GenaiStopReason, Tool as GenaiTool,
     ToolCall as GenaiToolCall, ToolResponse as GenaiToolResponse, Usage as GenaiUsage,
 };
@@ -102,8 +102,17 @@ impl Default for GenaiProvider {
 impl LlmProvider for GenaiProvider {
     async fn stream(&self, req: ChatRequest) -> crate::Result<EventStream> {
         let mut greq = GenaiChatRequest::default();
-        if let Some(sys) = &req.system {
-            greq = greq.with_system(sys.clone());
+        // system 分段 → genai 的 system-role 消息（按序，顺序由 iter_systems 保留）。
+        // 在最后一段打 cache_control 断点：既触发 Anthropic 的 system **数组**多段格式
+        // （genai 仅当任一 system 段带 cache_control 时才输出数组，否则拼成单串），
+        // 又把整个 system 前缀纳入 prompt cache（系统段在单次会话内是稳定的）。
+        let sys_last = req.system.len().saturating_sub(1);
+        for (i, seg) in req.system.iter().enumerate() {
+            let mut m = ChatMessage::system(seg.clone());
+            if i == sys_last {
+                m = m.with_options(CacheControl::Ephemeral);
+            }
+            greq = greq.append_message(m);
         }
         for msg in &req.messages {
             greq = greq.append_message(to_genai_message(msg));

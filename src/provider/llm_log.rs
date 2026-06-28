@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-use crate::session::now_ms;
+use crate::session::{civil_from_days, now_ms};
 
 /// 写入一条交换记录（已组装好的 JSON）。按 UTC 日期落到 `<dir>/<YYYY-MM-DD>.jsonl`。
 pub fn write_exchange(dir: &Path, entry: &serde_json::Value) {
@@ -54,20 +54,6 @@ fn ymd_hms(ms: u64) -> (i64, u32, u32, u32, u32, u32, u32) {
     let mi = ((rem % 3600) / 60) as u32;
     let s = (rem % 60) as u32;
     (y, mo, d, h, mi, s, (ms % 1000) as u32)
-}
-
-/// 自 1970-01-01 的天数 → (年, 月, 日)。Howard Hinnant 的 civil_from_days 算法。
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-    (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 #[cfg(test)]
