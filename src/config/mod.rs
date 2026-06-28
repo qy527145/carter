@@ -20,6 +20,20 @@ pub struct Config {
     pub skills: SkillsConfig,
     pub mcp: McpConfig,
     pub providers: HashMap<String, ProviderConfig>,
+    /// 启动时设置的环境变量（如 http_proxy / https_proxy）。在建任何 HTTP 客户端前生效。
+    pub env: HashMap<String, String>,
+    /// 调试开关。
+    pub debug: DebugConfig,
+}
+
+/// 调试开关。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DebugConfig {
+    /// 记录每次 LLM 请求的详情到独立的按天 jsonl 日志（默认 ~/.carter/debug/llm_log/）。
+    pub log_requests: bool,
+    /// 自定义 LLM 请求日志目录（省略用默认 ~/.carter/debug/llm_log）。
+    pub llm_log_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +123,8 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             mcp: McpConfig::default(),
             providers: HashMap::new(),
+            env: HashMap::new(),
+            debug: DebugConfig::default(),
         }
     }
 }
@@ -215,6 +231,27 @@ kind = "anthropic"
 
         let cfg: Config = toml::from_str("[agent]\nfast_model = \"ws/haiku\"\n").unwrap();
         assert_eq!(cfg.agent.fast_model.as_deref(), Some("ws/haiku"));
+    }
+
+    #[test]
+    fn env_and_debug_default_empty_and_parse() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.env.is_empty());
+        assert!(!cfg.debug.log_requests);
+
+        let toml = r#"
+[env]
+http_proxy = "http://127.0.0.1:7890"
+
+[debug]
+log_requests = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.env.get("http_proxy").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(cfg.debug.log_requests);
     }
 
     #[test]

@@ -31,6 +31,11 @@ pub fn log_path() -> PathBuf {
     carter_home().join("carter.log")
 }
 
+/// `<root>/debug/llm_log`（大模型请求日志目录，按天拆分 jsonl）。
+pub fn llm_log_dir() -> PathBuf {
+    carter_home().join("debug").join("llm_log")
+}
+
 /// 用户 home 目录：Windows `%USERPROFILE%`，其它 `$HOME`。缺失则回落当前目录。
 fn home_dir() -> PathBuf {
     #[cfg(windows)]

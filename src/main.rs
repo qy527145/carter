@@ -92,8 +92,6 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    init_tracing();
-
     match run().await {
         Ok(code) => code,
         Err(e) => {
@@ -105,6 +103,7 @@ async fn main() -> std::process::ExitCode {
 
 /// tracing 写日志文件 `~/.carter/carter.log`（append、无 ANSI），避免 warn 喷到终端
 /// 污染 inline TUI viewport / 退出后残留。文件打不开则回落 stderr（oneshot 仍可见）。
+/// LLM 请求日志是独立的（见 provider::llm_log），不走这里。
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
@@ -134,8 +133,24 @@ fn init_tracing() {
     }
 }
 
+/// 启动时把 `[env]` 配置项设进进程环境（如 http_proxy）。须在建任何 HTTP 客户端前调用。
+fn apply_env(env: &std::collections::HashMap<String, String>) {
+    for (k, v) in env {
+        // SAFETY: 启动早期、尚未 spawn 任务 / 建 HTTP 客户端，无并发读 env 者。
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
 async fn run() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
+
+    // 尽早加载配置：先设环境变量（代理等，须早于任何 HTTP 客户端 / models.dev 抓取），
+    // 再据此初始化 tracing（含可选的请求调试日志）。
+    let config = Config::load()?;
+    apply_env(&config.env);
+    init_tracing();
 
     // 子命令分发。
     match &cli.command {
@@ -152,7 +167,6 @@ async fn run() -> Result<std::process::ExitCode> {
     }
 
     let args = cli.run;
-    let config = Config::load()?;
 
     // 模型元数据：读 ~/.carter/models.json 缓存（缺失给友好提示）。
     let cache_json = fetch::read_cache()?;
@@ -231,9 +245,17 @@ fn resolve_provider(
     model_ref: &str,
 ) -> Result<(crate::registry::ModelInfo, Arc<dyn LlmProvider>)> {
     let model = crate::registry::resolve_model(config, cache_json, model_ref)?;
+    // LLM 请求日志目录：config 覆盖 or 默认 ~/.carter/debug/llm_log。
+    let log_dir = config
+        .debug
+        .llm_log_dir
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::config::paths::llm_log_dir);
+    let debug = config.debug.log_requests;
     let provider: Arc<dyn LlmProvider> = match config.providers.get(&model.provider) {
-        Some(pcfg) => Arc::new(GenaiProvider::from_provider_config(pcfg)?),
-        None => Arc::new(GenaiProvider::new()),
+        Some(pcfg) => Arc::new(GenaiProvider::from_provider_config(pcfg, debug, log_dir)?),
+        None => Arc::new(GenaiProvider::new(debug, log_dir)),
     };
     Ok((model, provider))
 }
