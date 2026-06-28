@@ -42,6 +42,9 @@ pub struct AgentConfig {
     pub model: String,
     /// 上下文压缩 / 标题生成专用模型（`provider/model` 引用）。省略则回落主模型。
     pub fast_model: Option<String>,
+    /// 自定义系统提示词文件路径（覆盖内置人设）。省略时回落约定位置
+    /// `~/.carter/system.md`，再无则用内置默认。
+    pub system_prompt_file: Option<String>,
     pub max_turns: u32,
     pub max_output_tokens: Option<u32>,
     /// 是否启用上下文自动压缩。
@@ -134,6 +137,7 @@ impl Default for AgentConfig {
         Self {
             model: "sonnet".to_string(),
             fast_model: None,
+            system_prompt_file: None,
             max_turns: 50,
             max_output_tokens: Some(16000),
             compact_enabled: true,

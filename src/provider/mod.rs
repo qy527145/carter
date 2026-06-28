@@ -17,7 +17,9 @@ use crate::registry::ReasoningEffort;
 pub struct ChatRequest {
     /// 模型的 API 名（已由 registry 解析自别名）。
     pub model_api_name: String,
-    pub system: Option<String>,
+    /// 系统提示词分段（按序：人设 + skills + 多层记忆 + 运行环境）。
+    /// 底座映射成 wire 上的 system 数组；空 = 不发 system。
+    pub system: Vec<String>,
     pub messages: Vec<Message>,
     /// 工具定义（支持工具的模型才下发）。
     pub tools: Vec<ToolSpec>,

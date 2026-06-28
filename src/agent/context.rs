@@ -197,7 +197,7 @@ async fn run_summary(
 ) -> crate::Result<String> {
     let req = ChatRequest {
         model_api_name: model.api_name.clone(),
-        system: Some(system.to_string()),
+        system: vec![system.to_string()],
         messages: vec![Message::User(format!("【待压缩历史】\n{rendered}"))],
         tools: Vec::new(),
         reasoning: None,

@@ -41,8 +41,9 @@ pub enum TurnOutcome {
 /// 控制流式输出的渲染选项。
 pub struct RunOptions {
     pub show_thinking: bool,
-    /// 注入到每轮请求的 system prompt（如 Skills 目录）。None = 不发 system。
-    pub system_prompt: Option<String>,
+    /// 注入到每轮请求的 system 分段（按序：人设 + skills + 多层记忆 + 运行环境）。
+    /// 空 = 不发 system。
+    pub system: Vec<String>,
     /// 上下文压缩专用模型；None = 复用主 provider+model。
     pub compact_model: Option<CompactModel>,
 }
@@ -106,7 +107,7 @@ pub async fn run_turn(
 
         let req = ChatRequest {
             model_api_name: model.api_name.clone(),
-            system: run_opts.system_prompt.clone(),
+            system: run_opts.system.clone(),
             messages,
             tools: tool_specs.clone(),
             reasoning: model.default_reasoning.clone(),

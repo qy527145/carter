@@ -25,6 +25,8 @@ pub struct TaskTool {
     provider: Arc<dyn LlmProvider>,
     model: ModelInfo,
     agent_cfg: AgentConfig,
+    /// 子 agent 的 system（内置人设 / 工程纪律）；由主进程解析后传入，与主 agent 一致。
+    base_system: String,
     /// 父 cancel：用于派生子 cancel（父取消则子取消），但**绝不**直接传给子 run_turn
     /// （run_turn 取消后会 reset，会清掉父信号）。
     parent_cancel: CancelToken,
@@ -35,12 +37,14 @@ impl TaskTool {
         provider: Arc<dyn LlmProvider>,
         model: ModelInfo,
         agent_cfg: AgentConfig,
+        base_system: String,
         parent_cancel: CancelToken,
     ) -> Self {
         Self {
             provider,
             model,
             agent_cfg,
+            base_system,
             parent_cancel,
         }
     }
@@ -88,7 +92,8 @@ impl Tool for TaskTool {
         let tools = ToolRegistry::builtin();
         let run_opts = RunOptions {
             show_thinking: false,
-            system_prompt: None,
+            // 子 agent 也带内置人设 / 工程纪律，保持行为一致；不注入 skills / 记忆 / 运行环境。
+            system: vec![self.base_system.clone()],
             compact_model: None,
         };
         let mut cfg = self.agent_cfg.clone();

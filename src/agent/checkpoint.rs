@@ -110,6 +110,14 @@ pub fn mutating_paths(name: &str, args: &serde_json::Value) -> Vec<PathBuf> {
             .and_then(|v| v.as_str())
             .map(|p| vec![PathBuf::from(p)])
             .unwrap_or_default(),
+        // save_memory 追加写 CARTER.md：按 scope 推断路径，纳入 /rewind。
+        "save_memory" => {
+            let path = match args.get("scope").and_then(|v| v.as_str()).unwrap_or("project") {
+                "global" => crate::config::paths::global_memory_path(),
+                _ => PathBuf::from("CARTER.md"),
+            };
+            vec![path]
+        }
         _ => Vec::new(),
     }
 }
