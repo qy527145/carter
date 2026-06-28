@@ -12,6 +12,7 @@ mod session;
 mod skills;
 mod tools;
 mod tui;
+mod wizard;
 
 pub use error::{CarterError, Result};
 
@@ -177,6 +178,12 @@ async fn run() -> Result<std::process::ExitCode> {
     }
 
     let args = cli.run;
+
+    // 首次运行向导：无 config.toml 且处于交互式终端时，引导生成一份并重载。
+    if wizard::ensure_config().await? {
+        config = Config::load()?;
+        apply_env(&config.env);
+    }
 
     // CLI `--system-prompt-file` 覆盖配置里的 agent.system_prompt_file（优先级最高）。
     if let Some(path) = &args.system_prompt_file {
