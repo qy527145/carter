@@ -1,5 +1,6 @@
 //! Agent 层 —— 编排器、Turn 状态机、会话历史、上下文工程。
 
+pub mod checkpoint;
 pub mod context;
 pub mod subagent;
 pub mod thread;
@@ -12,4 +13,6 @@ pub use thread::Thread;
 #[allow(unused_imports)]
 pub use turn::{run_turn, CompactModel, RunOptions, TurnOutcome, TurnState};
 #[allow(unused_imports)]
-pub use ui::{CancelToken, StdoutSink, UiEvent, UiSink};
+pub use ui::{
+    replay_from_messages, CancelToken, ReplayMsg, ReplayRole, StdoutSink, UiEvent, UiSink,
+};

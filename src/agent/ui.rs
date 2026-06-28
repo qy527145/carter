@@ -5,8 +5,58 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::provider::{ToolCall, Usage};
+use crate::provider::{Message, ToolCall, Usage};
 use crate::tools::{TodoItem, TodoStatus};
+
+/// resume/fork 历史回放的一条消息（仅用于可视化，不发给模型）。
+#[derive(Debug, Clone)]
+pub struct ReplayMsg {
+    pub role: ReplayRole,
+    pub text: String,
+}
+
+/// 回放消息的角色（决定 TUI 着色）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayRole {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
+/// 把会话历史消息转成可回放的展示项（工具输出截断为单行预览）。
+pub fn replay_from_messages(msgs: &[Message]) -> Vec<ReplayMsg> {
+    let mut out = Vec::new();
+    for m in msgs {
+        match m {
+            Message::User(s) => out.push(ReplayMsg {
+                role: ReplayRole::User,
+                text: s.clone(),
+            }),
+            Message::Assistant(s) => out.push(ReplayMsg {
+                role: ReplayRole::Assistant,
+                text: s.clone(),
+            }),
+            Message::ToolCalls(calls) => {
+                for c in calls {
+                    out.push(ReplayMsg {
+                        role: ReplayRole::ToolCall,
+                        text: format!("⚙ {}({})", c.name, args_preview(&c.args)),
+                    });
+                }
+            }
+            Message::Tool { content, .. } => {
+                let first = content.lines().next().unwrap_or("");
+                out.push(ReplayMsg {
+                    role: ReplayRole::ToolResult,
+                    text: truncate_inline(first, 120),
+                });
+            }
+            Message::System(_) => {}
+        }
+    }
+    out
+}
 
 /// agent loop 渲染事件。turn.rs / context.rs 只 emit 这些，不直接碰终端。
 #[derive(Debug, Clone)]
@@ -27,6 +77,14 @@ pub enum UiEvent {
     Notice(String),
     /// 会话标题（fast 模型生成，整个会话一次）。
     Title(String),
+    /// 当前模型变更（启动 / `/model` 切换）——状态栏立即更新，不等首轮 usage。
+    ModelChanged(String),
+    /// 一条带标签的分隔线（如「上下文已清空」「已恢复会话」），可视化标记上下文边界。
+    Divider(String),
+    /// resume/fork 后把历史消息回放到视图（不发给模型，仅可视化）。
+    ReplayHistory(Vec<ReplayMsg>),
+    /// 一轮（或一次斜杠命令）处理结束 —— 让 UI 退出 streaming 态、恢复可交互。
+    Idle,
     /// 一轮结束的用量 + 成本。
     TurnUsage {
         usage: Usage,
@@ -151,6 +209,14 @@ impl UiSink for StdoutSink {
             }
             // oneshot 不生成标题；穷尽 match 需此臂。
             UiEvent::Title(_) => {}
+            UiEvent::ModelChanged(_) => {}
+            UiEvent::Divider(label) => {
+                let _ = writeln!(out, "\x1b[90m──── {label} ────\x1b[0m");
+            }
+            // oneshot 不 resume，无历史可回放。
+            UiEvent::ReplayHistory(_) => {}
+            // oneshot 无 streaming 态可恢复，忽略。
+            UiEvent::Idle => {}
             UiEvent::TurnUsage { usage, cost, model } => {
                 let _ = writeln!(
                     out,
@@ -249,5 +315,36 @@ mod tests {
     fn truncate_respects_char_boundary() {
         assert_eq!(truncate_inline("abc", 5), "abc");
         assert_eq!(truncate_inline("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn replay_maps_roles_and_truncates_tool_output() {
+        use crate::provider::ToolCall;
+        use serde_json::json;
+        let msgs = vec![
+            Message::System("sys".into()), // 跳过
+            Message::User("问题".into()),
+            Message::Assistant("回答".into()),
+            Message::ToolCalls(vec![ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                args: json!({"path": "a.rs"}),
+            }]),
+            Message::Tool {
+                call_id: "1".into(),
+                content: format!("第一行\n{}", "x".repeat(500)),
+            },
+        ];
+        let out = replay_from_messages(&msgs);
+        // System 被跳过 → 4 条。
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].role, ReplayRole::User);
+        assert_eq!(out[1].role, ReplayRole::Assistant);
+        assert_eq!(out[2].role, ReplayRole::ToolCall);
+        assert!(out[2].text.contains("read"));
+        assert_eq!(out[3].role, ReplayRole::ToolResult);
+        // 工具结果只取首行且截断（不含第二行的海量 x）。
+        assert!(out[3].text.starts_with("第一行"));
+        assert!(out[3].text.chars().count() <= 121);
     }
 }
