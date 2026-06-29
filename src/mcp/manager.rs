@@ -23,9 +23,9 @@ pub struct McpManager {
 impl McpManager {
     /// 按配置启动所有 server，返回 (manager, 工具列表)。
     /// 任一 server 失败/超时 → emit 警告并跳过（呼应 provider-fallback 风格，不致命）。
-    pub async fn start(cfg: &McpConfig) -> (Self, Vec<Box<dyn Tool>>) {
+    pub async fn start(cfg: &McpConfig) -> (Self, Vec<std::sync::Arc<dyn Tool>>) {
         let mut services = Vec::new();
-        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut tools: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
 
         // 名字排序：启动顺序可复现。
         let mut names: Vec<&String> = cfg.servers.keys().collect();
@@ -57,17 +57,17 @@ impl McpManager {
     }
 
     /// 列远端工具并映射成 `McpTool`（每个持克隆 peer）。
-    async fn collect_tools(service: &Service, server: &str) -> Result<Vec<Box<dyn Tool>>, String> {
+    async fn collect_tools(service: &Service, server: &str) -> Result<Vec<std::sync::Arc<dyn Tool>>, String> {
         let listed = service
             .list_all_tools()
             .await
             .map_err(|e| format!("{e}"))?;
 
-        let mut out: Vec<Box<dyn Tool>> = Vec::new();
+        let mut out: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         for t in listed {
             let schema = Value::Object((*t.input_schema).clone());
             let description = t.description.map(|d| d.into_owned()).unwrap_or_default();
-            out.push(Box::new(McpTool::new(
+            out.push(std::sync::Arc::new(McpTool::new(
                 service.peer().clone(),
                 server,
                 t.name.into_owned(),

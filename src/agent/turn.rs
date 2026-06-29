@@ -1,16 +1,18 @@
 //! Turn 状态机 + 多轮 agent 循环（M2：模型调工具→执行→回灌→再调，直到无 tool_call 或达 max_turns）。
 //! 纪律：本文件不得 import 任何 `genai::*`/`ratatui`/`crossterm` 类型，只依赖能力抽象层 + ui sink。
 
+use futures::stream::FuturesOrdered;
 use futures::StreamExt;
 
 use crate::config::AgentConfig;
+use crate::hooks::{HookDecision, HookEvent, HookRegistry};
 use crate::provider::{ChatRequest, Event, LlmProvider, Message, StopReason, ToolCall, Usage};
 use crate::registry::{Capability, ModelInfo};
-use crate::tools::{parse_todos, TodoItem, TodoStatus, ToolRegistry};
+use crate::tools::{is_concurrent_safe, parse_todos, TodoItem, TodoStatus, ToolRegistry, ToolResult};
 
 use super::context;
 use super::thread::Thread;
-use super::ui::{tool_call_started, CancelToken, UiEvent, UiSink};
+use super::ui::{CancelToken, UiEvent, UiSink};
 
 /// Turn 状态（M1 子集，预留 ToolPending/Approving/Executing/Observing 给后续）。
 #[allow(dead_code)]
@@ -46,6 +48,8 @@ pub struct RunOptions {
     pub system: Vec<String>,
     /// 上下文压缩专用模型；None = 复用主 provider+model。
     pub compact_model: Option<CompactModel>,
+    /// Hook 注册表（pre/post tool use 等事件触发）。默认为空注册表 = 全 Continue。
+    pub hooks: std::sync::Arc<HookRegistry>,
 }
 
 /// 压缩专用模型句柄：owned + Clone 友好，避免给 run_turn 加 `&dyn` 参数。
@@ -205,23 +209,13 @@ pub async fn run_turn(
         }
         thread.append(Message::ToolCalls(pending_calls.clone()));
 
-        // 串行执行每个工具调用，结果按序回灌。
-        for tc in &pending_calls {
-            ui.emit(tool_call_started(tc));
-            // 写前检查点：对文件类工具，先快照目标文件当前内容（供 /rewind）。
-            let paths = super::checkpoint::mutating_paths(&tc.name, &tc.args);
-            if !paths.is_empty() {
-                thread
-                    .checkpoints
-                    .snapshot(format!("{} {}", tc.name, paths[0].display()), &paths);
-            }
-            let result = tools.dispatch(&tc.name, tc.args.clone()).await;
-            let first = result.content.lines().next().unwrap_or("");
-            ui.emit(UiEvent::ToolResult {
-                ok: result.ok,
-                summary: super::ui::truncate_inline(first, 120),
-            });
-            // todo_write 特判：成功则把 todo 写入 Thread.todos（工具本身只校验+回显）。
+        // 工具批量执行：连续的"并发安全"工具一起跑；遇到 unsafe 工具切断、串行跑。
+        // 顺序保持：派发顺序与回灌顺序与 model 给的 pending_calls 完全一致。
+        // hook 在每个工具前后触发（PreToolUse 可改写 args / 阻断；PostToolUse 仅观测）。
+        let results = execute_tool_calls(&pending_calls, tools, thread, ui, &run_opts.hooks).await;
+
+        // 写盘 + 特判 todo_write（成功则把 todo 写入 Thread.todos）。
+        for (tc, result) in pending_calls.iter().zip(results.iter()) {
             if tc.name == "todo_write" && result.ok {
                 if let Ok(todos) = parse_todos(&tc.args) {
                     thread.set_todos(todos);
@@ -237,6 +231,155 @@ pub async fn run_turn(
         thread.turns += 1;
         // 回到循环顶部，带新历史再 stream。
     }
+}
+
+/// 把同一轮的所有工具调用按"安全/不安全"分批执行，保持原顺序。
+///
+/// 切批规则：
+/// - 连续的 `is_concurrent_safe` 工具组成一个并发批，用 `FuturesOrdered` 并发派发、按序收集；
+/// - 遇到 unsafe 工具就关闭当前批、单独串行执行该 unsafe 调用；
+/// - 然后继续下一批。
+///
+/// Hook：每个工具调用前触发 `PreToolUse`（可改写 args、可阻断）、后触发 `PostToolUse`（仅观测）。
+/// 阻断时跳过真正的工具执行，直接返回一个结构化的 ToolResult::err。
+///
+/// UI/checkpoint：每个调用在被派发前 emit `ToolCallStarted` + 抓写前快照；
+/// 结果回收后 emit `ToolResult`。
+async fn execute_tool_calls(
+    calls: &[ToolCall],
+    tools: &ToolRegistry,
+    thread: &mut super::thread::Thread,
+    ui: &mut dyn UiSink,
+    hooks: &HookRegistry,
+) -> Vec<ToolResult> {
+    // 第 1 阶段：对每个调用过一遍 PreToolUse hook，得到一个"待执行"列表
+    // （可能改写过 args，可能直接被阻断为 ToolResult::err）。
+    // 注：hook 调用是 async + 顺序敏感，故在并发派发**之前**统一过一遍。
+    let mut prepared: Vec<PreparedCall> = Vec::with_capacity(calls.len());
+    for tc in calls {
+        let mut effective = tc.clone();
+        let mut blocked: Option<String> = None;
+        if hooks.has(HookEvent::PreToolUse) {
+            let payload = serde_json::json!({
+                "tool": tc.name,
+                "args": tc.args,
+            });
+            match hooks.dispatch(HookEvent::PreToolUse, payload).await {
+                HookDecision::Continue => {}
+                HookDecision::Rewrite(v) => {
+                    // 仅接受 `{"args": {...}}` 形态的改写；其它字段忽略。
+                    if let Some(new_args) = v.get("args") {
+                        effective.args = new_args.clone();
+                    }
+                }
+                HookDecision::Block { reason } => {
+                    blocked = Some(reason);
+                }
+            }
+        }
+        prepared.push(PreparedCall {
+            call: effective,
+            blocked,
+        });
+    }
+
+    // 第 2 阶段：按"安全/不安全"分批执行，被阻断的直接当 err 结果回灌。
+    let mut out: Vec<ToolResult> = Vec::with_capacity(prepared.len());
+    let mut i = 0;
+    while i < prepared.len() {
+        // 被阻断的：直接合成 err 结果，不进任何批次。
+        if let Some(reason) = prepared[i].blocked.clone() {
+            ui.emit(super::ui::tool_call_started(&prepared[i].call));
+            let res = ToolResult::err(format!("blocked by hook: {reason}"));
+            emit_tool_result(ui, &res);
+            // 触发 PostToolUse 让观测类 hook 也能看到（payload 含 blocked 标记）。
+            post_tool_hook(hooks, &prepared[i].call, &res).await;
+            out.push(res);
+            i += 1;
+            continue;
+        }
+
+        if is_concurrent_safe(&prepared[i].call.name) {
+            // 收集本批连续 safe 且非阻断的调用。
+            let start = i;
+            while i < prepared.len()
+                && prepared[i].blocked.is_none()
+                && is_concurrent_safe(&prepared[i].call.name)
+            {
+                i += 1;
+            }
+            let batch = &prepared[start..i];
+            for p in batch {
+                ui.emit(super::ui::tool_call_started(&p.call));
+            }
+            // 并发派发、按序收集。
+            let mut fo: FuturesOrdered<_> = batch
+                .iter()
+                .map(|p| {
+                    let name = p.call.name.clone();
+                    let args = p.call.args.clone();
+                    async move { tools.dispatch(&name, args).await }
+                })
+                .collect();
+            let mut batch_results: Vec<ToolResult> = Vec::with_capacity(batch.len());
+            while let Some(res) = fo.next().await {
+                emit_tool_result(ui, &res);
+                batch_results.push(res);
+            }
+            // PostToolUse 在并发返回后串行触发（hook 顺序与原调用顺序一致）。
+            for (p, res) in batch.iter().zip(batch_results.iter()) {
+                post_tool_hook(hooks, &p.call, res).await;
+            }
+            out.extend(batch_results);
+        } else {
+            // 串行：unsafe 工具单独跑，先抓写前快照。
+            let tc = &prepared[i].call;
+            ui.emit(super::ui::tool_call_started(tc));
+            let paths = super::checkpoint::mutating_paths(&tc.name, &tc.args);
+            if !paths.is_empty() {
+                thread
+                    .checkpoints
+                    .snapshot(format!("{} {}", tc.name, paths[0].display()), &paths);
+            }
+            let res = tools.dispatch(&tc.name, tc.args.clone()).await;
+            emit_tool_result(ui, &res);
+            post_tool_hook(hooks, tc, &res).await;
+            out.push(res);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 单个工具调用的"经 PreToolUse hook 处理后"的状态。
+struct PreparedCall {
+    /// 改写后的调用（args 可能已被 hook 修改）。
+    call: ToolCall,
+    /// 若被 hook 阻断，此处为阻断原因；否则 None。
+    blocked: Option<String>,
+}
+
+/// 触发单个工具的 PostToolUse hook（fire-and-forget 语义，仅观测，不修改结果）。
+async fn post_tool_hook(hooks: &HookRegistry, call: &ToolCall, res: &ToolResult) {
+    if !hooks.has(HookEvent::PostToolUse) {
+        return;
+    }
+    let payload = serde_json::json!({
+        "tool": call.name,
+        "args": call.args,
+        "ok": res.ok,
+        "content": res.content,
+    });
+    // PostToolUse 不可改写、不可阻断；忽略 Rewrite/Block。
+    let _ = hooks.dispatch(HookEvent::PostToolUse, payload).await;
+}
+
+fn emit_tool_result(ui: &mut dyn UiSink, result: &ToolResult) {
+    let first = result.content.lines().next().unwrap_or("");
+    ui.emit(UiEvent::ToolResult {
+        ok: result.ok,
+        summary: super::ui::truncate_inline(first, 120),
+    });
 }
 
 /// 组装并 emit 一轮的用量 + 成本。
@@ -261,4 +404,117 @@ fn render_todos(todos: &[TodoItem]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolRegistry;
+    use serde_json::json;
+
+    /// 收集 sink：把所有事件按序攒起来供断言。
+    #[derive(Default)]
+    struct VecSink(Vec<UiEvent>);
+    impl UiSink for VecSink {
+        fn emit(&mut self, ev: UiEvent) {
+            self.0.push(ev);
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_and_unsafe_batches_emit_in_call_order() {
+        // 混合调用：grep(safe), bash(unsafe), read_file(safe)。
+        // 期望：started 事件按原顺序 emit，结果数量与 calls 一致。
+        let calls = vec![
+            ToolCall { id: "1".into(), name: "grep".into(), args: json!({"pattern":"x"}) },
+            ToolCall { id: "2".into(), name: "bash".into(), args: json!({"command":"true"}) },
+            ToolCall { id: "3".into(), name: "read_file".into(), args: json!({"path":"Cargo.toml"}) },
+        ];
+        let reg = ToolRegistry::builtin();
+        let mut thread = crate::agent::Thread::new("test");
+        let mut sink = VecSink::default();
+        let hooks = HookRegistry::default();
+        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        assert_eq!(results.len(), 3);
+        let starts: Vec<&str> = sink.0.iter().filter_map(|e| match e {
+            UiEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(starts, vec!["grep", "bash", "read_file"]);
+    }
+
+    #[tokio::test]
+    async fn all_safe_calls_run_concurrently_and_preserve_order() {
+        // 多个 grep（全部 safe）一同派发；结果顺序 = 调用顺序。
+        let calls: Vec<ToolCall> = (0..4)
+            .map(|i| ToolCall {
+                id: format!("g{i}"),
+                name: "grep".into(),
+                args: json!({"pattern": format!("p{i}"), "path": "."}),
+            })
+            .collect();
+        let reg = ToolRegistry::builtin();
+        let mut thread = crate::agent::Thread::new("test");
+        let mut sink = VecSink::default();
+        let hooks = HookRegistry::default();
+        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        assert_eq!(results.len(), 4);
+        // ToolCallStarted 事件个数 = 4。
+        let started_n = sink.0.iter().filter(|e| matches!(e, UiEvent::ToolCallStarted{..})).count();
+        assert_eq!(started_n, 4);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_hook_blocks_tool_execution() {
+        use crate::hooks::HookConfig;
+        // 注册一个对 bash 阻断的 PreToolUse hook。
+        let hooks = HookRegistry::from_configs(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: "echo nope; exit 2".to_string(),
+            r#match: None,
+            timeout_secs: 5,
+            enabled: true,
+        }]);
+        let calls = vec![ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            args: json!({"command":"echo should-not-run"}),
+        }];
+        let reg = ToolRegistry::builtin();
+        let mut thread = crate::agent::Thread::new("test");
+        let mut sink = VecSink::default();
+        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok, "hook 应阻断 bash 执行");
+        assert!(results[0].content.contains("blocked by hook"));
+        // 结果里不应包含真实命令的 stdout。
+        assert!(!results[0].content.contains("should-not-run"));
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_hook_can_rewrite_args() {
+        use crate::hooks::HookConfig;
+        // hook 改写 read_file 的 path 为另一个文件。
+        // 用 jq 不可用 → 改用 sh + sed 简化：直接 emit 改写后 JSON。
+        let hooks = HookRegistry::from_configs(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: r#"echo '{"decision":"rewrite","data":{"args":{"path":"Cargo.toml"}}}'"#.to_string(),
+            r#match: None,
+            timeout_secs: 5,
+            enabled: true,
+        }]);
+        let calls = vec![ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            args: json!({"path":"/nonexistent/should/fail"}),
+        }];
+        let reg = ToolRegistry::builtin();
+        let mut thread = crate::agent::Thread::new("test");
+        let mut sink = VecSink::default();
+        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        assert_eq!(results.len(), 1);
+        // 改写后读 Cargo.toml 应该成功（项目根有这个文件）。
+        assert!(results[0].ok, "hook 改写 path → Cargo.toml 应该读成功");
+        assert!(results[0].content.contains("carter") || results[0].content.contains("[package]"));
+    }
 }

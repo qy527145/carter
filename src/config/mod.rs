@@ -24,6 +24,9 @@ pub struct Config {
     pub env: HashMap<String, String>,
     /// 调试开关。
     pub debug: DebugConfig,
+    /// 生命周期 hook 列表（来自 `[[hooks]]` 段）。
+    #[serde(default)]
+    pub hooks: Vec<crate::hooks::HookConfig>,
 }
 
 /// 调试开关。
@@ -51,6 +54,8 @@ pub struct AgentConfig {
     pub compact_enabled: bool,
     /// 压缩触发阈值：真实 input token 超过 context_window * ratio 时压缩。
     pub compact_threshold_ratio: f64,
+    /// 子代理链最大深度（主 agent = 0，每层 +1）。缺省 3。
+    pub subagent_max_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +133,7 @@ impl Default for Config {
             providers: HashMap::new(),
             env: HashMap::new(),
             debug: DebugConfig::default(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -142,6 +148,7 @@ impl Default for AgentConfig {
             max_output_tokens: Some(16000),
             compact_enabled: true,
             compact_threshold_ratio: 0.75,
+            subagent_max_depth: None,
         }
     }
 }

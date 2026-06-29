@@ -1,6 +1,15 @@
 //! TUI 层 —— 交互式 REPL：可滚动历史 + 输入框 + 状态栏 + 流式增量渲染 + 流式中断。
 //! 隔离纪律：本模块是**唯一**允许 import `ratatui`/`crossterm` 的地方；
 //! 不得 import `genai::*`。与 agent 层经 `UiEvent` 通道 + `CancelToken` 通信。
+//!
+//! viewport 模式：**Inline + 自定义 TrackingBackend**。
+//! 底部 N 行做 TUI、定稿块经 `insert_before` 落入上方终端 scrollback —— 退出后
+//! 完整对话仍可在 shell 里上滚查看 / 选中复制。
+//! macOS 已知问题（`crossterm::cursor::position()` 与 `EventStream` 抢 stdin 锁导致 2s timeout）
+//! 由 [`tracking_backend::TrackingBackend`] 解决：拦截 `get_cursor_position` 返回追踪值，
+//! 永不发 `ESC[6n`。详见该模块文档。
+
+mod tracking_backend;
 
 use std::io;
 
@@ -12,7 +21,6 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -25,6 +33,8 @@ use crate::agent::ui::{UiEvent, UiSink};
 use crate::agent::CancelToken;
 use crate::provider::Usage;
 use crate::tools::{TodoItem, TodoStatus};
+
+use self::tracking_backend::TrackingBackend;
 
 /// 输入框最大行数（超出则框内滚动）；viewport 总高据此固定。
 const MAX_INPUT_ROWS: u16 = 8;
@@ -1092,8 +1102,10 @@ fn blank_wide_placeholders(buf: &mut ratatui::buffer::Buffer) {
 /// 但该路径逐 cell `Print(symbol())`，宽字符（CJK）的占位续单元 `symbol()` 返回 `" "`，
 /// 导致每个中文字后多一个空格。故在 buffer draw 后把宽字符的续单元 symbol 清空
 /// （`Print("")` 不输出），既保留 scrollback 又消除多余空格。
+///
+/// 不再走 ratatui 默认的 `cursor::position()` ESC[6n 路径——见模块头注释 + tracking_backend。
 fn flush_outbox(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<TrackingBackend<io::Stdout>>,
     app: &mut App,
 ) -> io::Result<()> {
     let width = terminal.get_frame().area().width.max(1);
@@ -1308,8 +1320,17 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// 跑交互式 REPL。`ui_rx` 收 agent 输出事件；`input_tx` 发用户 prompt 给 agent 任务；
-/// `cancel` 在中断时 set。返回时终端已恢复（RAII guard）。
+/// macOS 已知问题（ratatui inline + crossterm EventStream）：
+/// `Terminal::insert_before` 内部要 `cursor::position()` 读 DSR(CSI 6n) 应答，
+/// 而 `EventStream` 后台 reader 在抢 stdin —— 在快速连续多次 `insert_before`
+/// （如 resume 时 Divider + ReplayHistory + Divider 连发）下，上一次 scroll 的应答
+/// 可能延迟到本次查询之后，crossterm 默认 2s timeout 后报
+/// `The cursor position could not be read within a normal duration`，整个 TUI 死掉。
+///
+/// 修复策略：把 `insert_before` 的 Err **降级为 warn** —— 这一行 divider/历史回放可能丢，
+/// 但会话不死、用户可继续输入。比让进程崩好得多。
+/// （ratatui 0.30 的 `insert_before` 签名是 `FnOnce`，retry 需要重建闭包，故只做一次尝试。）
+
 pub async fn run(
     model: String,
     commands: Vec<CompletionItem>,
@@ -1322,7 +1343,20 @@ pub async fn run(
     cancel: CancelToken,
 ) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
+    // 关键：在 EventStream::new() **之前**做唯一一次真实 cursor::position() 查询。
+    // 此刻没有任何后台 reader 抢 stdin，crossterm 能即时收到 ESC[6n 应答，无 race。
+    // 拿到的 Position 作为 TrackingBackend 的初始锚点；之后所有 ratatui 调用
+    // get_cursor_position 都走追踪值，永不发 ESC[6n。
+    let initial_cursor = match crossterm::cursor::position() {
+        Ok((x, y)) => Position::new(x, y),
+        // 极少数环境（headless / pipe）拿不到光标也不应崩——按 (0, 0) 兜底，
+        // ratatui inline 在首次 draw autoresize 时会用最新光标位置重新计算。
+        Err(e) => {
+            tracing::warn!("tui: initial cursor::position failed ({e}); fallback to (0,0)");
+            Position::new(0, 0)
+        }
+    };
+    let backend = TrackingBackend::with_initial_cursor(io::stdout(), initial_cursor);
     // Inline viewport：底部固定 VIEWPORT_HEIGHT 行（预览 + 输入框最大高 + 状态栏）；
     // 不切 alt-screen，定稿块经 insert_before 落入上方终端 scrollback。
     let mut terminal = Terminal::with_options(
