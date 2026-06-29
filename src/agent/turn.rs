@@ -89,6 +89,18 @@ pub async fn run_turn(
     let mut needs_compaction = false;
 
     loop {
+        // PreTurn hook：观察型。提供本轮的元数据（轮次、消息条数）。
+        run_opts
+            .hooks
+            .emit(
+                HookEvent::PreTurn,
+                serde_json::json!({
+                    "turn": thread.turns,
+                    "message_count": thread.messages.len(),
+                }),
+            )
+            .await;
+
         // 进入下一轮前，若上一轮真实 token 超阈值则先压缩。
         if needs_compaction {
             // 压缩择源：配了 fast 模型用之，否则复用主 provider+model。
@@ -96,9 +108,42 @@ pub async fn run_turn(
                 Some(cm) => (&*cm.provider, &cm.model),
                 None => (provider, model),
             };
-            // 压缩内部已降级处理失败，错误仅记录不中断。
-            if let Err(e) = context::compact(thread, cprov, cmodel, compact_threshold, ui).await {
-                ui.emit(UiEvent::Notice(format!("[compact] error: {e}")));
+            // PreCompact hook：可阻断。阻断时跳过本次压缩（让 token 撞墙，模型自己处理）。
+            let pre = run_opts
+                .hooks
+                .dispatch(
+                    HookEvent::PreCompact,
+                    serde_json::json!({
+                        "message_count": thread.messages.len(),
+                        "threshold": compact_threshold,
+                    }),
+                )
+                .await;
+            match pre {
+                HookDecision::Block { reason } => {
+                    ui.emit(UiEvent::Notice(format!("[compact] skipped by hook: {reason}")));
+                }
+                _ => {
+                    // 压缩内部已降级处理失败，错误仅记录不中断。
+                    if let Err(e) =
+                        context::compact(thread, cprov, cmodel, compact_threshold, ui).await
+                    {
+                        ui.emit(UiEvent::Notice(format!("[compact] error: {e}")));
+                    } else {
+                        // 压缩成功 → fire Notification（语义对应"有重要状态变化要告知用户"）。
+                        run_opts
+                            .hooks
+                            .emit(
+                                HookEvent::Notification,
+                                serde_json::json!({
+                                    "kind": "compact_done",
+                                    "message": "context compacted",
+                                    "message_count": thread.messages.len(),
+                                }),
+                            )
+                            .await;
+                    }
+                }
             }
             needs_compaction = false;
         }
@@ -180,6 +225,7 @@ pub async fn run_turn(
                 thread.append(Message::Assistant(assistant_text));
             }
             cancel.reset();
+            emit_post_turn_and_stop(&run_opts.hooks, thread.turns, "cancelled", &total_usage).await;
             return Ok((TurnOutcome::Cancelled, total_usage));
         }
 
@@ -194,12 +240,20 @@ pub async fn run_turn(
                 StopReason::MaxTokens => TurnOutcome::Limit,
                 _ => TurnOutcome::Assistant,
             };
+            let outcome_label = match &outcome {
+                TurnOutcome::Limit => "limit",
+                TurnOutcome::Assistant => "assistant",
+                TurnOutcome::Cancelled => "cancelled",
+                TurnOutcome::Error(_) => "error",
+            };
+            emit_post_turn_and_stop(&run_opts.hooks, thread.turns, outcome_label, &total_usage).await;
             return Ok((outcome, total_usage));
         }
 
         // 达上限 → 不再执行工具，提前收尾。
         if thread.turns >= agent_cfg.max_turns {
             emit_usage(ui, &total_usage, model);
+            emit_post_turn_and_stop(&run_opts.hooks, thread.turns, "limit", &total_usage).await;
             return Ok((TurnOutcome::Limit, total_usage));
         }
 
@@ -337,9 +391,12 @@ async fn execute_tool_calls(
             ui.emit(super::ui::tool_call_started(tc));
             let paths = super::checkpoint::mutating_paths(&tc.name, &tc.args);
             if !paths.is_empty() {
-                thread
-                    .checkpoints
-                    .snapshot(format!("{} {}", tc.name, paths[0].display()), &paths);
+                let recorder = thread.recorder();
+                thread.checkpoints.snapshot_with_recorder(
+                    format!("{} {}", tc.name, paths[0].display()),
+                    &paths,
+                    recorder.as_deref(),
+                );
             }
             let res = tools.dispatch(&tc.name, tc.args.clone()).await;
             emit_tool_result(ui, &res);
@@ -360,18 +417,30 @@ struct PreparedCall {
 }
 
 /// 触发单个工具的 PostToolUse hook（fire-and-forget 语义，仅观测，不修改结果）。
+/// 工具名是 `task` 时**额外**触发 SubagentStop，方便用户只关心子 agent 生命周期。
 async fn post_tool_hook(hooks: &HookRegistry, call: &ToolCall, res: &ToolResult) {
-    if !hooks.has(HookEvent::PostToolUse) {
-        return;
+    if hooks.has(HookEvent::PostToolUse) {
+        let payload = serde_json::json!({
+            "tool": call.name,
+            "args": call.args,
+            "ok": res.ok,
+            "content": res.content,
+        });
+        // PostToolUse 不可改写、不可阻断；忽略 Rewrite/Block。
+        let _ = hooks.dispatch(HookEvent::PostToolUse, payload).await;
     }
-    let payload = serde_json::json!({
-        "tool": call.name,
-        "args": call.args,
-        "ok": res.ok,
-        "content": res.content,
-    });
-    // PostToolUse 不可改写、不可阻断；忽略 Rewrite/Block。
-    let _ = hooks.dispatch(HookEvent::PostToolUse, payload).await;
+    if call.name == "task" {
+        hooks
+            .emit(
+                HookEvent::SubagentStop,
+                serde_json::json!({
+                    "description": call.args.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                    "ok": res.ok,
+                    "output": res.content,
+                }),
+            )
+            .await;
+    }
 }
 
 fn emit_tool_result(ui: &mut dyn UiSink, result: &ToolResult) {
@@ -380,6 +449,39 @@ fn emit_tool_result(ui: &mut dyn UiSink, result: &ToolResult) {
         ok: result.ok,
         summary: super::ui::truncate_inline(first, 120),
     });
+}
+
+/// PostTurn + Stop hook 串行触发。outcome_label = "assistant" / "limit" / "cancelled" / "error"。
+/// Stop 在 PostTurn 之后立刻 fire，表示整个 run_turn 即将返回（与 PostTurn 的 1:1 关系）。
+async fn emit_post_turn_and_stop(
+    hooks: &HookRegistry,
+    turns: u32,
+    outcome: &str,
+    usage: &Usage,
+) {
+    let usage_payload = serde_json::json!({
+        "input": usage.input,
+        "output": usage.output,
+        "cache_read": usage.cache_read,
+        "cache_write": usage.cache_write,
+        "reasoning": usage.reasoning,
+    });
+    hooks
+        .emit(
+            HookEvent::PostTurn,
+            serde_json::json!({
+                "turn": turns,
+                "outcome": outcome,
+                "usage": usage_payload,
+            }),
+        )
+        .await;
+    hooks
+        .emit(
+            HookEvent::Stop,
+            serde_json::json!({ "reason": outcome }),
+        )
+        .await;
 }
 
 /// 组装并 emit 一轮的用量 + 成本。
@@ -516,5 +618,66 @@ mod tests {
         // 改写后读 Cargo.toml 应该成功（项目根有这个文件）。
         assert!(results[0].ok, "hook 改写 path → Cargo.toml 应该读成功");
         assert!(results[0].content.contains("carter") || results[0].content.contains("[package]"));
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_fires_for_task_tool() {
+        use crate::hooks::HookConfig;
+        // hook 把命中的 SubagentStop 写到临时文件，便于检验。
+        let tmp = std::env::temp_dir().join(format!(
+            "carter-subagent-stop-{}",
+            crate::session::now_ms()
+        ));
+        let tmp_str = tmp.to_string_lossy().to_string();
+        let hooks = HookRegistry::from_configs(vec![HookConfig {
+            event: HookEvent::SubagentStop,
+            command: format!("echo subagent-fired >> {tmp_str}"),
+            r#match: None,
+            timeout_secs: 5,
+            enabled: true,
+        }]);
+        // 模拟一次 task 调用（直接走 dispatch，不真正派生子 agent —— PostToolUse 路径独立）。
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "task".into(),
+            args: json!({"description":"x","prompt":"do something"}),
+        };
+        let res = ToolResult::ok("done".to_string());
+        post_tool_hook(&hooks, &call, &res).await;
+        // hook 应触发并写文件。
+        let content = std::fs::read_to_string(&tmp).unwrap_or_default();
+        assert!(content.contains("subagent-fired"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn pre_post_turn_and_stop_fire_in_order() {
+        use crate::hooks::HookConfig;
+        let tmp = std::env::temp_dir().join(format!(
+            "carter-turn-events-{}",
+            crate::session::now_ms()
+        ));
+        let tmp_str = tmp.to_string_lossy().to_string();
+        // 三个事件都写到同一个文件，按顺序，便于检验顺序。
+        let make = |event, label: &str| HookConfig {
+            event,
+            command: format!("echo {label} >> {tmp_str}"),
+            r#match: None,
+            timeout_secs: 5,
+            enabled: true,
+        };
+        let hooks = HookRegistry::from_configs(vec![
+            make(HookEvent::PreTurn, "pre-turn"),
+            make(HookEvent::PostTurn, "post-turn"),
+            make(HookEvent::Stop, "stop"),
+        ]);
+        let usage = Usage::default();
+        // 模拟 run_turn 收尾：先触发了 PreTurn（loop 顶），后触发 PostTurn + Stop。
+        hooks.emit(HookEvent::PreTurn, json!({"turn":0})).await;
+        emit_post_turn_and_stop(&hooks, 1, "assistant", &usage).await;
+        let content = std::fs::read_to_string(&tmp).unwrap_or_default();
+        let order: Vec<&str> = content.lines().collect();
+        assert_eq!(order, vec!["pre-turn", "post-turn", "stop"]);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

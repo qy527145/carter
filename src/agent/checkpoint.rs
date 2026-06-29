@@ -3,9 +3,12 @@
 //! `/rewind <n>` 可把文件恢复到某个检查点之前的状态。
 //!
 //! 范围：仅覆盖结构化文件工具（bash 内的 `rm`/重定向等无法获知路径，不在此列）。
-//! 当前为**会话内内存**存储（不跨重启 / resume）；只回滚文件，不回滚对话历史。
+//! **持久化**：每次 snapshot 落到会话 JSONL 的 `Checkpoint` 行；resume 时 fold_file
+//! 回放进 thread.checkpoints。回滚仍只动文件（不动对话历史）。
 
 use std::path::{Path, PathBuf};
+
+use crate::session::{FileSnapshotRecord, RecordKind, Recorder};
 
 /// 单个文件在某次改动前的内容快照。
 #[derive(Debug, Clone)]
@@ -13,6 +16,24 @@ pub struct FileSnapshot {
     pub path: PathBuf,
     /// 改动前内容；None = 当时文件不存在（回滚即删除）。
     pub prior: Option<String>,
+}
+
+impl FileSnapshot {
+    /// 转成 session 持久化形态。
+    pub fn to_record(&self) -> FileSnapshotRecord {
+        FileSnapshotRecord {
+            path: self.path.to_string_lossy().to_string(),
+            prior: self.prior.clone(),
+        }
+    }
+
+    /// 从 session 持久化形态恢复。
+    pub fn from_record(r: &FileSnapshotRecord) -> Self {
+        Self {
+            path: PathBuf::from(&r.path),
+            prior: r.prior.clone(),
+        }
+    }
 }
 
 /// 一次工具调用产生的检查点（可能涉及多个文件）。
@@ -29,23 +50,44 @@ pub struct CheckpointStore {
 }
 
 impl CheckpointStore {
-    /// 工具执行前调用：抓取将被改动文件的当前内容，压入一个检查点。
-    /// 读不到的路径记为 `prior = None`（视作不存在）。`paths` 为空则不记。
-    pub fn snapshot(&mut self, label: impl Into<String>, paths: &[PathBuf]) {
+    /// 工具执行前调用：抓取将被改动文件的当前内容，压入一个检查点；
+    /// 如提供 recorder 则同步落 JSONL（resume 后 `/rewind` 仍可用）。
+    pub fn snapshot_with_recorder(
+        &mut self,
+        label: impl Into<String>,
+        paths: &[PathBuf],
+        recorder: Option<&Recorder>,
+    ) {
         if paths.is_empty() {
             return;
         }
-        let snapshots = paths
+        let label = label.into();
+        let snapshots: Vec<FileSnapshot> = paths
             .iter()
             .map(|p| FileSnapshot {
                 path: p.clone(),
                 prior: std::fs::read_to_string(p).ok(),
             })
             .collect();
-        self.entries.push(Checkpoint {
-            label: label.into(),
-            snapshots,
-        });
+        if let Some(rec) = recorder {
+            rec.record(RecordKind::Checkpoint {
+                label: label.clone(),
+                snapshots: snapshots.iter().map(FileSnapshot::to_record).collect(),
+            });
+        }
+        self.entries.push(Checkpoint { label, snapshots });
+    }
+
+    /// 兼容旧路径：不落盘，仅内存。`snapshot_with_recorder` 是推荐入口。
+    #[allow(dead_code)] // 单测里用作快捷构造
+    pub fn snapshot(&mut self, label: impl Into<String>, paths: &[PathBuf]) {
+        self.snapshot_with_recorder(label, paths, None);
+    }
+
+    /// 从持久化记录恢复一项（resume 用）。
+    pub fn restore_from_record(&mut self, label: String, snapshots: Vec<FileSnapshotRecord>) {
+        let snapshots = snapshots.iter().map(FileSnapshot::from_record).collect();
+        self.entries.push(Checkpoint { label, snapshots });
     }
 
     pub fn list(&self) -> &[Checkpoint] {

@@ -85,6 +85,20 @@ pub enum RecordKind {
     Todo(Vec<TodoItem>),
     /// 压缩后的全量快照（head + 摘要 + recent），等价 Codex 的 replacement_history。
     Compacted { tier: String, messages: Vec<Message> },
+    /// 文件检查点：write_file/edit_file 等工具执行前的快照（供 /rewind）。
+    /// 跨会话持久化：resume 时 fold_file 把这些恢复进 thread.checkpoints。
+    Checkpoint {
+        label: String,
+        snapshots: Vec<FileSnapshotRecord>,
+    },
+}
+
+/// FileSnapshot 的序列化形态（避开 PathBuf 直接序列化的歧义）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSnapshotRecord {
+    pub path: String,
+    /// None = 当时文件不存在（回滚即删除）。
+    pub prior: Option<String>,
 }
 
 /// 落盘的一行（带时间戳）。

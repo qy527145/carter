@@ -18,22 +18,16 @@ const SUMMARY_MAX_TOKENS: u32 = 2000;
 /// L3 结构化高保真摘要的输出上限（比 L2 宽，保留更多细节）。
 const L3_SUMMARY_MAX_TOKENS: u32 = 3000;
 
-/// 廉价估算一组消息的 token（chars/4，保守上取整）。仅用于无真实 Usage 的兜底。
+/// 估算一组消息的 token 数。默认走 cl100k_base（OpenAI 系精确、Anthropic 系合理近似）；
+/// 用 `estimate_tokens_for` 可显式按 model.tokenizer 选编码器拿到更精确结果。
+/// 仅用于"是否触发上下文压缩"的判定；真实计费仍以 provider 返回的 Usage 为准。
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
-    messages.iter().map(estimate_message).sum()
+    crate::tokens::estimate_messages(messages, "cl100k")
 }
 
-fn estimate_message(msg: &Message) -> u64 {
-    let chars = match msg {
-        Message::System(s) | Message::User(s) | Message::Assistant(s) => s.chars().count(),
-        Message::Tool { content, call_id } => content.chars().count() + call_id.chars().count(),
-        Message::ToolCalls(calls) => calls
-            .iter()
-            .map(|c| c.name.chars().count() + c.args.to_string().chars().count())
-            .sum(),
-    };
-    // chars/4 向上取整，+少量结构开销。
-    (chars as u64).div_ceil(4) + 4
+/// 按模型 tokenizer 估算 token 数（精确路径，供 turn.rs 在已知 model 时调用）。
+pub fn estimate_tokens_for(messages: &[Message], tokenizer: &str) -> u64 {
+    crate::tokens::estimate_messages(messages, tokenizer)
 }
 
 /// 压缩 thread.messages：先 L1（清旧工具输出），不够再 L2（滚动摘要）。
@@ -47,12 +41,22 @@ pub async fn compact(
     threshold: u64,
     ui: &mut dyn UiSink,
 ) -> crate::Result<()> {
+    // L0：剥离较旧消息里的图片引用 token（多模态会话下 token 量大头）。
+    // 真实图片每张 ≈ 1.5k tokens（1568px 边），保护窗口外的不再回灌避免反复占位。
+    let imgs_stripped = strip_old_image_refs(&mut thread.messages, L1_KEEP_RECENT);
+    if imgs_stripped > 0 {
+        ui.emit(UiEvent::Notice(format!(
+            "[compact] L0 stripped {imgs_stripped} image refs from older messages"
+        )));
+    }
+
     // L1：折叠较旧的工具输出。
-    let before = estimate_tokens(&thread.messages);
+    let before = estimate_tokens_for(&thread.messages, &model.tokenizer);
     elide_old_tool_outputs(&mut thread.messages, L1_KEEP_RECENT);
-    let after_l1 = estimate_tokens(&thread.messages);
+    let after_l1 = estimate_tokens_for(&thread.messages, &model.tokenizer);
     ui.emit(UiEvent::Notice(format!(
-        "[compact] L1 elided old tool outputs: ~{before} → ~{after_l1} tokens (est)"
+        "[compact] L1 elided old tool outputs: ~{before} → ~{after_l1} tokens (tiktoken {})",
+        model.tokenizer
     )));
 
     // L1 已把估算降到阈值下 → 跳过 L2。
@@ -94,7 +98,7 @@ pub async fn compact(
         rebuilt.push(head);
         rebuilt.push(Message::Assistant(format!("【历史摘要·{tier}】\n{summary}")));
         rebuilt.extend(recent);
-        let after = estimate_tokens(&rebuilt);
+        let after = estimate_tokens_for(&rebuilt, &model.tokenizer);
         thread.messages = rebuilt;
         // 落盘压缩后的全量快照（resume 重放据此整体替换，见 docs/04）。
         if let Some(rec) = thread.recorder() {
@@ -127,6 +131,53 @@ fn elide_old_tool_outputs(messages: &mut [Message], keep_recent: usize) {
             *content = format!("[tool result elided: {bytes} bytes, call_id={call_id}]");
         }
     }
+}
+
+/// L0：把保护窗口之外的消息文本里的 `[img:<hash>.<ext>]` 引用替换为占位文本
+/// `[image elided]`，让 genai 边界不再发对应的多模态块。返回剥离的引用条数。
+///
+/// 仅扫 User / Assistant / Tool 文本字段；不动 ToolCalls / System。
+/// 最近 `keep_recent` 条不动（让模型还能看到当前任务的图）。
+fn strip_old_image_refs(messages: &mut [Message], keep_recent: usize) -> usize {
+    let len = messages.len();
+    if len <= keep_recent {
+        return 0;
+    }
+    let cutoff = len - keep_recent;
+    let mut stripped = 0usize;
+    for msg in messages.iter_mut().take(cutoff) {
+        match msg {
+            Message::User(s) | Message::Assistant(s) => {
+                stripped += strip_in_str(s);
+            }
+            Message::Tool { content, .. } => {
+                stripped += strip_in_str(content);
+            }
+            _ => {}
+        }
+    }
+    stripped
+}
+
+/// 把单个字符串里的 `[img:<hex>.<alnum>]` 全部替换为 `[image elided]`，返回替换次数。
+fn strip_in_str(s: &mut String) -> usize {
+    let segs = crate::media::parse_segments(s);
+    let img_count = segs
+        .iter()
+        .filter(|seg| matches!(seg, crate::media::Segment::Image(_)))
+        .count();
+    if img_count == 0 {
+        return 0;
+    }
+    let mut out = String::with_capacity(s.len());
+    for seg in segs {
+        match seg {
+            crate::media::Segment::Text(t) => out.push_str(&t),
+            crate::media::Segment::Image(_) => out.push_str("[image elided]"),
+        }
+    }
+    *s = out;
+    img_count
 }
 
 /// L2 切分：首条 user（head，必留）+ 中段（middle，待摘要）+ 尾部 keep_recent 条（必留）。
@@ -352,6 +403,42 @@ mod tests {
         if let Message::Tool { content, .. } = &msgs[0] {
             assert_eq!(content, "out");
         }
+    }
+
+    #[test]
+    fn strip_old_image_refs_replaces_only_old_imgs() {
+        let mut msgs = vec![
+            Message::User("oldest [img:abc.png] question".into()),
+            Message::Assistant("answer".into()),
+            Message::User("recent [img:def.png] still visible".into()),
+        ];
+        // keep_recent = 1 → 前两条会被 strip，最后一条保留。
+        let n = super::strip_old_image_refs(&mut msgs, 1);
+        assert_eq!(n, 1);
+        match &msgs[0] {
+            Message::User(s) => {
+                assert!(s.contains("[image elided]"));
+                assert!(!s.contains("[img:abc"));
+            }
+            _ => panic!(),
+        }
+        match &msgs[2] {
+            Message::User(s) => {
+                assert!(s.contains("[img:def.png]"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn strip_old_image_refs_returns_zero_when_no_imgs() {
+        let mut msgs = vec![
+            Message::User("plain text".into()),
+            Message::Assistant("answer".into()),
+            Message::User("more text".into()),
+        ];
+        let n = super::strip_old_image_refs(&mut msgs, 1);
+        assert_eq!(n, 0);
     }
 
     #[test]
