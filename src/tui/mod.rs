@@ -438,8 +438,22 @@ impl App {
     }
 
     /// 删除光标前一个字符（Backspace）。
+    /// 特例：光标前刚好是完整的 `[img:hash.ext]` 引用 → 整段删（含前缀空格）。
     fn input_backspace(&mut self) {
         if self.cursor == 0 {
+            return;
+        }
+        if let Some(start) = token_ends_at(&self.input, self.cursor) {
+            // 顺手吃掉 token 紧前的一个空格（粘贴时自带），保持视觉干净。
+            let real_start = if start > 0
+                && self.input.as_bytes().get(start - 1) == Some(&b' ')
+            {
+                start - 1
+            } else {
+                start
+            };
+            self.input.replace_range(real_start..self.cursor, "");
+            self.cursor = real_start;
             return;
         }
         let prev = self.input[..self.cursor]
@@ -452,8 +466,19 @@ impl App {
     }
 
     /// 删除光标后一个字符（Delete）。
+    /// 特例：光标后紧跟一个完整 `[img:...]` 引用 → 整段删（含末尾空格）。
     fn input_delete(&mut self) {
         if self.cursor >= self.input.len() {
+            return;
+        }
+        if let Some(end) = token_starts_at(&self.input, self.cursor) {
+            // 顺手吃掉 token 紧后的一个空格。
+            let real_end = if self.input.as_bytes().get(end) == Some(&b' ') {
+                end + 1
+            } else {
+                end
+            };
+            self.input.replace_range(self.cursor..real_end, "");
             return;
         }
         let next = self.input[self.cursor..]
@@ -1042,6 +1067,58 @@ fn total_visual_rows(input: &str, inner_width: u16) -> u16 {
 /// 估算输入框所需高度 = 总视觉行数 clamp `[1, MAX_INPUT_ROWS]`。纯函数，便于单测。
 fn input_height(input: &str, inner_width: u16) -> u16 {
     total_visual_rows(input, inner_width).min(MAX_INPUT_ROWS)
+}
+
+/// 若 `end_byte` 处刚好是一个 `[img:<hex>.<alnum>]` 引用的**末尾**（含闭合 `]`），
+/// 返回该引用的**起始字节位置**；否则 None。供 Backspace 原子删除。
+///
+/// 严格匹配：从 `end_byte - 1` 回找最近的 `[img:`，中间字符必须满足 hash.ext 格式。
+/// 不依赖 media::parse_segments 是为了避免每次按键都做整串扫描，O(token 长度) 即可。
+fn token_ends_at(input: &str, end_byte: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    // 必须以 `]` 结尾。
+    if end_byte == 0 || bytes.get(end_byte - 1) != Some(&b']') {
+        return None;
+    }
+    // 在 [..end_byte-1] 范围内找最近的 `[img:`。
+    let head = &input[..end_byte - 1];
+    let open = head.rfind("[img:")?;
+    // body = head[open+5..]，必须是 `<hex>.<alnum>`。
+    let body = &head[open + "[img:".len()..];
+    let (hash, ext) = body.rsplit_once('.')?;
+    if hash.is_empty() || ext.is_empty() {
+        return None;
+    }
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(open)
+}
+
+/// 若 `start_byte` 处刚好是一个 `[img:...]` 引用的**起始**（`[` 位置），
+/// 返回该引用的**结束字节位置**（紧跟 `]` 之后）；否则 None。供 Delete 原子删除。
+fn token_starts_at(input: &str, start_byte: usize) -> Option<usize> {
+    if !input[start_byte..].starts_with("[img:") {
+        return None;
+    }
+    let after_open = start_byte + "[img:".len();
+    let close_rel = input[after_open..].find(']')?;
+    let close = after_open + close_rel;
+    let body = &input[after_open..close];
+    let (hash, ext) = body.rsplit_once('.')?;
+    if hash.is_empty() || ext.is_empty() {
+        return None;
+    }
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(close + 1)
 }
 
 /// 计算光标在多行输入中的 (列显示宽度, 视觉行号)，与 `Paragraph` 的折行一致。
@@ -1942,6 +2019,70 @@ mod tests {
         // 超宽折行：宽 4，10 个字符 → 3 行。
         assert_eq!(input_height("aaaaaaaaaa", 4), 3);
         // clamp 到 MAX_INPUT_ROWS。
+        assert_eq!(input_height(&"a\n".repeat(100), 80), MAX_INPUT_ROWS);
+    }
+
+    #[test]
+    fn token_ends_at_recognizes_valid_token() {
+        // 输入末尾刚好是合法 token。
+        let s = "看这张图 [img:abc12345.png]";
+        let end = s.len();
+        let start = super::token_ends_at(s, end).unwrap();
+        // 起点应是 `[` 的位置。
+        assert_eq!(&s[start..end], "[img:abc12345.png]");
+    }
+
+    #[test]
+    fn token_ends_at_rejects_invalid_chars() {
+        // 非 hex / 缺扩展名 / 没闭合 → None。
+        assert!(super::token_ends_at("[img:zz.png]", 12).is_none());
+        assert!(super::token_ends_at("[img:abc.]", 10).is_none());
+        assert!(super::token_ends_at("[img:abc.png", 12).is_none()); // 没 ]
+        assert!(super::token_ends_at("ordinary text", 13).is_none());
+    }
+
+    #[test]
+    fn token_starts_at_recognizes_at_open_bracket() {
+        let s = "[img:abc12345.png] 描述";
+        let end = super::token_starts_at(s, 0).unwrap();
+        // 结束位置应紧跟 ]。
+        assert_eq!(&s[..end], "[img:abc12345.png]");
+    }
+
+    #[test]
+    fn backspace_atomically_deletes_token_and_leading_space() {
+        let mut app = App::new("m".into());
+        app.input = "看下 [img:abc12345.png]".to_string();
+        app.cursor = app.input.len();
+        app.input_backspace();
+        // 整个 token + 前置空格被吃掉。
+        assert_eq!(app.input, "看下");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn backspace_falls_back_to_char_when_not_token() {
+        let mut app = App::new("m".into());
+        app.input = "abc".to_string();
+        app.cursor = 3;
+        app.input_backspace();
+        assert_eq!(app.input, "ab");
+        assert_eq!(app.cursor, 2);
+    }
+
+    #[test]
+    fn delete_atomically_consumes_token_at_cursor() {
+        let mut app = App::new("m".into());
+        app.input = "[img:abc12345.png] 后文".to_string();
+        app.cursor = 0;
+        app.input_delete();
+        // 整个 token + 后置空格被吃掉。
+        assert_eq!(app.input, "后文");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn input_height_clamps_to_max_rows() {
         let many = "x\n".repeat(20);
         assert_eq!(input_height(&many, 80), MAX_INPUT_ROWS);
     }
