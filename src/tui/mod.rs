@@ -914,33 +914,6 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
                 Action::None
             }
         }
-        KeyCode::Char('v') if ctrl => {
-            // 剪贴板二进制粘贴：先看剪贴板是否有图片，有则入库 + 把 token 插进输入框；
-            // 没图就回落到普通字符 'v'（让 ctrl+v 在文本中也能输入字面 v —— 罕见但兼容）。
-            match crate::media::clipboard::paste_image() {
-                Ok(Some(r)) => {
-                    let token = format!("{} ", r.token());
-                    app.input_insert_str(&token);
-                    app.update_completion();
-                    app.outbox.push(Block_::Notice(format!(
-                        "📎 已粘贴剪贴板图片：{} ({})",
-                        r.token(),
-                        r.mime()
-                    )));
-                    Action::None
-                }
-                Ok(None) => {
-                    // 剪贴板无图：忽略（terminal 自己的 bracketed paste 会处理文本）。
-                    Action::None
-                }
-                Err(e) => {
-                    app.outbox.push(Block_::Notice(format!(
-                        "⚠ 剪贴板图片粘贴失败：{e}"
-                    )));
-                    Action::None
-                }
-            }
-        }
         KeyCode::Char('d') if ctrl => {
             if app.input.is_empty() {
                 Action::Quit
@@ -1534,7 +1507,39 @@ pub async fn run(
                             }
                         }
                     }
-                    Some(Ok(_)) => {} // resize/paste 等：下一帧自然重绘。
+                    Some(Ok(CtEvent::Paste(text))) => {
+                        // bracketed paste：用户在终端用平台原生快捷键粘贴
+                        // (macOS Cmd+V / Windows Ctrl+V / Linux Ctrl+Shift+V)。
+                        // 终端把剪贴板**文本**包成 paste 序列发过来，但**图片字节不会**走这条路。
+                        //
+                        // 策略：先去系统剪贴板看有没有图片二进制 —— 有就把它入库 + 插入 token，
+                        // 同时**丢弃** paste text（macOS 截图工具常把"截图路径"也写进文本剪贴板，
+                        // 用户预期是"贴图"而不是"贴路径"，图片优先正确）。
+                        // 没图就把 paste text 原样插入（普通文本粘贴）。
+                        match crate::media::clipboard::paste_image() {
+                            Ok(Some(r)) => {
+                                let token = format!("{} ", r.token());
+                                app.input_insert_str(&token);
+                                app.update_completion();
+                                app.apply(UiEvent::Notice(format!(
+                                    "📎 已粘贴剪贴板图片：{} ({})",
+                                    r.token(),
+                                    r.mime()
+                                )));
+                            }
+                            Ok(None) => {
+                                // 剪贴板没图 → 普通文本粘贴。
+                                app.input_insert_str(&text);
+                                app.update_completion();
+                            }
+                            Err(e) => {
+                                tracing::warn!("tui: paste image failed ({e}); falling back to text");
+                                app.input_insert_str(&text);
+                                app.update_completion();
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {} // resize 等：下一帧自然重绘。
                     Some(Err(_)) | None => break,
                 }
             }
