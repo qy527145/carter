@@ -89,12 +89,10 @@ fn prune_revisions(revs_dir: &Path, filename: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// 串行化所有动 CARTER_HOME 的测试。
+    /// 共享 CARTER_HOME 锁（在 config::paths::home_env_lock）—— media / memory 单测共用，
+    /// 避免 cargo test 多线程下覆盖彼此的 env。
     fn home_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        crate::config::paths::home_env_lock()
     }
 
     fn unique_home() -> std::path::PathBuf {

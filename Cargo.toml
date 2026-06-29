@@ -42,6 +42,12 @@ base64 = "0.22"
 # 真实 token 计数（OpenAI 系 cl100k_base / o200k_base 直接命中；
 # Anthropic / Gemini 用 cl100k_base 作为合理估算）。
 tiktoken-rs = "0.7"
+# 图片自动 downsample（控制多模态 token 成本，对齐 aiko-agent 的 Jimp 1568px 策略）。
+# 仅启用我们支持的几种格式，避免不必要的 binary 膨胀。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# 剪贴板二进制读取（macOS NSPasteboard / Linux X11+Wayland / Windows clipboard）。
+# 必须保留 image-data feature，否则 get_image() 不可用。
+arboard = "3"
 
 # bash 工具 unix 进程组超时清理：kill(-pgid)。仅 src/tools/bash.rs 在 unix 下使用。
 [target.'cfg(unix)'.dependencies]

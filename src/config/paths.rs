@@ -78,6 +78,16 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 测试共享锁：所有动 `CARTER_HOME` 的单元测试都得拿这把锁，避免 cargo test 多线程
+/// 下 env 竞态。在 `media` / `memory::writer` 多个模块的测试间共享。
+#[cfg(test)]
+pub(crate) fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

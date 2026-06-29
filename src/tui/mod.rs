@@ -431,6 +431,12 @@ impl App {
         self.cursor += c.len_utf8();
     }
 
+    /// 在光标位置整段插入字符串（剪贴板粘贴 / 自动插入 image token 用）。
+    fn input_insert_str(&mut self, s: &str) {
+        self.input.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     /// 删除光标前一个字符（Backspace）。
     fn input_backspace(&mut self) {
         if self.cursor == 0 {
@@ -906,6 +912,33 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
                     "再按一次 Ctrl+C 退出（或 /quit）".into(),
                 ));
                 Action::None
+            }
+        }
+        KeyCode::Char('v') if ctrl => {
+            // 剪贴板二进制粘贴：先看剪贴板是否有图片，有则入库 + 把 token 插进输入框；
+            // 没图就回落到普通字符 'v'（让 ctrl+v 在文本中也能输入字面 v —— 罕见但兼容）。
+            match crate::media::clipboard::paste_image() {
+                Ok(Some(r)) => {
+                    let token = format!("{} ", r.token());
+                    app.input_insert_str(&token);
+                    app.update_completion();
+                    app.outbox.push(Block_::Notice(format!(
+                        "📎 已粘贴剪贴板图片：{} ({})",
+                        r.token(),
+                        r.mime()
+                    )));
+                    Action::None
+                }
+                Ok(None) => {
+                    // 剪贴板无图：忽略（terminal 自己的 bracketed paste 会处理文本）。
+                    Action::None
+                }
+                Err(e) => {
+                    app.outbox.push(Block_::Notice(format!(
+                        "⚠ 剪贴板图片粘贴失败：{e}"
+                    )));
+                    Action::None
+                }
             }
         }
         KeyCode::Char('d') if ctrl => {
