@@ -65,6 +65,10 @@ pub fn images_dir() -> PathBuf {
     carter_home().join("images")
 }
 
+/// token 中 hash 的字符数（hex）。16 = 64 bit 命名空间，
+/// 单用户百万级图片碰撞概率约 2.7e-8，足够；权衡显示长度后选 16。
+const TOKEN_HASH_LEN: usize = 16;
+
 /// 把原始字节按内容寻址存入 image store；若已存在则跳过写。
 /// `ext_hint` 可由调用方提供（如来自源文件扩展名）；否则按字节嗅探。
 ///
@@ -78,7 +82,11 @@ pub fn put_bytes(bytes: &[u8], ext_hint: Option<&str>) -> std::io::Result<ImageR
 
     let mut hasher = Sha256::new();
     hasher.update(&out_bytes);
-    let hash = hex_lower(&hasher.finalize());
+    // 截取前 16 个 hex 字符（64 bit），平衡显示长度与碰撞安全（见 TOKEN_HASH_LEN）。
+    let hash: String = hex_lower(&hasher.finalize())
+        .chars()
+        .take(TOKEN_HASH_LEN)
+        .collect();
 
     let dir = images_dir();
     std::fs::create_dir_all(&dir)?;
