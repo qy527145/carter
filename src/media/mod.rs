@@ -8,12 +8,23 @@
 //! 加载磁盘文件 base64 后组装成多模态请求体。
 //!
 //! 存储路径：`~/.carter/images/<hash>.<ext>`（按内容寻址，重复粘贴自动去重）。
+//!
+//! **自动 downsample**：入库前用 `image` crate 检查尺寸，任一维 > `MAX_DIMENSION`（1568px）
+//! 则按比例缩到长边 1568，控制多模态 token 成本（对齐 aiko-agent 的 Jimp 策略）。
+//! Claude vision 也建议输入图像不超过 1568px。
+//! 解码失败 / 不支持的格式 → 原样落盘（fallback to raw bytes），不致命。
+
+pub mod clipboard;
 
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::config::paths::carter_home;
+
+/// 图片长边上限（像素）。超过则按比例缩到该值。
+/// 1568 = Claude vision recommended max；对齐 aiko-agent 的 Jimp 默认。
+const MAX_DIMENSION: u32 = 1568;
 
 /// 一条「文本+图片」混排消息切片。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,24 +67,57 @@ pub fn images_dir() -> PathBuf {
 
 /// 把原始字节按内容寻址存入 image store；若已存在则跳过写。
 /// `ext_hint` 可由调用方提供（如来自源文件扩展名）；否则按字节嗅探。
-/// 返回引用句柄。
+///
+/// 写盘前会自动尝试 downsample：超过 `MAX_DIMENSION` 的图片按比例缩到长边 = 上限，
+/// **缩放后 bytes 重算 sha256**，所以"原图 + 缩略图"会分别落盘（去重粒度仍正确）。
+/// 解码失败 / 不支持格式 → 原样落盘。
 pub fn put_bytes(bytes: &[u8], ext_hint: Option<&str>) -> std::io::Result<ImageRef> {
-    let ext = ext_hint
-        .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
-        .or_else(|| sniff_ext(bytes).map(str::to_string))
-        .unwrap_or_else(|| "bin".to_string());
+    let hint = ext_hint.map(|s| s.trim_start_matches('.').to_ascii_lowercase());
+    // 尝试 downsample；失败回落原 bytes + 原 ext。
+    let (out_bytes, out_ext) = downsample_if_needed(bytes, hint.as_deref());
 
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    hasher.update(&out_bytes);
     let hash = hex_lower(&hasher.finalize());
 
     let dir = images_dir();
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{hash}.{ext}"));
+    let path = dir.join(format!("{hash}.{out_ext}"));
     if !path.exists() {
-        std::fs::write(&path, bytes)?;
+        std::fs::write(&path, &out_bytes)?;
     }
-    Ok(ImageRef { hash, ext })
+    Ok(ImageRef { hash, ext: out_ext })
+}
+
+/// 检查并按需 downsample。返回 (bytes, ext)：
+/// - 解码成功 且 任一维 > MAX_DIMENSION → 按比例缩到长边 MAX_DIMENSION，重编码为 PNG（无损 + 跨 provider 兼容）
+/// - 解码成功 且 已在阈值内 → 原样返回 (省一次重编码)
+/// - 解码失败 → 原 bytes + 嗅探/hint 出的 ext（fallback）
+fn downsample_if_needed(bytes: &[u8], ext_hint: Option<&str>) -> (Vec<u8>, String) {
+    let fallback_ext = || {
+        ext_hint
+            .map(str::to_string)
+            .or_else(|| sniff_ext(bytes).map(str::to_string))
+            .unwrap_or_else(|| "bin".to_string())
+    };
+    let Ok(img) = image::load_from_memory(bytes) else {
+        return (bytes.to_vec(), fallback_ext());
+    };
+    let (w, h) = (img.width(), img.height());
+    if w <= MAX_DIMENSION && h <= MAX_DIMENSION {
+        return (bytes.to_vec(), fallback_ext());
+    }
+    // 按比例缩到长边 = MAX_DIMENSION。Lanczos3 质量好但慢；图片不大，足够。
+    let resized = img.resize(MAX_DIMENSION, MAX_DIMENSION, image::imageops::FilterType::Lanczos3);
+    let mut out: Vec<u8> = Vec::new();
+    // 统一编码为 PNG（无损、跨 provider 一致）。
+    if resized
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .is_err()
+    {
+        return (bytes.to_vec(), fallback_ext());
+    }
+    (out, "png".to_string())
 }
 
 /// 从磁盘路径导入：读字节，扩展名从源文件名取。
@@ -332,12 +376,9 @@ mod tests {
         assert!(!is_image_path(Path::new("c.rs")));
     }
 
-    /// 串行化所有「会动 CARTER_HOME」的测试，避免 cargo test 多线程下 env 竞态。
+    /// 共享 CARTER_HOME 锁 —— media / memory 单测共用，避免 env 竞态。
     fn home_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        crate::config::paths::home_env_lock()
     }
 
     #[test]
@@ -392,6 +433,85 @@ mod tests {
         assert!(out.starts_with("@missing.png"));
 
         // 清理
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { std::env::remove_var("CARTER_HOME"); }
+    }
+
+    #[test]
+    fn downsample_kicks_in_above_threshold() {
+        // 构造一张 2000×1000 的纯色 PNG，put_bytes 应当 downsample。
+        let _g = home_test_lock();
+        let tmp = std::env::temp_dir().join(format!("carter-dsample-{}", crate::session::now_ms()));
+        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+
+        let big = image::RgbaImage::from_pixel(2000, 1000, image::Rgba([42, 99, 200, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(big)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let original_len = png.len();
+
+        let rf = put_bytes(&png, Some("png")).unwrap();
+        // 落盘文件应小于原图（缩小到 1568×784 + 重编码）。
+        let stored = std::fs::read(rf.path()).unwrap();
+        // 用 image 反解，确认长边 <= MAX_DIMENSION。
+        let decoded = image::load_from_memory(&stored).unwrap();
+        assert!(decoded.width() <= MAX_DIMENSION);
+        assert!(decoded.height() <= MAX_DIMENSION);
+        // 比例正确：2000:1000 = 1568:784（允许 1px 舍入）。
+        let ratio_ok = (decoded.width() as i32 - 1568).abs() <= 1
+            && (decoded.height() as i32 - 784).abs() <= 1;
+        assert!(
+            ratio_ok,
+            "expected ~1568x784, got {}x{}",
+            decoded.width(),
+            decoded.height()
+        );
+        // 重编码后字节数应少于原图（纯色无损 PNG，downsample 的几何缩减效果明显）。
+        assert!(
+            stored.len() < original_len,
+            "downsample 应缩小：原 {original_len} 现 {}",
+            stored.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { std::env::remove_var("CARTER_HOME"); }
+    }
+
+    #[test]
+    fn small_image_skips_downsample() {
+        // 800×600 在阈值内 → 原样落盘，不重编码。
+        let _g = home_test_lock();
+        let tmp = std::env::temp_dir().join(format!("carter-dsample-skip-{}", crate::session::now_ms()));
+        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+
+        let small = image::RgbaImage::from_pixel(800, 600, image::Rgba([10, 20, 30, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(small)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let rf = put_bytes(&png, Some("png")).unwrap();
+        let stored = std::fs::read(rf.path()).unwrap();
+        // 字节级一致：未触发 downsample → 原样写盘。
+        assert_eq!(stored, png);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { std::env::remove_var("CARTER_HOME"); }
+    }
+
+    #[test]
+    fn non_image_bytes_passthrough() {
+        // 不是图片的字节：image::load_from_memory 会失败，落盘是原始 bytes，ext 走嗅探/hint。
+        let _g = home_test_lock();
+        let tmp = std::env::temp_dir().join(format!("carter-dsample-raw-{}", crate::session::now_ms()));
+        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+
+        let garbage = b"this is not an image at all, just some bytes";
+        let rf = put_bytes(garbage, Some("bin")).unwrap();
+        let stored = std::fs::read(rf.path()).unwrap();
+        assert_eq!(stored, garbage);
+
         let _ = std::fs::remove_dir_all(&tmp);
         unsafe { std::env::remove_var("CARTER_HOME"); }
     }
