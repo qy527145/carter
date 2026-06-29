@@ -12,6 +12,7 @@ mod provider;
 mod registry;
 mod session;
 mod skills;
+mod tokens;
 mod tools;
 mod tui;
 mod wizard;
@@ -492,12 +493,18 @@ fn build_tools(
     base_system: String,
     cancel: CancelToken,
     mcp_tools: Vec<Arc<dyn crate::tools::Tool>>,
+    ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent::UiEvent>>,
 ) -> ToolRegistry {
     let mut tools = ToolRegistry::builtin();
     if skills_enabled {
         tools.push(Arc::new(crate::skills::SkillTool::new(
             crate::config::paths::skills_dir(),
         )));
+    }
+    // ask_user_question 工具：有 ui_tx 才注册（TUI 模式）。
+    // oneshot 模式下没有 UI 等用户输入，工具不可用 —— 模型见不到该工具描述也就不会调。
+    if let Some(tx) = &ui_tx {
+        tools.push(Arc::new(crate::agent::AskUserQuestionTool::new(tx.clone())));
     }
     // MCP 工具放进主 registry。
     for t in &mcp_tools {
@@ -566,8 +573,21 @@ async fn run_oneshot(
         base_system,
         cancel.clone(),
         mcp_tools,
+        None, // oneshot 模式无 TUI，ask_user_question 工具不可用
     );
     let mut sink = StdoutSink::new();
+
+    // SessionStart hook：oneshot 也算一次 session。
+    hooks
+        .emit(
+            crate::hooks::HookEvent::SessionStart,
+            serde_json::json!({
+                "mode": "oneshot",
+                "cwd": cwd.to_string_lossy(),
+                "model": model.key,
+            }),
+        )
+        .await;
 
     let run_res = run_turn(
         &mut thread,
@@ -583,7 +603,19 @@ async fn run_oneshot(
 
     // 回收 MCP 子进程（无论成功失败都先 shutdown，再传播错误）。
     mcp_mgr.shutdown().await;
-    let (outcome, _usage) = run_res?;
+    let (outcome, usage) = run_res?;
+
+    // SessionEnd hook：返回最终用量。
+    hooks
+        .emit(
+            crate::hooks::HookEvent::SessionEnd,
+            serde_json::json!({
+                "mode": "oneshot",
+                "input_tokens": usage.input,
+                "output_tokens": usage.output,
+            }),
+        )
+        .await;
 
     Ok(outcome_to_code(outcome))
 }
@@ -679,6 +711,20 @@ async fn run_tui(
     // 跨会话输入历史：启动时载入（上下方向键召回）。
     let input_history = session::history::load();
 
+    // SessionStart hook：TUI 起来即触发（resume 也算一次新 session 入口）。
+    hooks
+        .emit(
+            crate::hooks::HookEvent::SessionStart,
+            serde_json::json!({
+                "mode": "tui",
+                "session_id": session_meta.id,
+                "cwd": cwd.to_string_lossy(),
+                "model": model_label,
+                "resumed": session_meta.title.is_some(),
+            }),
+        )
+        .await;
+
     // agent 任务：连续多轮，每轮一个 prompt → run_turn → emit 事件。
     let agent_cancel = cancel.clone();
     let agent_hooks = hooks.clone();
@@ -703,6 +749,7 @@ async fn run_tui(
             base_system,
             agent_cancel.clone(),
             mcp_tools,
+            Some(ui_tx.clone()), // TUI 模式：ask_user_question 工具走这个通道发 UiEvent::AskUser
         );
         // 主模型 / provider 设为可变：会话内 `/model` 热切换会重绑它们（run_turn 每轮取最新）。
         // 注：子 agent 的 `task` 工具仍持旧 model（重建 MCP 工具代价高，列为已知限制）。
@@ -853,6 +900,14 @@ async fn run_tui(
 
     // agent 任务结束（peer 克隆随 tools 一并 drop）后，回收 MCP 子进程。
     mcp_mgr.shutdown().await;
+
+    // SessionEnd hook：TUI 退出时触发。
+    hooks
+        .emit(
+            crate::hooks::HookEvent::SessionEnd,
+            serde_json::json!({ "mode": "tui" }),
+        )
+        .await;
 
     tui_res.map_err(crate::error::CarterError::Io)?;
     Ok(std::process::ExitCode::SUCCESS)

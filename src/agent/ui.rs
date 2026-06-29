@@ -71,6 +71,16 @@ pub enum UiEvent {
     ToolCallStarted { name: String, args_preview: String },
     /// 工具结果（执行后）。
     ToolResult { ok: bool, summary: String },
+    /// 子 agent / 主 agent 通过 `ask_user_question` 工具向 TUI 弹出选择题。
+    /// `response_tx` 为 oneshot channel：TUI 选完把答案文本（option label 或自由输入）发回。
+    AskUser {
+        id: u64,
+        question: String,
+        options: Vec<String>,
+        /// 用 Mutex<Option<...>> 包裹 oneshot Sender，因为 UiEvent 必须 Clone（多个 sink），
+        /// 但 oneshot Sender 不是 Clone —— 实际只有一个 sink 应该消费 Sender。
+        response_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    },
     /// todo 列表更新。
     TodoUpdated(Vec<TodoItem>),
     /// 系统提示（压缩日志等，替代裸 eprintln）。
@@ -217,6 +227,25 @@ impl UiSink for StdoutSink {
             UiEvent::ReplayHistory(_) => {}
             // oneshot 无 streaming 态可恢复，忽略。
             UiEvent::Idle => {}
+            UiEvent::AskUser {
+                question,
+                options,
+                response_tx,
+                ..
+            } => {
+                // oneshot 模式（无 TUI）：打印问题，并把第一个 option（缺省）发回作为答案。
+                // 让 LLM 在 oneshot 流程里不会卡死。
+                let _ = writeln!(out, "\x1b[33m[ask] {question}\x1b[0m");
+                if !options.is_empty() {
+                    let _ = writeln!(out, "\x1b[33m  options: {}\x1b[0m", options.join(" | "));
+                }
+                let auto = options.first().cloned().unwrap_or_default();
+                if let Ok(mut guard) = response_tx.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(auto);
+                    }
+                }
+            }
             UiEvent::TurnUsage { usage, cost, model } => {
                 let _ = writeln!(
                     out,

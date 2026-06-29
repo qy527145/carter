@@ -144,6 +144,14 @@ struct CompletionState {
     selected: usize,
 }
 
+/// 当前等待用户回答的 AskUser 问题（None = 无）。
+struct PendingAsk {
+    #[allow(dead_code)] // id 仅用于将来 dedup / 日志
+    id: u64,
+    options: Vec<String>,
+    response_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+}
+
 /// 状态栏累计数据。
 #[derive(Debug, Default, Clone)]
 struct StatusLine {
@@ -194,6 +202,8 @@ pub struct App {
     session_candidates: Option<Box<dyn Fn() -> Vec<CompletionItem> + Send>>,
     /// 当前参数补全的候选缓存（命令名 → 候选），打开弹窗时取一次，过滤期间复用。
     arg_cache: Option<(String, Vec<CompletionItem>)>,
+    /// 当前等待用户回答的 AskUser 问题；None = 无。
+    pending_ask: Option<PendingAsk>,
 }
 
 impl App {
@@ -222,6 +232,7 @@ impl App {
             arg_completions: Vec::new(),
             session_candidates: None,
             arg_cache: None,
+            pending_ask: None,
         }
     }
 
@@ -323,6 +334,28 @@ impl App {
                 // 一轮 / 斜杠命令处理结束：无论是否产生 usage，都恢复可交互。
                 self.flush_pending();
                 self.streaming = false;
+            }
+            UiEvent::AskUser {
+                id,
+                question,
+                options,
+                response_tx,
+            } => {
+                // 把问题作为提示进 outbox 让用户看到；同时进入 ask 模式：键盘 1-9 选项 / Esc 取消。
+                self.flush_pending();
+                self.outbox.push(Block_::Notice(format!("❓ {question}")));
+                for (i, opt) in options.iter().enumerate() {
+                    self.outbox
+                        .push(Block_::Notice(format!("  {}. {opt}", i + 1)));
+                }
+                self.outbox.push(Block_::Notice(
+                    "(按数字键选择，或直接输入答案后回车提交，Esc 跳过 = 选第一项)".into(),
+                ));
+                self.pending_ask = Some(PendingAsk {
+                    id,
+                    options,
+                    response_tx,
+                });
             }
             UiEvent::TurnUsage { usage, cost, model: _ } => {
                 self.flush_pending();
@@ -797,6 +830,46 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
     let is_ctrl_c = ctrl && matches!(key.code, KeyCode::Char('c'));
     if !is_ctrl_c {
         app.armed_quit = false;
+    }
+
+    // 待回答 AskUser 拦截：数字键直接选项 / Esc 取消（选第一项 = 缺省） / Enter 用当前输入内容作答。
+    if app.pending_ask.is_some() {
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c as u8 - b'1') as usize;
+                let ask = app.pending_ask.take().unwrap();
+                let answer = ask.options.get(idx).cloned().unwrap_or_default();
+                if let Ok(mut guard) = ask.response_tx.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(answer);
+                    }
+                }
+                return Action::None;
+            }
+            KeyCode::Esc => {
+                let ask = app.pending_ask.take().unwrap();
+                let answer = ask.options.first().cloned().unwrap_or_default();
+                if let Ok(mut guard) = ask.response_tx.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(answer);
+                    }
+                }
+                return Action::None;
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) && !app.input.is_empty() => {
+                let ask = app.pending_ask.take().unwrap();
+                let answer = std::mem::take(&mut app.input);
+                app.cursor = 0;
+                if let Ok(mut guard) = ask.response_tx.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(answer);
+                    }
+                }
+                return Action::None;
+            }
+            // 其他键正常输入（让用户能编辑自由答案）。
+            _ => {}
+        }
     }
 
     // 补全弹窗激活时，Tab/↑/↓/Esc 优先用于导航/关闭（不落到历史浏览/中断）。

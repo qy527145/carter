@@ -11,6 +11,9 @@ use crate::tools::TodoItem;
 
 use super::{now_ms, GitInfo, Record, RecordKind, Recorder, SessionMeta};
 
+/// fold_file 的副产物：恢复进 thread 的检查点序列（resume/load 时回放）。
+pub type FoldedCheckpoints = Vec<(String, Vec<super::FileSnapshotRecord>)>;
+
 /// 新会话的可选参数。
 #[derive(Debug, Default)]
 pub struct SessionOpts {
@@ -105,13 +108,17 @@ pub fn start_new(
     Ok((thread, meta))
 }
 
-/// 折叠一个会话文件 → (messages, todos, meta)。Compacted 整体替换 messages。
-fn fold_file(path: &Path) -> crate::Result<(Vec<Message>, Vec<TodoItem>, SessionMeta)> {
+/// 折叠一个会话文件 → (messages, todos, meta, checkpoints)。Compacted 整体替换 messages。
+/// Checkpoint 记录按出现顺序保留（resume 后 /rewind 可用）。
+fn fold_file(
+    path: &Path,
+) -> crate::Result<(Vec<Message>, Vec<TodoItem>, SessionMeta, FoldedCheckpoints)> {
     let raw = std::fs::read_to_string(path)?;
     let mut messages: Vec<Message> = Vec::new();
     let mut todos: Vec<TodoItem> = Vec::new();
     let mut meta: Option<SessionMeta> = None;
     let mut title: Option<String> = None;
+    let mut checkpoints: FoldedCheckpoints = Vec::new();
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
@@ -129,6 +136,9 @@ fn fold_file(path: &Path) -> crate::Result<(Vec<Message>, Vec<TodoItem>, Session
             RecordKind::Message(m) => messages.push(m),
             RecordKind::Todo(t) => todos = t,
             RecordKind::Compacted { messages: snap, .. } => messages = snap,
+            RecordKind::Checkpoint { label, snapshots } => {
+                checkpoints.push((label, snapshots));
+            }
         }
     }
     let mut meta = meta.ok_or_else(|| {
@@ -138,19 +148,25 @@ fn fold_file(path: &Path) -> crate::Result<(Vec<Message>, Vec<TodoItem>, Session
     if title.is_some() {
         meta.title = title;
     }
-    Ok((messages, todos, meta))
+    Ok((messages, todos, meta, checkpoints))
 }
 
 /// 加载会话续接（追加写同一文件）。
 pub fn load(entry: &SessionEntry) -> crate::Result<(Thread, SessionMeta)> {
-    let (messages, todos, meta) = fold_file(&entry.path)?;
+    let (messages, todos, meta, checkpoints) = fold_file(&entry.path)?;
     let recorder = Arc::new(Recorder::open(&entry.path)?);
-    Ok((Thread::from_parts(messages, todos, recorder), meta))
+    let mut thread = Thread::from_parts(messages, todos, recorder);
+    // 回放 checkpoint：let /rewind 在 resume 后仍可用。
+    for (label, snaps) in checkpoints {
+        thread.checkpoints.restore_from_record(label, snaps);
+    }
+    Ok((thread, meta))
 }
 
 /// fork：种子=父历史，写到全新自包含文件（含 forked_from 血缘）。
+/// 注意：fork 不复制父的 checkpoint（新会话从干净状态起；改回滚的是新文件的写动作）。
 pub fn fork(entry: &SessionEntry) -> crate::Result<(Thread, SessionMeta)> {
-    let (messages, todos, parent) = fold_file(&entry.path)?;
+    let (messages, todos, parent, _checkpoints) = fold_file(&entry.path)?;
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = now_ms();
     let cwd = PathBuf::from(&parent.cwd);
@@ -192,7 +208,7 @@ pub fn list(cwd: &Path, all: bool) -> Vec<SessionEntry> {
     let glob_pat = pattern.to_string_lossy().to_string();
     if let Ok(paths) = glob::glob(&glob_pat) {
         for p in paths.flatten() {
-            if let Ok((_, _, meta)) = fold_file(&p) {
+            if let Ok((_, _, meta, _)) = fold_file(&p) {
                 entries.push(SessionEntry { meta, path: p });
             }
         }
@@ -212,7 +228,7 @@ pub fn latest(cwd: &Path) -> Option<SessionEntry> {
 /// 返回 (旧字节数, 新字节数)。
 pub fn gc(entry: &SessionEntry) -> crate::Result<(u64, u64)> {
     let old = std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0);
-    let (messages, todos, meta) = fold_file(&entry.path)?;
+    let (messages, todos, meta, _checkpoints) = fold_file(&entry.path)?;
 
     let mut buf = String::new();
     let mut push = |kind: RecordKind| {
@@ -281,7 +297,7 @@ mod tests {
                 RecordKind::Title { title: "标题".into() },
             ],
         );
-        let (messages, _todos, m) = fold_file(&path).unwrap();
+        let (messages, _todos, m, _) = fold_file(&path).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(m.title.as_deref(), Some("标题"));
         let _ = std::fs::remove_file(&path);
@@ -303,7 +319,7 @@ mod tests {
                 RecordKind::Message(Message::User("q2".into())),
             ],
         );
-        let (messages, _todos, _m) = fold_file(&path).unwrap();
+        let (messages, _todos, _m, _) = fold_file(&path).unwrap();
         // 压缩快照整体替换前序，再叠加其后的新消息。
         assert_eq!(messages.len(), 2);
         assert!(matches!(&messages[0], Message::Assistant(s) if s == "【摘要】"));
@@ -345,9 +361,39 @@ mod tests {
         let (old, new) = gc(&entry).unwrap();
         assert!(new < old, "gc 应缩小文件: {old} -> {new}");
         // 重放状态不变（消息序列一致），标题保留。
-        let (after, _todos, m) = fold_file(&path).unwrap();
+        let (after, _todos, m, _) = fold_file(&path).unwrap();
         assert_eq!(before.len(), after.len());
         assert_eq!(m.title.as_deref(), Some("标题"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checkpoint_round_trips_through_jsonl() {
+        use crate::session::FileSnapshotRecord;
+        let path = temp_file("checkpoint");
+        write_lines(
+            &path,
+            &[
+                RecordKind::SessionMeta(meta()),
+                RecordKind::Message(Message::User("q".into())),
+                RecordKind::Checkpoint {
+                    label: "write_file a.txt".into(),
+                    snapshots: vec![FileSnapshotRecord {
+                        path: "a.txt".into(),
+                        prior: Some("v0".into()),
+                    }],
+                },
+                RecordKind::Message(Message::Assistant("done".into())),
+            ],
+        );
+        let (msgs, _todos, _meta, ckpts) = fold_file(&path).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(ckpts.len(), 1);
+        let (label, snaps) = &ckpts[0];
+        assert!(label.starts_with("write_file"));
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].path, "a.txt");
+        assert_eq!(snaps[0].prior.as_deref(), Some("v0"));
         let _ = std::fs::remove_file(&path);
     }
 }

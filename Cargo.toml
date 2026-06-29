@@ -39,6 +39,9 @@ http = "1"
 # 多模态：图片内容寻址（sha256） + base64 编码给 provider 发 wire。
 sha2 = "0.10"
 base64 = "0.22"
+# 真实 token 计数（OpenAI 系 cl100k_base / o200k_base 直接命中；
+# Anthropic / Gemini 用 cl100k_base 作为合理估算）。
+tiktoken-rs = "0.7"
 
 # bash 工具 unix 进程组超时清理：kill(-pgid)。仅 src/tools/bash.rs 在 unix 下使用。
 [target.'cfg(unix)'.dependencies]

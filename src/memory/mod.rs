@@ -1,10 +1,21 @@
 //! 多层记忆 —— 受 Claude Code 的 CLAUDE.md / Codex 的 AGENTS.md 启发。
-//! 发现并拼装分层记忆文件：全局（`~/.carter/CARTER.md`）+ 项目祖先链
-//! （从 cwd 逐级上溯到 git 根或文件系统根，每层的 `CARTER.md` / `AGENTS.md`）。
+//! 发现并拼装分层记忆文件：全局（`~/.carter/CARTER.md` + facts.md + profile.md + skills/）
+//! + 项目祖先链（从 cwd 逐级上溯到 git 根或文件系统根，每层的 `CARTER.md` / `AGENTS.md`）。
 //! 作为单个 system 段注入，是持久背景与偏好。
+//!
+//! 三态分层（对齐 aiko-agent）：
+//! - **Facts**：项目/环境事实（测试命令、包管理器、运行约定）
+//! - **Profile**：用户画像（角色、偏好、沟通风格）
+//! - **Skills**：可复用的工作流（多步骤"做某事"的方法）
+//!
+//! 写路径要求：**原子写**（tmp + rename）+ **修订快照**（每次写前备份到
+//! `~/.carter/memory_revisions/`），崩溃恢复最多读到上一版完整内容。
+//!
 //! 纪律：本模块不得 import `genai`/`rmcp`/`ratatui`/`crossterm`，仅 std。
 
 use std::path::{Path, PathBuf};
+
+pub mod writer;
 
 /// 每层记忆的文件名候选（同一目录两者都在则都收）。
 const MEMORY_FILES: [&str; 2] = ["CARTER.md", "AGENTS.md"];
@@ -32,10 +43,24 @@ pub fn load(cwd: &Path) -> String {
 fn discover(cwd: &Path) -> Vec<Layer> {
     let mut layers = Vec::new();
 
-    // 全局层：~/.carter/CARTER.md。
+    // 全局综合层：~/.carter/CARTER.md。
     if let Some(content) = read_capped(&crate::config::paths::global_memory_path()) {
         layers.push(Layer {
             label: "global".into(),
+            content,
+        });
+    }
+    // 全局事实层：~/.carter/facts.md。
+    if let Some(content) = read_capped(&crate::config::paths::global_facts_path()) {
+        layers.push(Layer {
+            label: "global-facts".into(),
+            content,
+        });
+    }
+    // 全局画像层：~/.carter/profile.md（用户身份/偏好）。
+    if let Some(content) = read_capped(&crate::config::paths::global_profile_path()) {
+        layers.push(Layer {
+            label: "global-profile".into(),
             content,
         });
     }

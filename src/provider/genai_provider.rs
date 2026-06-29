@@ -116,8 +116,22 @@ impl LlmProvider for GenaiProvider {
             }
             greq = greq.append_message(m);
         }
-        for msg in &req.messages {
-            greq = greq.append_message(to_genai_message(msg));
+        // Anthropic prompt cache 多 breakpoint 策略：
+        // - system 末段已打 1 个 cache_control（上面）—— 包含 system 前缀 + 工具定义
+        // - 这里给最后一条 user 消息**之前**的最后一条消息打第 2 个 breakpoint，缓存"截止上轮"
+        //   的所有历史。下一轮请求只要 system+tools 不变 + 已经过的消息序列不变，就命中缓存。
+        // - 其它 provider 见到 cache_control 但不支持的会被 genai 忽略，无副作用。
+        let last_user_idx = req.messages.iter().rposition(|m| matches!(m, Message::User(_)));
+        let cache_at = match last_user_idx {
+            Some(i) if i > 0 => Some(i - 1),
+            _ => None,
+        };
+        for (idx, msg) in req.messages.iter().enumerate() {
+            let mut m = to_genai_message(msg);
+            if Some(idx) == cache_at {
+                m = m.with_options(CacheControl::Ephemeral);
+            }
+            greq = greq.append_message(m);
         }
         // 下发工具（支持工具的模型才会带）。
         if !req.tools.is_empty() {

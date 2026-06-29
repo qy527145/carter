@@ -66,6 +66,17 @@ impl HookRegistry {
             HookDecision::Continue
         }
     }
+
+    /// 观察型 dispatch：不读返回值、不阻断，仅触发副作用 hook（PostToolUse / PreTurn /
+    /// PostTurn / SessionStart / SessionEnd / SubagentStop / Stop / Notification 等）。
+    /// 内部仍是 fire-and-block（同一 task 内 await 完），但 Rewrite / Block 都被忽略。
+    /// 用于不希望被 hook 改变控制流的事件。
+    pub async fn emit(&self, event: HookEvent, data: Value) {
+        if !self.has(event) {
+            return;
+        }
+        let _ = self.dispatch(event, data).await;
+    }
 }
 
 #[cfg(test)]
