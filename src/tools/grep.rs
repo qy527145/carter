@@ -4,7 +4,7 @@ use std::process::Stdio;
 
 use serde_json::{json, Value};
 
-use super::{arg_str, truncate, Tool, ToolResult};
+use super::{arg_str, arg_u64_opt, truncate, Tool, ToolResult};
 
 pub struct Grep;
 
@@ -17,7 +17,8 @@ impl Tool for Grep {
     }
 
     fn description(&self) -> &str {
-        "用 ripgrep 搜索文件内容。支持正则、按 glob 过滤、限定目录。需系统已安装 rg。"
+        "用 ripgrep 搜索文件内容。支持正则、按 glob 过滤、限定目录、上下文行、忽略大小写。\
+         需系统已安装 rg。"
     }
 
     fn parameters(&self) -> Value {
@@ -26,7 +27,9 @@ impl Tool for Grep {
             "properties": {
                 "pattern": { "type": "string", "description": "正则表达式" },
                 "path": { "type": "string", "description": "搜索目录或文件（缺省当前目录）" },
-                "glob": { "type": "string", "description": "文件过滤 glob，如 *.rs" }
+                "glob": { "type": "string", "description": "文件过滤 glob，如 *.rs" },
+                "case_insensitive": { "type": "boolean", "description": "忽略大小写（缺省 false）" },
+                "context": { "type": "integer", "description": "前后各显示几行上下文（缺省 0）" }
             },
             "required": ["pattern"]
         })
@@ -42,6 +45,14 @@ impl Tool for Grep {
         cmd.arg("--line-number").arg("--no-heading").arg("--color=never");
         if let Some(g) = args.get("glob").and_then(Value::as_str) {
             cmd.arg("--glob").arg(g);
+        }
+        if args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false) {
+            cmd.arg("-i");
+        }
+        if let Some(ctx) = arg_u64_opt(&args, "context") {
+            if ctx > 0 {
+                cmd.arg("-C").arg(ctx.to_string());
+            }
         }
         cmd.arg(&pattern);
         if let Some(p) = args.get("path").and_then(Value::as_str) {

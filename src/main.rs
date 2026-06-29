@@ -3,7 +3,9 @@ mod commands;
 mod config;
 mod cost;
 mod error;
+mod hooks;
 mod mcp;
+mod media;
 mod memory;
 mod prompt;
 mod provider;
@@ -478,7 +480,10 @@ fn count_models(json: &str) -> (usize, usize) {
 
 /// 组装工具注册表：内置工具 + （启用时）Skills 的 `skill` 工具 + 子 agent 的 `task` 工具
 /// + MCP server 透明并入的工具。
-/// `task` 只在主 registry 注入（子 agent 用 `builtin()`，递归守卫 R3）。
+///
+/// `task` 工具持有"工厂闭包"用于子 agent 派生时重建工具池：
+/// - 工厂里**不含** `task`（递归守卫由这里保证）
+/// - 工厂里包含所有 builtin + skill + MCP 工具（子 agent 也能用 MCP）
 fn build_tools(
     skills_enabled: bool,
     provider: Arc<dyn LlmProvider>,
@@ -486,24 +491,33 @@ fn build_tools(
     agent_cfg: crate::config::AgentConfig,
     base_system: String,
     cancel: CancelToken,
-    mcp_tools: Vec<Box<dyn crate::tools::Tool>>,
+    mcp_tools: Vec<Arc<dyn crate::tools::Tool>>,
 ) -> ToolRegistry {
     let mut tools = ToolRegistry::builtin();
     if skills_enabled {
-        tools.push(Box::new(crate::skills::SkillTool::new(
+        tools.push(Arc::new(crate::skills::SkillTool::new(
             crate::config::paths::skills_dir(),
         )));
     }
-    tools.push(Box::new(TaskTool::new(
+    // MCP 工具放进主 registry。
+    for t in &mcp_tools {
+        tools.push(t.clone());
+    }
+
+    // 子 agent 工厂：能产出"主 registry 中的所有工具（去掉 task）"。
+    // tools.tools() 此刻还不含 TaskTool（下面才 push），所以工厂就是当前快照 + 永不含 task。
+    let snapshot: Vec<Arc<dyn crate::tools::Tool>> = tools.tools().to_vec();
+    let factory: crate::agent::ToolFactory = Arc::new(move || snapshot.clone());
+
+    tools.push(Arc::new(TaskTool::new(
         provider,
         model,
         agent_cfg,
         base_system,
         cancel,
+        factory,
+        0, // 主 agent depth = 0
     )));
-    for t in mcp_tools {
-        tools.push(t);
-    }
     tools
 }
 
@@ -520,6 +534,16 @@ async fn run_oneshot(
     system: Vec<String>,
 ) -> Result<std::process::ExitCode> {
     // 续接时 thread 已含历史；追加本次 prompt（并落盘）。
+    // `@图片.png` 等内联图片附件先转成 `[img:...]` token，便于 provider 边界组多模态。
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::from_configs(config.hooks.clone()));
+    let prompt = crate::media::inline_user_attachments(&prompt, &cwd);
+    // UserPromptSubmit hook：可改写 prompt，可阻断。
+    let prompt = run_user_prompt_submit_hook(&hooks, prompt).await;
+    let Some(prompt) = prompt else {
+        // 被 hook 阻断。
+        return Ok(std::process::ExitCode::SUCCESS);
+    };
     thread.append_user(prompt);
     // 子 agent 复用人设段（system[0]）作为其 base system。
     let base_system = system.first().cloned().unwrap_or_default();
@@ -530,6 +554,7 @@ async fn run_oneshot(
             provider: fast_provider,
             model: fast_model,
         }),
+        hooks: hooks.clone(),
     };
     let cancel = CancelToken::new();
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
@@ -588,6 +613,9 @@ async fn run_tui(
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
     // /mcp 用：移入 build_tools 前先记下已加载的 MCP 工具数。
     let mcp_tool_count = mcp_tools.len();
+
+    // 生命周期 hook 注册表（按事件分桶）。
+    let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::from_configs(config.hooks.clone()));
 
     // 自定义斜杠命令：按 cwd 发现一次，移入 agent 任务。
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -653,6 +681,7 @@ async fn run_tui(
 
     // agent 任务：连续多轮，每轮一个 prompt → run_turn → emit 事件。
     let agent_cancel = cancel.clone();
+    let agent_hooks = hooks.clone();
     let agent_task = tokio::spawn(async move {
         let mut thread = thread;
         // 子 agent 复用人设段（system[0]）作为其 base system。
@@ -664,6 +693,7 @@ async fn run_tui(
                 provider: fast_provider.clone(),
                 model: fast_model.clone(),
             }),
+            hooks: agent_hooks.clone(),
         };
         let tools = build_tools(
             config.skills.enabled,
@@ -747,6 +777,19 @@ async fn run_tui(
             };
 
             if let Some(text) = to_run {
+                // `@图片.png` 等内联附件先转成 `[img:...]` token；非图片 `@路径` 不变（保留语义）。
+                let text = crate::media::inline_user_attachments(&text, &cwd);
+                // UserPromptSubmit hook：可改写 / 可阻断。阻断时本轮 prompt 丢弃。
+                let text = match run_user_prompt_submit_hook(&agent_hooks, text).await {
+                    Some(t) => t,
+                    None => {
+                        sink.emit(crate::agent::UiEvent::Notice(
+                            "[hook] prompt blocked by user_prompt_submit hook".into(),
+                        ));
+                        sink.emit(crate::agent::UiEvent::Idle);
+                        continue;
+                    }
+                };
                 thread.append_user(text);
                 if needs_title {
                     needs_title = false;
@@ -1084,6 +1127,33 @@ fn current_meta_placeholder() -> session::SessionMeta {
         carter_version: String::new(),
         model: String::new(),
         created_at: 0,
+    }
+}
+
+/// 跑 `UserPromptSubmit` hook：根据决策返回 `Some(改写后的 prompt)` 或 `None`（被阻断）。
+/// 没有任何 hook 注册 → 直接返回 `Some(text)`，无任何开销。
+async fn run_user_prompt_submit_hook(
+    hooks: &std::sync::Arc<crate::hooks::HookRegistry>,
+    text: String,
+) -> Option<String> {
+    if !hooks.has(crate::hooks::HookEvent::UserPromptSubmit) {
+        return Some(text);
+    }
+    let payload = serde_json::json!({ "prompt": text });
+    match hooks
+        .dispatch(crate::hooks::HookEvent::UserPromptSubmit, payload)
+        .await
+    {
+        crate::hooks::HookDecision::Continue => Some(text),
+        crate::hooks::HookDecision::Rewrite(v) => v
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .map(str::to_string)
+            .or(Some(text)),
+        crate::hooks::HookDecision::Block { reason } => {
+            tracing::info!("hooks: user prompt blocked: {reason}");
+            None
+        }
     }
 }
 

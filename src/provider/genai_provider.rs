@@ -5,8 +5,9 @@ use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
     CacheControl, ChatMessage, ChatOptions, ChatRequest as GenaiChatRequest, ChatStreamEvent,
-    ReasoningEffort as GenaiReasoning, StopReason as GenaiStopReason, Tool as GenaiTool,
-    ToolCall as GenaiToolCall, ToolResponse as GenaiToolResponse, Usage as GenaiUsage,
+    ContentPart, MessageContent, ReasoningEffort as GenaiReasoning, StopReason as GenaiStopReason,
+    Tool as GenaiTool, ToolCall as GenaiToolCall, ToolResponse as GenaiToolResponse,
+    Usage as GenaiUsage,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
@@ -14,6 +15,7 @@ use genai::{Client, ModelIden, ServiceTarget};
 use super::{llm_log, ChatRequest, Event, EventStream, LlmProvider, Message, StopReason, ToolSpec, Usage};
 use crate::config::ProviderConfig;
 use crate::error::CarterError;
+use crate::media::{self, Segment};
 use crate::registry::ReasoningEffort;
 
 /// 基于 genai 的 provider。
@@ -280,8 +282,8 @@ fn adapter_kind_from_str(kind: &str) -> Option<AdapterKind> {
 fn to_genai_message(msg: &Message) -> ChatMessage {
     match msg {
         Message::System(s) => ChatMessage::system(s.clone()),
-        Message::User(s) => ChatMessage::user(s.clone()),
-        Message::Assistant(s) => ChatMessage::assistant(s.clone()),
+        Message::User(s) => user_with_media(s),
+        Message::Assistant(s) => assistant_with_media(s),
         // assistant 发起的工具调用：转成 genai ToolCall 列表（assistant 役）。
         Message::ToolCalls(calls) => {
             let gcalls: Vec<GenaiToolCall> = calls
@@ -295,11 +297,71 @@ fn to_genai_message(msg: &Message) -> ChatMessage {
                 .collect();
             ChatMessage::from(gcalls)
         }
-        // 工具执行结果：tool 役 ToolResponse。
+        // 工具执行结果：tool 役 ToolResponse。content 里若含图片引用同样组装多模态。
+        // 注：genai 0.6.5 的 ToolResponse 当前只支持纯文本 content，故图片引用走文本兜底
+        // （`[img:...]` 字面量），由调用方/模型按需在后续 user 消息里二次引用。
         Message::Tool { call_id, content } => {
             ChatMessage::from(GenaiToolResponse::new(call_id.clone(), content.clone()))
         }
     }
+}
+
+/// 把混排了 `[img:...]` 引用的字符串组装成 genai 多模态 user 消息。
+/// 单段纯文本走老路径（更短的 wire 体 + cache 友好）；含图才切多 part。
+fn user_with_media(text: &str) -> ChatMessage {
+    let parts = build_content_parts(text);
+    if parts.iter().all(|p| matches!(p, ContentPart::Text(_))) {
+        ChatMessage::user(text.to_string())
+    } else {
+        ChatMessage::user(MessageContent::from_parts(parts))
+    }
+}
+
+/// assistant 角色一般不含图片（模型只生成文本），但保留同款切分以防被回灌的历史里有。
+fn assistant_with_media(text: &str) -> ChatMessage {
+    let parts = build_content_parts(text);
+    if parts.iter().all(|p| matches!(p, ContentPart::Text(_))) {
+        ChatMessage::assistant(text.to_string())
+    } else {
+        ChatMessage::assistant(MessageContent::from_parts(parts))
+    }
+}
+
+/// 把 carter 文本切成 genai ContentPart 序列。图片引用解析 → 读盘 → base64。
+/// 读盘失败时把引用降级回原始 token 字面量（保留信息、不爆错）。
+fn build_content_parts(text: &str) -> Vec<ContentPart> {
+    let mut out: Vec<ContentPart> = Vec::new();
+    for seg in media::parse_segments(text) {
+        match seg {
+            Segment::Text(t) => {
+                if !t.is_empty() {
+                    out.push(ContentPart::Text(t));
+                }
+            }
+            Segment::Image(rf) => {
+                match media::read(&rf) {
+                    Ok(bytes) => {
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        out.push(ContentPart::from_binary_base64(
+                            rf.mime(),
+                            b64,
+                            Some(format!("{}.{}", rf.hash, rf.ext)),
+                        ));
+                    }
+                    Err(e) => {
+                        // 读盘失败 → 降级为字面 token，让模型至少看到引用上下文。
+                        tracing::warn!("media: failed to load {}: {e}", rf.token());
+                        out.push(ContentPart::Text(rf.token()));
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(ContentPart::Text(String::new()));
+    }
+    out
 }
 
 /// 自研 ToolSpec → genai Tool。

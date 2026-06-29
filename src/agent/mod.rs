@@ -8,7 +8,7 @@ pub mod turn;
 pub mod ui;
 
 pub use context::generate_title;
-pub use subagent::TaskTool;
+pub use subagent::{TaskTool, ToolFactory};
 pub use thread::Thread;
 #[allow(unused_imports)]
 pub use turn::{run_turn, CompactModel, RunOptions, TurnOutcome, TurnState};

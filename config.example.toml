@@ -1,0 +1,147 @@
+# carter `~/.carter/config.toml` 示例
+
+放在 `~/.carter/config.toml`。所有段都是可选的；不填走代码里的默认值。
+
+```toml
+# ----- agent 基础 -----
+[agent]
+model = "ws/sonnet"              # 默认模型，引用形如 "provider/model"
+fast_model = "ws/haiku"          # 上下文压缩 / 标题生成专用模型（缺省回落 model）
+max_turns = 50                   # 单轮 task 最多多少轮工具循环
+max_output_tokens = 16000        # 单次推理最大输出 tokens
+compact_enabled = true           # 自动上下文压缩
+compact_threshold_ratio = 0.75   # 真实 input tokens > context_window * ratio 时触发
+subagent_max_depth = 3           # 子代理链最大深度（task → task → ...）
+
+# ----- 推理强度 -----
+[reasoning]
+effort = "medium"                # none/low/medium/high/xhigh/max
+show_thinking = true             # 流式渲染思考过程
+
+# ----- skills 能力包目录 -----
+[skills]
+enabled = true                   # 启用 ~/.carter/skills/
+
+# ----- 启动 env -----
+[env]
+http_proxy = "http://127.0.0.1:7890"
+https_proxy = "http://127.0.0.1:7890"
+
+# ----- 调试 -----
+[debug]
+log_requests = false             # 把 LLM 请求 / 响应写到 ~/.carter/debug/llm_log/
+
+# ----- providers -----
+[providers.ws]
+kind = "anthropic"               # anthropic / openai / openai_responses / gemini /
+                                 # openai_compat / ollama / groq / deepseek / xai / openrouter / custom
+base_url = "https://example/anthropic/v1/"
+api_key = "${API_KEY}"           # 支持 ${ENV} 展开
+
+  [providers.ws.models.sonnet]
+  meta = "anthropic/claude-sonnet-4-5"
+  api_name = "claude-sonnet-4-6"
+
+  [providers.ws.models.haiku]
+  meta = "anthropic/claude-haiku-4-5"
+
+# ----- MCP servers -----
+[mcp.servers.fs]
+transport = "stdio"
+command = "npx"
+args = ["-y", "server-filesystem", "/tmp"]
+env = { TOKEN = "${MCP_TOKEN}" }
+
+[mcp.servers.remote]
+transport = "http"
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer ${MCP_BEARER}" }
+
+# ----- Hooks 生命周期钩子（v0.2 新）-----
+#
+# 11 个事件：
+#   session-start / session-end
+#   user-prompt-submit
+#   pre-turn / post-turn
+#   pre-tool-use / post-tool-use
+#   pre-compact
+#   subagent-stop
+#   notification
+#   stop
+#
+# 协议：
+#   - 子进程通过 sh -c "<command>" 启动（Windows: cmd /C）
+#   - 事件 payload 经 stdin 以 JSON 喂入：{ "event": "...", "data": { ... } }
+#   - 退出码：
+#       0 = 通过；若是 rewritable 事件且 stdout 是合法 JSON 则用作改写后的 data
+#       2 = 阻断（仅 pre-tool-use / pre-compact / user-prompt-submit 生效）
+#       其它 = 错误（warn 后按通过处理）
+#   - rewrite 协议：stdout 输出 {"decision":"rewrite","data":{...}}
+#     或直接 stdout 输出 {...}（自动当作改写后 data）
+#   - block 协议：exit 2，stdout 的第一行用作 reason
+
+[[hooks]]
+event = "pre-tool-use"
+command = """
+  # bash 命令前打 git status，让模型 audit-log 一下。
+  if [ "$(jq -r .data.tool)" = "bash" ]; then
+    cmd=$(jq -r .data.args.command)
+    echo "[audit] $(date) running: $cmd" >> ~/.carter/audit.log
+  fi
+"""
+timeout_secs = 5
+match = { tool = "bash" }        # 只对 bash 触发
+
+[[hooks]]
+event = "user-prompt-submit"
+command = """
+  # 自动给所有 user prompt 加日期前缀（演示 rewrite）。
+  data=$(cat)
+  prompt=$(echo "$data" | jq -r .data.prompt)
+  echo "{\\"prompt\\": \\"[$(date +%F)] $prompt\\"}"
+"""
+timeout_secs = 5
+
+[[hooks]]
+event = "pre-tool-use"
+command = """
+  # 阻止任何想动 /etc/ 的 write_file / edit_file。
+  tool=$(jq -r .data.tool)
+  path=$(jq -r .data.args.path // empty)
+  case "$tool/$path" in
+    write_file//etc/* | edit_file//etc/*)
+      echo "writing to /etc/ is forbidden"
+      exit 2
+      ;;
+  esac
+"""
+timeout_secs = 5
+match = { tool_glob = "*_file" }
+
+[[hooks]]
+event = "post-turn"
+command = """
+  # 任务结束时叮一声（macOS）。
+  osascript -e 'display notification "carter done" with title "agent"' >/dev/null 2>&1
+"""
+enabled = false                  # 默认关，需要时改 true
+timeout_secs = 10
+```
+
+## TUI 快捷键
+
+- `Enter` 发送，`Shift+Enter` 换行（需终端支持 Kitty 协议）
+- `↑/↓` 浏览历史输入
+- `/` 触发命令补全；`@` 触发文件补全
+- `@图片.png` 自动作为多模态附件入库
+- `Esc` 取消当前流式请求
+- `Ctrl+C` 双击退出，`Ctrl+D` 立即退出
+
+## 一些常用 slash 命令
+
+- `/model <provider/model>` 切换模型
+- `/compact` 强制压缩上下文
+- `/cost` 查看本会话累计成本
+- `/rewind [n]` 回滚文件检查点
+- `/clear` 清空上下文（磁盘原文保留）
+- `/help` 完整命令列表

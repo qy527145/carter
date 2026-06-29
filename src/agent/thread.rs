@@ -23,6 +23,7 @@ pub struct Thread {
 
 impl Thread {
     /// 用一条用户消息开启会话。
+    #[allow(dead_code)] // 子 agent 改用 new_empty + 手动 push 后此构造未被生产路径使用，但单测仍用。
     pub fn new(user_prompt: impl Into<String>) -> Self {
         Self {
             messages: vec![Message::User(user_prompt.into())],

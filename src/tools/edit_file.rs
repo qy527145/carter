@@ -62,17 +62,27 @@ impl Tool for EditFile {
 }
 
 /// 纯函数核心，便于单测。返回 (新文本, 替换次数)。
+/// 错误信息力求帮助模型自纠：报告匹配次数、最近候选行号（"看似但不是"）。
 fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize), String> {
     if old.is_empty() {
         return Err("old_string must not be empty".to_string());
     }
     let count = text.matches(old).count();
     if count == 0 {
-        return Err(format!("old_string not found: {old:?}"));
+        // 提供 fuzzy 提示：找最长公共前缀让模型知道拼错在哪。
+        let hint = nearest_match_hint(text, old);
+        return Err(format!("old_string not found: {old:?}{hint}"));
     }
     if count > 1 && !replace_all {
+        // 列出前 3 个匹配的行号，便于模型挑更具体的子串。
+        let lines = first_match_lines(text, old, 3);
+        let lines_str = lines
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(format!(
-            "old_string appears {count} times; pass replace_all=true or provide a more specific string"
+            "old_string appears {count} times (lines {lines_str}); pass replace_all=true or provide a more specific string"
         ));
     }
     let updated = if replace_all {
@@ -83,9 +93,55 @@ fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(St
     Ok((updated, count))
 }
 
+/// 找出最长前缀重合的候选行；空返回串表示无线索。
+fn nearest_match_hint(text: &str, old: &str) -> String {
+    // 取 old 的首行（避免多行 old_string 噪声），找首行能匹配到多少前缀的源行。
+    let first = old.lines().next().unwrap_or("").trim();
+    if first.len() < 4 {
+        return String::new();
+    }
+    // 前 12 字符前缀作为锚点。
+    let n = first.chars().take(12).collect::<String>();
+    if n.is_empty() {
+        return String::new();
+    }
+    for (i, line) in text.lines().enumerate() {
+        if line.contains(&n) {
+            return format!(" — closest line {} contains the prefix {:?}", i + 1, n);
+        }
+    }
+    String::new()
+}
+
+/// 列出前 N 个 old 出现的行号（1 基）。
+fn first_match_lines(text: &str, old: &str, max: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    // 把整段拆行；记录每行起始 byte offset，再用 text.find_iter 找 byte offset → line。
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let mut start = 0usize;
+    while let Some(off) = text[start..].find(old) {
+        let abs = start + off;
+        let lineno = match line_starts.binary_search(&abs) {
+            Ok(i) => i + 1,
+            Err(i) => i, // 插入位置 = 该行号（1 基）。
+        };
+        out.push(lineno);
+        if out.len() >= max {
+            break;
+        }
+        start = abs + old.len().max(1);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::apply_edit;
+    use super::{apply_edit, first_match_lines, nearest_match_hint};
 
     #[test]
     fn unique_replace() {
@@ -96,12 +152,15 @@ mod tests {
 
     #[test]
     fn not_found_errors() {
-        assert!(apply_edit("abc", "xyz", "q", false).is_err());
+        let err = apply_edit("abc", "xyz", "q", false).unwrap_err();
+        assert!(err.contains("not found"));
     }
 
     #[test]
     fn ambiguous_without_replace_all_errors() {
-        assert!(apply_edit("a a a", "a", "b", false).is_err());
+        let err = apply_edit("a a a", "a", "b", false).unwrap_err();
+        // 错误里要带行号提示。
+        assert!(err.contains("lines"), "expected line numbers, got: {err}");
     }
 
     #[test]
@@ -109,5 +168,25 @@ mod tests {
         let (out, n) = apply_edit("a a a", "a", "b", true).unwrap();
         assert_eq!(out, "b b b");
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn first_match_lines_finds_correct_row() {
+        let text = "line1\nfoo bar\nline3\nfoo baz\nline5";
+        let lines = first_match_lines(text, "foo", 5);
+        assert_eq!(lines, vec![2, 4]);
+    }
+
+    #[test]
+    fn nearest_match_hint_finds_typos() {
+        let text = "fn render_history(ctx: &Ctx) {}\n";
+        // 拼成 render_histroy（typo），首行前缀 render_histr 无效；改前缀 render_histo 命中。
+        let hint = nearest_match_hint(text, "render_history_typo_long_enough");
+        assert!(hint.contains("closest line"), "got: {hint}");
+    }
+
+    #[test]
+    fn nearest_match_hint_short_query_yields_empty() {
+        assert_eq!(nearest_match_hint("abc", "ab"), "");
     }
 }
