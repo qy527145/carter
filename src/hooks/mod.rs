@@ -35,3 +35,31 @@ pub use registry::HookRegistry;
 #[allow(unused_imports)] // 单测里用
 pub use runner::run_hook;
 pub use types::{HookConfig, HookDecision, HookEvent};
+
+/// 触发 `UserPromptSubmit` hook：
+/// - 没有 hook 注册 → 原样返回 `Some(text)`，零开销
+/// - hook 返回 Rewrite → 用改写后的 prompt
+/// - hook 返回 Block → 返回 `None`，调用方应丢弃本轮
+///
+/// 抽到这里供 TUI / oneshot / NDJSON 三种入口共用（避免重复实现）。
+pub async fn run_user_prompt_submit(
+    hooks: &std::sync::Arc<HookRegistry>,
+    text: String,
+) -> Option<String> {
+    if !hooks.has(HookEvent::UserPromptSubmit) {
+        return Some(text);
+    }
+    let payload = serde_json::json!({ "prompt": text });
+    match hooks.dispatch(HookEvent::UserPromptSubmit, payload).await {
+        HookDecision::Continue => Some(text),
+        HookDecision::Rewrite(v) => v
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .map(str::to_string)
+            .or(Some(text)),
+        HookDecision::Block { reason } => {
+            tracing::info!("hooks: user prompt blocked: {reason}");
+            None
+        }
+    }
+}

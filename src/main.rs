@@ -7,6 +7,7 @@ mod hooks;
 mod mcp;
 mod media;
 mod memory;
+mod ndjson;
 mod prompt;
 mod provider;
 mod registry;
@@ -86,6 +87,11 @@ struct RunArgs {
     /// 强制一次性 stdout 模式（即使无 prompt 也不进 TUI）。
     #[arg(long)]
     no_tui: bool,
+
+    /// NDJSON 模式：通过 stdin/stdout 双向 JSON 流协议供 host 程序驱动
+    /// （VSCode 扩展 / 服务端 / 自动化）。stdin 每行一个 Command，stdout 每行一个 Event。
+    #[arg(long)]
+    ndjson: bool,
 
     /// 续接当前目录最近一条会话。
     #[arg(short = 'c', long = "continue")]
@@ -233,8 +239,23 @@ async fn run() -> Result<std::process::ExitCode> {
         !args.no_memory,
     );
 
-    // 模式分发：有 prompt 或 --no-tui → 一次性 stdout；否则交互式 TUI REPL。
-    if args.prompt.is_some() || args.no_tui {
+    // 模式分发：--ndjson → NDJSON 协议；有 prompt 或 --no-tui → 一次性 stdout；否则 TUI。
+    if args.ndjson {
+        crate::ndjson::run_ndjson(
+            thread,
+            session_meta,
+            provider,
+            model,
+            fast_provider,
+            fast_model,
+            config,
+            show_thinking,
+            model_name,
+            system,
+            cwd,
+        )
+        .await
+    } else if args.prompt.is_some() || args.no_tui {
         let prompt = args.prompt.clone().unwrap_or_default();
         run_oneshot(
             thread,
@@ -546,7 +567,7 @@ async fn run_oneshot(
     let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::from_configs(config.hooks.clone()));
     let prompt = crate::media::inline_user_attachments(&prompt, &cwd);
     // UserPromptSubmit hook：可改写 prompt，可阻断。
-    let prompt = run_user_prompt_submit_hook(&hooks, prompt).await;
+    let prompt = crate::hooks::run_user_prompt_submit(&hooks, prompt).await;
     let Some(prompt) = prompt else {
         // 被 hook 阻断。
         return Ok(std::process::ExitCode::SUCCESS);
@@ -827,7 +848,7 @@ async fn run_tui(
                 // `@图片.png` 等内联附件先转成 `[img:...]` token；非图片 `@路径` 不变（保留语义）。
                 let text = crate::media::inline_user_attachments(&text, &cwd);
                 // UserPromptSubmit hook：可改写 / 可阻断。阻断时本轮 prompt 丢弃。
-                let text = match run_user_prompt_submit_hook(&agent_hooks, text).await {
+                let text = match crate::hooks::run_user_prompt_submit(&agent_hooks, text).await {
                     Some(t) => t,
                     None => {
                         sink.emit(crate::agent::UiEvent::Notice(
@@ -1182,33 +1203,6 @@ fn current_meta_placeholder() -> session::SessionMeta {
         carter_version: String::new(),
         model: String::new(),
         created_at: 0,
-    }
-}
-
-/// 跑 `UserPromptSubmit` hook：根据决策返回 `Some(改写后的 prompt)` 或 `None`（被阻断）。
-/// 没有任何 hook 注册 → 直接返回 `Some(text)`，无任何开销。
-async fn run_user_prompt_submit_hook(
-    hooks: &std::sync::Arc<crate::hooks::HookRegistry>,
-    text: String,
-) -> Option<String> {
-    if !hooks.has(crate::hooks::HookEvent::UserPromptSubmit) {
-        return Some(text);
-    }
-    let payload = serde_json::json!({ "prompt": text });
-    match hooks
-        .dispatch(crate::hooks::HookEvent::UserPromptSubmit, payload)
-        .await
-    {
-        crate::hooks::HookDecision::Continue => Some(text),
-        crate::hooks::HookDecision::Rewrite(v) => v
-            .get("prompt")
-            .and_then(|p| p.as_str())
-            .map(str::to_string)
-            .or(Some(text)),
-        crate::hooks::HookDecision::Block { reason } => {
-            tracing::info!("hooks: user prompt blocked: {reason}");
-            None
-        }
     }
 }
 
