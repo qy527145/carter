@@ -1,10 +1,10 @@
 [package]
 name = "carter"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Carter — a Rust agent CLI with an interactive TUI, multi-provider LLM support, skills, and MCP integration."
 license = "Apache-2.0"
-repository = "https://github.com/qy527145/safedrive"
+repository = "https://github.com/qy527145/carter"
 authors = ["wmymz"]
 
 [package.metadata.wix]
