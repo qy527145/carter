@@ -11,12 +11,11 @@ use crate::error::Result;
 
 use std::sync::Arc;
 
-use crate::agent::{run_turn, CancelToken, RunOptions, StdoutSink, TaskTool, Thread, TurnOutcome};
+use crate::agent::{run_turn, CancelToken, RunOptions, StdoutSink, Thread, TurnOutcome};
 use crate::config::Config;
 use crate::provider::genai_provider::GenaiProvider;
 use crate::provider::LlmProvider;
 use crate::registry::fetch;
-use crate::tools::ToolRegistry;
 use crate::tui::ChannelSink;
 
 #[derive(Parser, Debug)]
@@ -100,6 +99,9 @@ struct RunArgs {
 /// tracing 写日志文件 `~/.carter/carter.log`（append、无 ANSI），避免 warn 喷到终端
 /// 污染 inline TUI viewport / 退出后残留。文件打不开则回落 stderr（oneshot 仍可见）。
 /// LLM 请求日志是独立的（见 crate::provider::llm_log），不走这里。
+///
+/// 用 `try_init` 而不是 `init`：后者在已有全局订阅器时会 **panic**，而宿主进程
+/// （GUI / 服务端）通常自己装了一个。装不上就安静跳过 —— 日志少几行，比整个进程崩掉好。
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
@@ -118,13 +120,15 @@ fn init_tracing() {
                 .with_env_filter(filter)
                 .with_ansi(false)
                 .with_writer(file)
-                .init();
+                .try_init()
+                .ok();
         }
         Err(_) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
-                .init();
+                .try_init()
+                .ok();
         }
     }
 }
@@ -476,55 +480,6 @@ fn count_models(json: &str) -> (usize, usize) {
     (providers, models)
 }
 
-/// 组装工具注册表：内置工具 + （启用时）Skills 的 `skill` 工具 + 子 agent 的 `task` 工具
-/// + MCP server 透明并入的工具。
-///
-/// `task` 工具持有"工厂闭包"用于子 agent 派生时重建工具池：
-/// - 工厂里**不含** `task`（递归守卫由这里保证）
-/// - 工厂里包含所有 builtin + skill + MCP 工具（子 agent 也能用 MCP）
-fn build_tools(
-    skills_enabled: bool,
-    provider: Arc<dyn LlmProvider>,
-    model: crate::registry::ModelInfo,
-    agent_cfg: crate::config::AgentConfig,
-    base_system: String,
-    cancel: CancelToken,
-    mcp_tools: Vec<Arc<dyn crate::tools::Tool>>,
-    ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent::UiEvent>>,
-) -> ToolRegistry {
-    let mut tools = ToolRegistry::builtin();
-    if skills_enabled {
-        tools.push(Arc::new(crate::skills::SkillTool::new(
-            crate::config::paths::skills_dir(),
-        )));
-    }
-    // ask_user_question 工具：有 ui_tx 才注册（TUI 模式）。
-    // oneshot 模式下没有 UI 等用户输入，工具不可用 —— 模型见不到该工具描述也就不会调。
-    if let Some(tx) = &ui_tx {
-        tools.push(Arc::new(crate::agent::AskUserQuestionTool::new(tx.clone())));
-    }
-    // MCP 工具放进主 registry。
-    for t in &mcp_tools {
-        tools.push(t.clone());
-    }
-
-    // 子 agent 工厂：能产出"主 registry 中的所有工具（去掉 task）"。
-    // tools.tools() 此刻还不含 TaskTool（下面才 push），所以工厂就是当前快照 + 永不含 task。
-    let snapshot: Vec<Arc<dyn crate::tools::Tool>> = tools.tools().to_vec();
-    let factory: crate::agent::ToolFactory = Arc::new(move || snapshot.clone());
-
-    tools.push(Arc::new(TaskTool::new(
-        provider,
-        model,
-        agent_cfg,
-        base_system,
-        cancel,
-        factory,
-        0, // 主 agent depth = 0
-    )));
-    tools
-}
-
 /// 一次性 stdout 模式（向后兼容 M1–M3）。
 async fn run_oneshot(
     mut thread: Thread,
@@ -562,7 +517,7 @@ async fn run_oneshot(
     };
     let cancel = CancelToken::new();
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
-    let tools = build_tools(
+    let tools = crate::agent::build_tools(
         config.skills.enabled,
         provider.clone(),
         model.clone(),
@@ -738,7 +693,7 @@ async fn run_tui(
             }),
             hooks: agent_hooks.clone(),
         };
-        let tools = build_tools(
+        let tools = crate::agent::build_tools(
             config.skills.enabled,
             provider.clone(),
             model.clone(),

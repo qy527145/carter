@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
 
-use crate::agent::{run_turn, CancelToken, CompactModel, RunOptions, ToolFactory};
+use crate::agent::{run_turn, CancelToken, CompactModel, RunOptions};
 use crate::config::Config;
 use crate::provider::LlmProvider;
 
@@ -81,7 +81,7 @@ pub async fn run_ndjson(
             hooks: agent_hooks.clone(),
         };
 
-        let tools = build_tools_for_ndjson(
+        let tools = crate::agent::build_tools(
             config.skills.enabled,
             provider.clone(),
             model.clone(),
@@ -89,7 +89,7 @@ pub async fn run_ndjson(
             base_system,
             agent_cancel.clone(),
             mcp_tools,
-            ui_tx.clone(),
+            Some(ui_tx.clone()),
         );
 
         // SessionStart hook。
@@ -184,42 +184,3 @@ pub async fn run_ndjson(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// 构建工具池 —— 与 main::build_tools 几乎一样，但**始终**注册 ask_user_question
-/// （NDJSON 模式下 host 端是"用户"，永远能接 RPC）。
-#[allow(clippy::too_many_arguments)]
-fn build_tools_for_ndjson(
-    skills_enabled: bool,
-    provider: Arc<dyn LlmProvider>,
-    model: crate::registry::ModelInfo,
-    agent_cfg: crate::config::AgentConfig,
-    base_system: String,
-    cancel: CancelToken,
-    mcp_tools: Vec<Arc<dyn crate::tools::Tool>>,
-    ui_tx: tokio::sync::mpsc::UnboundedSender<crate::agent::UiEvent>,
-) -> crate::tools::ToolRegistry {
-    let mut tools = crate::tools::ToolRegistry::builtin();
-    if skills_enabled {
-        tools.push(Arc::new(crate::skills::SkillTool::new(
-            crate::config::paths::skills_dir(),
-        )));
-    }
-    tools.push(Arc::new(crate::agent::AskUserQuestionTool::new(ui_tx)));
-    for t in &mcp_tools {
-        tools.push(t.clone());
-    }
-
-    // 子 agent 工厂（不含 task 自身，递归守卫）。
-    let snapshot: Vec<Arc<dyn crate::tools::Tool>> = tools.tools().to_vec();
-    let factory: ToolFactory = Arc::new(move || snapshot.clone());
-
-    tools.push(Arc::new(crate::agent::TaskTool::new(
-        provider,
-        model,
-        agent_cfg,
-        base_system,
-        cancel,
-        factory,
-        0,
-    )));
-    tools
-}
