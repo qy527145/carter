@@ -10,6 +10,9 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+use llm_adapt_core::{ClientConfig, ProtocolId};
+
+use crate::error::{CarterError, Result};
 use crate::registry::ReasoningEffort;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +124,113 @@ pub struct ProviderConfig {
     /// provider 内部的模型定义：块名即模型名（`provider/model` 引用）。
     #[serde(default)]
     pub models: HashMap<String, ModelEntry>,
+}
+
+/// 渠道种类 → (线协议, 默认端点, 覆盖路径)。
+///
+/// `kind` 是用户面写的东西，允许沿用旧名（`openai` / `openai_compat` / `custom` / `gemini` …），
+/// 由 [`ProtocolId::new`] 做别名归一。带覆盖路径的那两个是**路径与官方不同**的兼容端点：
+/// Gemini 的 OpenAI 兼容端点在 `/v1beta/openai/chat/completions`，不是 `/v1/chat/completions`。
+fn kind_preset(kind: &str) -> (ProtocolId, Option<&'static str>, Option<&'static str>) {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "anthropic_v2" | "anthropic_messages" | "messages" => (
+            ProtocolId::new(ProtocolId::ANTHROPIC),
+            Some("https://api.anthropic.com"),
+            None,
+        ),
+        "openai_responses" | "responses" => (
+            ProtocolId::new(ProtocolId::OPENAI_RESPONSES),
+            Some("https://api.openai.com"),
+            None,
+        ),
+        "gemini" | "google" => (
+            ProtocolId::new(ProtocolId::OPENAI_CHAT),
+            Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+            Some("/chat/completions"),
+        ),
+        "ollama" => (
+            ProtocolId::new(ProtocolId::OPENAI_CHAT),
+            Some("http://localhost:11434/v1"),
+            None,
+        ),
+        "groq" => (
+            ProtocolId::new(ProtocolId::OPENAI_CHAT),
+            Some("https://api.groq.com/openai/v1"),
+            None,
+        ),
+        "deepseek" => (
+            ProtocolId::new(ProtocolId::OPENAI_CHAT),
+            Some("https://api.deepseek.com"),
+            None,
+        ),
+        "xai" | "grok" => (
+            ProtocolId::new(ProtocolId::OPENAI_CHAT),
+            Some("https://api.x.ai/v1"),
+            None,
+        ),
+        "openrouter" => (
+            ProtocolId::new(ProtocolId::OPENAI_CHAT),
+            Some("https://openrouter.ai/api/v1"),
+            None,
+        ),
+        // openai / openai_compat / custom 以及一切未知值：OpenAI Chat 协议。
+        // 未知值必须自带 `base_url`，否则下面会报错而不是偷偷打到 api.openai.com。
+        _ => (ProtocolId::new(ProtocolId::OPENAI_CHAT), None, None),
+    }
+}
+
+impl ProviderConfig {
+    /// 这个渠道走哪种线协议。
+    pub fn protocol(&self) -> ProtocolId {
+        kind_preset(&self.kind).0
+    }
+
+    /// 解析成底座要的客户端配置。
+    ///
+    /// 缺少端点且种类无法辨认时**报错**，不猜 —— 猜错的后果是把请求（连同 API key）
+    /// 发到一个你没打算用的域名上。
+    pub fn to_client_config(&self) -> Result<ClientConfig> {
+        let (_, preset_base, preset_path) = kind_preset(&self.kind);
+        let base_url = self
+            .base_url
+            .clone()
+            .or_else(|| preset_base.map(str::to_string))
+            .ok_or_else(|| {
+                CarterError::Config(format!(
+                    "provider kind `{}` 无法辨认，且没有配 base_url ——                      请补上 base_url，或把 kind 改成内置支持的名字",
+                    self.kind
+                ))
+            })?;
+        Ok(ClientConfig {
+            base_url,
+            path: preset_path.map(str::to_string),
+            api_key: self.api_key.clone().unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+}
+
+impl Config {
+    /// 取某个 provider 的配置。`[providers.*]` 里没有的话按名字合成一份，
+    /// API key 从 `<NAME>_API_KEY` 环境变量取。
+    ///
+    /// 保留这种「不写配置也能跑」的开箱体验是刻意的：换底座之前
+    /// （genai）就是这么工作的，突然要求人人都写 `[providers.*]` 是没必要的破坏。
+    pub fn provider_for(&self, name: &str) -> ProviderConfig {
+        if let Some(p) = self.providers.get(name) {
+            return p.clone();
+        }
+        let env_key = format!(
+            "{}_API_KEY",
+            name.to_ascii_uppercase().replace(['-', '.', '/'], "_")
+        );
+        ProviderConfig {
+            kind: name.to_string(),
+            api_key: std::env::var(&env_key).ok(),
+            base_url: None,
+            models: HashMap::new(),
+        }
+    }
 }
 
 impl Default for Config {

@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use crate::agent::Thread;
 use crate::config::paths::carter_home;
-use crate::provider::Message;
+use crate::provider::WireMessage;
 use crate::tools::TodoItem;
 
-use super::{now_ms, GitInfo, Record, RecordKind, Recorder, SessionMeta};
+use super::{GitInfo, Record, RecordKind, Recorder, SessionMeta, now_ms};
 
 /// fold_file 的副产物：恢复进 thread 的检查点序列（resume/load 时回放）。
 pub type FoldedCheckpoints = Vec<(String, Vec<super::FileSnapshotRecord>)>;
@@ -90,6 +90,7 @@ pub fn start_new(
     let created_at = now_ms();
     let meta = SessionMeta {
         id: id.clone(),
+        format_version: super::CURRENT_FORMAT_VERSION,
         parent_id: None,
         forked_from: None,
         cwd: cwd.to_string_lossy().to_string(),
@@ -112,9 +113,14 @@ pub fn start_new(
 /// Checkpoint 记录按出现顺序保留（resume 后 /rewind 可用）。
 fn fold_file(
     path: &Path,
-) -> crate::Result<(Vec<Message>, Vec<TodoItem>, SessionMeta, FoldedCheckpoints)> {
+) -> crate::Result<(
+    Vec<WireMessage>,
+    Vec<TodoItem>,
+    SessionMeta,
+    FoldedCheckpoints,
+)> {
     let raw = std::fs::read_to_string(path)?;
-    let mut messages: Vec<Message> = Vec::new();
+    let mut messages: Vec<WireMessage> = Vec::new();
     let mut todos: Vec<TodoItem> = Vec::new();
     let mut meta: Option<SessionMeta> = None;
     let mut title: Option<String> = None;
@@ -125,10 +131,18 @@ fn fold_file(
         }
         let rec: Record = match serde_json::from_str(line) {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("session: skip malformed line in {}: {e}", path.display());
-                continue;
-            }
+            // 直接解失败 → 可能是 v1 的老记录，升一级再解。
+            // 判定放在解析失败之后而不是先读文件头的版本号：这样半路混进老记录的
+            // 文件也能读，而「格式版本」字段只用来标注我们写出去的是什么。
+            Err(e) => match super::migrate::upgrade_v1_line(line)
+                .and_then(|v| serde_json::from_value::<Record>(v).ok())
+            {
+                Some(r) => r,
+                None => {
+                    tracing::warn!("session: skip malformed line in {}: {e}", path.display());
+                    continue;
+                }
+            },
         };
         match rec.kind {
             RecordKind::SessionMeta(m) => meta = Some(m),
@@ -172,6 +186,7 @@ pub fn fork(entry: &SessionEntry) -> crate::Result<(Thread, SessionMeta)> {
     let cwd = PathBuf::from(&parent.cwd);
     let meta = SessionMeta {
         id: id.clone(),
+        format_version: super::CURRENT_FORMAT_VERSION,
         parent_id: None,
         forked_from: Some(parent.id.clone()),
         cwd: parent.cwd.clone(),
@@ -271,9 +286,32 @@ mod tests {
         }
     }
 
+    use crate::provider::{Block, Role, ToolResultContent};
+
+    fn user(s: &str) -> WireMessage {
+        WireMessage::user_text(s)
+    }
+
+    fn assistant(s: &str) -> WireMessage {
+        WireMessage::new(Role::Assistant, vec![Block::text(s)])
+    }
+
+    fn tool_result(call_id: &str, content: String) -> WireMessage {
+        WireMessage::new(
+            Role::User,
+            vec![Block::ToolResult {
+                tool_use_id: call_id.to_string(),
+                content: ToolResultContent::Text { text: content },
+                is_error: false,
+                cache: None,
+            }],
+        )
+    }
+
     fn meta() -> SessionMeta {
         SessionMeta {
             id: "s1".into(),
+            format_version: crate::session::CURRENT_FORMAT_VERSION,
             parent_id: None,
             forked_from: None,
             cwd: "/x".into(),
@@ -292,9 +330,11 @@ mod tests {
             &path,
             &[
                 RecordKind::SessionMeta(meta()),
-                RecordKind::Message(Message::User("q".into())),
-                RecordKind::Message(Message::Assistant("a".into())),
-                RecordKind::Title { title: "标题".into() },
+                RecordKind::Message(user("q")),
+                RecordKind::Message(assistant("a")),
+                RecordKind::Title {
+                    title: "标题".into(),
+                },
             ],
         );
         let (messages, _todos, m, _) = fold_file(&path).unwrap();
@@ -310,20 +350,20 @@ mod tests {
             &path,
             &[
                 RecordKind::SessionMeta(meta()),
-                RecordKind::Message(Message::User("q1".into())),
-                RecordKind::Message(Message::Assistant("a1".into())),
+                RecordKind::Message(user("q1")),
+                RecordKind::Message(assistant("a1")),
                 RecordKind::Compacted {
                     tier: "L3".into(),
-                    messages: vec![Message::Assistant("【摘要】".into())],
+                    messages: vec![assistant("【摘要】")],
                 },
-                RecordKind::Message(Message::User("q2".into())),
+                RecordKind::Message(user("q2")),
             ],
         );
         let (messages, _todos, _m, _) = fold_file(&path).unwrap();
         // 压缩快照整体替换前序，再叠加其后的新消息。
         assert_eq!(messages.len(), 2);
-        assert!(matches!(&messages[0], Message::Assistant(s) if s == "【摘要】"));
-        assert!(matches!(&messages[1], Message::User(s) if s == "q2"));
+        assert_eq!(messages[0].content[0].as_text(), Some("【摘要】"));
+        assert_eq!(messages[1].content[0].as_text(), Some("q2"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -343,14 +383,14 @@ mod tests {
             &path,
             &[
                 RecordKind::SessionMeta(meta()),
-                RecordKind::Title { title: "标题".into() },
-                RecordKind::Message(Message::User("q1".into())),
-                RecordKind::Message(Message::Tool {
-                    call_id: "1".into(),
-                    content: "x".repeat(5000), // 大块原始工具输出
-                }),
-                RecordKind::Message(Message::Assistant("a1".into())),
-                RecordKind::Message(Message::User("q2".into())),
+                RecordKind::Title {
+                    title: "标题".into(),
+                },
+                RecordKind::Message(user("q1")),
+                // 大块原始工具输出
+                RecordKind::Message(tool_result("1", "x".repeat(5000))),
+                RecordKind::Message(assistant("a1")),
+                RecordKind::Message(user("q2")),
             ],
         );
         let entry = SessionEntry {
@@ -375,7 +415,7 @@ mod tests {
             &path,
             &[
                 RecordKind::SessionMeta(meta()),
-                RecordKind::Message(Message::User("q".into())),
+                RecordKind::Message(user("q")),
                 RecordKind::Checkpoint {
                     label: "write_file a.txt".into(),
                     snapshots: vec![FileSnapshotRecord {
@@ -383,7 +423,7 @@ mod tests {
                         prior: Some("v0".into()),
                     }],
                 },
-                RecordKind::Message(Message::Assistant("done".into())),
+                RecordKind::Message(assistant("done")),
             ],
         );
         let (msgs, _todos, _meta, ckpts) = fold_file(&path).unwrap();

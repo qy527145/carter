@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::provider::ToolSpec;
 
-pub use todo_write::{parse_todos, TodoItem, TodoStatus};
+pub use todo_write::{TodoItem, TodoStatus, parse_todos};
 
 /// 结构化工具输出（docs §4.4 简化版：去掉权限元数据）。
 /// 错误即数据：失败不抛异常，包成 `ok=false` 回灌让模型自纠。
@@ -30,12 +30,18 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { ok: true, content: content.into() }
+        Self {
+            ok: true,
+            content: content.into(),
+        }
     }
 
     /// 失败结果。content 即结构化错误文本（回灌给模型）。
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, content: msg.into() }
+        Self {
+            ok: false,
+            content: msg.into(),
+        }
     }
 
     /// 回灌给模型的最终字符串。失败时带明显前缀，便于模型识别并自纠。
@@ -98,14 +104,13 @@ impl ToolRegistry {
     }
 
     /// 转成下发给模型的工具规格。
+    ///
+    /// 全部是**本地函数工具**。服务端工具（厂商自己执行的 web_search 等）不由工具
+    /// 注册表产出 —— 它们是渠道能力，由 provider 层按渠道协议声明。
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
             .iter()
-            .map(|t| ToolSpec {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters(),
-            })
+            .map(|t| ToolSpec::function(t.name(), t.description(), t.parameters()))
             .collect()
     }
 
@@ -160,9 +165,5 @@ pub(crate) fn truncate(s: &str, max_bytes: usize) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!(
-        "{}\n... [truncated {} bytes]",
-        &s[..end],
-        s.len() - end
-    )
+    format!("{}\n... [truncated {} bytes]", &s[..end], s.len() - end)
 }

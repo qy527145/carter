@@ -32,10 +32,7 @@ impl HookEvent {
 
     /// 该事件是否允许改写 payload（pre_* 类 + user_prompt_submit）。
     pub fn is_rewritable(&self) -> bool {
-        matches!(
-            self,
-            HookEvent::PreToolUse | HookEvent::UserPromptSubmit
-        )
+        matches!(self, HookEvent::PreToolUse | HookEvent::UserPromptSubmit)
     }
 }
 

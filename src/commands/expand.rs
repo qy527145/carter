@@ -33,7 +33,9 @@ fn inject_files(body: &str, cwd: &Path) -> String {
             if !token.is_empty() {
                 let path = cwd.join(&token);
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    out.push_str(&format!("\n--- {token} ---\n{content}\n--- end {token} ---\n"));
+                    out.push_str(&format!(
+                        "\n--- {token} ---\n{content}\n--- end {token} ---\n"
+                    ));
                     i = j;
                     continue;
                 }

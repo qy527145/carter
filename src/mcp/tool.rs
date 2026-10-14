@@ -63,7 +63,7 @@ impl Tool for McpTool {
             other => {
                 return ToolResult::err(format!(
                     "tool arguments must be a JSON object, got: {other}"
-                ))
+                ));
             }
         };
 

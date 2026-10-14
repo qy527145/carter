@@ -2,9 +2,9 @@
 
 use std::process::Stdio;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{arg_str, arg_u64_opt, truncate, Tool, ToolResult};
+use super::{Tool, ToolResult, arg_str, arg_u64_opt, truncate};
 
 pub struct Grep;
 
@@ -42,11 +42,17 @@ impl Tool for Grep {
         };
 
         let mut cmd = tokio::process::Command::new("rg");
-        cmd.arg("--line-number").arg("--no-heading").arg("--color=never");
+        cmd.arg("--line-number")
+            .arg("--no-heading")
+            .arg("--color=never");
         if let Some(g) = args.get("glob").and_then(Value::as_str) {
             cmd.arg("--glob").arg(g);
         }
-        if args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false) {
+        if args
+            .get("case_insensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             cmd.arg("-i");
         }
         if let Some(ctx) = arg_u64_opt(&args, "context") {
@@ -63,9 +69,7 @@ impl Tool for Grep {
         let output = match cmd.output().await {
             Ok(o) => o,
             Err(e) => {
-                return ToolResult::err(format!(
-                    "cannot run ripgrep (is `rg` installed?): {e}"
-                ))
+                return ToolResult::err(format!("cannot run ripgrep (is `rg` installed?): {e}"));
             }
         };
 

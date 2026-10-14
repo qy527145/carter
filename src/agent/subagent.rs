@@ -17,15 +17,15 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::AgentConfig;
-use crate::provider::{LlmProvider, Message};
+use crate::provider::{LlmProvider, WireMessage};
 use crate::registry::ModelInfo;
 use crate::tools::{Tool, ToolRegistry, ToolResult};
 
 use super::thread::Thread;
-use super::turn::{run_turn, RunOptions, TurnOutcome};
+use super::turn::{RunOptions, TurnOutcome, run_turn};
 use super::ui::{CancelToken, UiEvent, UiSink};
 
 /// 子 agent 的轮数上限（独立于主 agent，防失控）。
@@ -130,12 +130,15 @@ impl Tool for TaskTool {
         }
 
         // 解析 prompt(s)：要么单个 prompt，要么多个 prompts。
-        let prompts: Vec<String> = if let Some(arr) = args.get("prompts").and_then(Value::as_array) {
+        let prompts: Vec<String> = if let Some(arr) = args.get("prompts").and_then(Value::as_array)
+        {
             let mut out = Vec::new();
             for p in arr {
                 match p.as_str() {
                     Some(s) if !s.is_empty() => out.push(s.to_string()),
-                    _ => return ToolResult::err("prompts array contains non-string or empty entry"),
+                    _ => {
+                        return ToolResult::err("prompts array contains non-string or empty entry");
+                    }
                 }
             }
             if out.is_empty() {
@@ -145,15 +148,17 @@ impl Tool for TaskTool {
         } else {
             match args.get("prompt").and_then(Value::as_str) {
                 Some(p) if !p.is_empty() => vec![p.to_string()],
-                _ => return ToolResult::err("missing argument: pass `prompt` (string) or `prompts` (array)"),
+                _ => {
+                    return ToolResult::err(
+                        "missing argument: pass `prompt` (string) or `prompts` (array)",
+                    );
+                }
             }
         };
 
         // 工具白名单（None = 全开）。
-        let whitelist: Option<Vec<String>> = args
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(|arr| {
+        let whitelist: Option<Vec<String>> =
+            args.get("tools").and_then(Value::as_array).map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
                     .collect()
@@ -244,7 +249,7 @@ impl Tool for TaskTool {
 #[allow(clippy::too_many_arguments)]
 async fn spawn_one(
     prompt: String,
-    initial_messages: Vec<Message>,
+    initial_messages: Vec<WireMessage>,
     provider: Arc<dyn LlmProvider>,
     model: ModelInfo,
     agent_cfg: AgentConfig,
@@ -291,7 +296,7 @@ async fn spawn_one(
     for m in initial_messages {
         thread.messages.push(m);
     }
-    thread.messages.push(Message::User(prompt));
+    thread.messages.push(WireMessage::user_text(prompt));
     let mut sink = CollectSink::default();
 
     let result = run_turn(
@@ -357,7 +362,7 @@ impl UiSink for CollectSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ChatRequest, Event, EventStream, StopReason};
+    use crate::provider::{ChatRequest, EventStream, FinishReason, StreamChunk};
     use crate::registry::{Pricing, ReasoningEffort};
 
     #[test]
@@ -391,8 +396,10 @@ mod tests {
         async fn stream(&self, _req: ChatRequest) -> crate::Result<EventStream> {
             let text = self.0.clone();
             let events = vec![
-                Ok(Event::TextDelta(text)),
-                Ok(Event::Done(StopReason::EndTurn)),
+                Ok(StreamChunk::TextDelta { index: 0, text }),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                }),
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }

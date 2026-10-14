@@ -2,7 +2,7 @@
 //! 工具的 execute 只校验+回显；真正写入 `Thread.todos` 由 turn.rs 在 dispatch 后特判。
 //! 类型 + 解析定义在此（tools 是 agent 的下层，agent 可反向 import）。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{Tool, ToolResult};
 
@@ -56,7 +56,9 @@ pub fn parse_todos(args: &Value) -> Result<Vec<TodoItem>, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("todos[{i}]: missing or non-string `status`"))?;
         let status = TodoStatus::from_str(status_str).ok_or_else(|| {
-            format!("todos[{i}]: invalid status `{status_str}` (expected pending/in_progress/completed)")
+            format!(
+                "todos[{i}]: invalid status `{status_str}` (expected pending/in_progress/completed)"
+            )
         })?;
         // active_form 可选，缺省回退到 content。
         let active_form = item
@@ -116,8 +118,14 @@ impl Tool for TodoWrite {
         // 仅校验 + 回显；写入 Thread.todos 由 turn.rs 特判完成。
         match parse_todos(&args) {
             Ok(todos) => {
-                let done = todos.iter().filter(|t| t.status == TodoStatus::Completed).count();
-                let in_prog = todos.iter().filter(|t| t.status == TodoStatus::InProgress).count();
+                let done = todos
+                    .iter()
+                    .filter(|t| t.status == TodoStatus::Completed)
+                    .count();
+                let in_prog = todos
+                    .iter()
+                    .filter(|t| t.status == TodoStatus::InProgress)
+                    .count();
                 ToolResult::ok(format!(
                     "todos updated: {} total ({} completed, {} in progress)",
                     todos.len(),

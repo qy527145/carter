@@ -1,99 +1,119 @@
-//! 大模型请求日志 —— 独立于 carter.log，按天拆分的 JSONL。
-//! 默认目录 `~/.carter/debug/llm_log/<YYYY-MM-DD>.jsonl`（UTC 日期）。
-//! **一行 = 一次完整交换**：`{ts,id,provider,request{...},response{...}}`。
-//! 请求含 endpoint/method/model/system/messages/tools；响应把流式 SSE 合并成
-//! text/thinking/tool_calls/usage/stop。用 `serde_json::to_string`（默认不转义非 ASCII，
-//! 中文原样写入）。失败仅 warn 不影响请求。
+//! 请求报文日志（`[debug] log_requests`）。
 //!
-//! 说明：这是 carter 视角的「归一化交换」，非逐字节 wire 报文——精确的 HTTP 头/原始体
-//! 由 genai 内部序列化，需要逐字节时用 mitmproxy 等抓包工具。
+//! 实现成底座的 [`RequestHook`] 而不是塞进 provider：hook 拿到的 `HttpRequest.body`
+//! 就是最终要发出去的**字节**。旧底座（genai）只能给出归一化视图，排障时经常对不上
+//! 真实报文 —— 现在记下来的是原名原样的东西。
+//!
+//! 只记请求与（非流式的）响应头/体。**流式响应的逐帧**要等 M5 的捕获层，
+//! 那时会连 SSE 帧与耗时一起落到 SQLite，供对话里的「查看原始报文」用。
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::session::{civil_from_days, now_ms};
+use llm_adapt_core::{HttpRequest, RawHttpResponse, RequestHook};
+use serde_json::{Value, json};
 
-/// 写入一条交换记录（已组装好的 JSON）。按 UTC 日期落到 `<dir>/<YYYY-MM-DD>.jsonl`。
-pub fn write_exchange(dir: &Path, entry: &serde_json::Value) {
-    let ms = now_ms();
-    let (y, m, d, ..) = ymd_hms(ms);
-    let file = dir.join(format!("{y:04}-{m:02}-{d:02}.jsonl"));
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!("llm_log: create dir failed: {e}");
-        return;
+/// 落盘目录由 `[debug] llm_log_dir` 决定，默认 `~/.carter/debug/llm_log`。
+pub struct LlmLogHook {
+    dir: PathBuf,
+    /// 请求 / 响应配对的序号。hook 是同步的、没有请求上下文，
+    /// 只能靠这个把成对的两条记录串起来。
+    seq: AtomicU64,
+}
+
+impl LlmLogHook {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            seq: AtomicU64::new(0),
+        }
     }
-    let line = match serde_json::to_string(entry) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("llm_log: serialize failed: {e}");
+
+    fn append(&self, kind: &str, seq: u64, payload: Value) {
+        if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
-    };
-    match OpenOptions::new().create(true).append(true).open(&file) {
-        Ok(mut f) => {
-            let _ = writeln!(f, "{line}");
-        }
-        Err(e) => tracing::warn!("llm_log: open {} failed: {e}", file.display()),
-    }
-}
-
-/// epoch ms → ISO-8601 UTC 字符串（无依赖）。
-pub fn iso_utc(ms: u64) -> String {
-    let (y, mo, d, h, mi, s, milli) = ymd_hms(ms);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{milli:03}Z")
-}
-
-/// epoch ms → (年, 月, 日, 时, 分, 秒, 毫秒)，UTC。
-fn ymd_hms(ms: u64) -> (i64, u32, u32, u32, u32, u32, u32) {
-    let secs = (ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (y, mo, d) = civil_from_days(days);
-    let h = (rem / 3600) as u32;
-    let mi = ((rem % 3600) / 60) as u32;
-    let s = (rem % 60) as u32;
-    (y, mo, d, h, mi, s, (ms % 1000) as u32)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn civil_from_days_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(20_632), (2026, 6, 28));
-    }
-
-    #[test]
-    fn iso_utc_formats() {
-        assert_eq!(iso_utc(0), "1970-01-01T00:00:00.000Z");
-        let ms = (86_400 + 3661) * 1000 + 500;
-        assert_eq!(iso_utc(ms), "1970-01-02T01:01:01.500Z");
-    }
-
-    #[test]
-    fn write_exchange_keeps_utf8_unescaped() {
-        let dir = std::env::temp_dir().join(format!("carter-llmlog-{}", now_ms()));
-        let entry = serde_json::json!({
-            "id": "x",
-            "request": { "messages": [{"User": "你好"}] },
-            "response": { "text": "世界" },
+        let now = crate::session::now_ms();
+        let path = self
+            .dir
+            .join(format!("{}.jsonl", crate::session::date_utc(now)));
+        let line = json!({
+            "ts": now,
+            "seq": seq,
+            "kind": kind,
+            "data": payload,
         });
-        write_exchange(&dir, &entry);
-        let mut found = false;
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for ent in rd.flatten() {
-                let content = std::fs::read_to_string(ent.path()).unwrap();
-                assert!(content.contains("你好") && content.contains("世界"), "原样中文: {content}");
-                assert!(!content.contains("\\u4f60"), "不应转义: {content}");
-                // 一行一条。
-                assert_eq!(content.lines().count(), 1);
-                found = true;
-            }
+        let Ok(mut s) = serde_json::to_string(&line) else {
+            return;
+        };
+        s.push('\n');
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(s.as_bytes());
         }
-        assert!(found, "应生成日志文件");
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+impl RequestHook for LlmLogHook {
+    fn before_request(&self, req: &HttpRequest) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.append(
+            "request",
+            seq,
+            json!({
+                "method": format!("{:?}", req.method),
+                "url": req.url,
+                "headers": redact(&req.headers),
+                "body": parse_body(&req.body),
+            }),
+        );
+    }
+
+    fn after_raw_response(&self, resp: &RawHttpResponse) {
+        // 用当前序号减一：请求先记，紧接着才是它的响应。
+        let seq = self.seq.load(Ordering::Relaxed).saturating_sub(1);
+        self.append(
+            "response",
+            seq,
+            json!({
+                "status": resp.status,
+                "headers": redact(&resp.headers),
+                "body": parse_body(&resp.body),
+            }),
+        );
+    }
+}
+
+/// 密钥落盘前脱敏。日志是给人看的，不该顺手把 key 抄一份到磁盘上。
+fn redact(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let lower = k.to_ascii_lowercase();
+            let sensitive = lower == "authorization"
+                || lower == "x-api-key"
+                || lower.contains("api-key")
+                || lower.contains("token");
+            if sensitive {
+                (k.clone(), "***".to_string())
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect()
+}
+
+/// 能当 JSON 解析就当 JSON（便于阅读与 diff），否则退回字符串。
+fn parse_body(bytes: &[u8]) -> Value {
+    if bytes.is_empty() {
+        return Value::Null;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string())),
+        Err(_) => Value::String(format!("<{} 字节的二进制>", bytes.len())),
     }
 }

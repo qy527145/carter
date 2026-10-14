@@ -1,9 +1,11 @@
 //! 上下文工程：token 估算 + 分级压缩（L1 清旧工具输出 / L2 滚动摘要）。
-//! 纪律：本文件不得 import 任何 `genai::*`；压缩的模型调用走 `LlmProvider` trait。
+//! 纪律：本文件不得 import 任何具体底座类型；压缩的模型调用走 `LlmProvider` trait。
 
 use futures::StreamExt;
 
-use crate::provider::{ChatRequest, Event, LlmProvider, Message};
+use crate::provider::{
+    Block, ChatRequest, LlmProvider, Role, StreamChunk, ToolResultContent, WireMessage, WireRequest,
+};
 use crate::registry::ModelInfo;
 
 use super::thread::Thread;
@@ -21,12 +23,12 @@ const L3_SUMMARY_MAX_TOKENS: u32 = 3000;
 /// 估算一组消息的 token 数。默认走 cl100k_base（OpenAI 系精确、Anthropic 系合理近似）；
 /// 用 `estimate_tokens_for` 可显式按 model.tokenizer 选编码器拿到更精确结果。
 /// 仅用于"是否触发上下文压缩"的判定；真实计费仍以 provider 返回的 Usage 为准。
-pub fn estimate_tokens(messages: &[Message]) -> u64 {
+pub fn estimate_tokens(messages: &[WireMessage]) -> u64 {
     crate::tokens::estimate_messages(messages, "cl100k")
 }
 
 /// 按模型 tokenizer 估算 token 数（精确路径，供 turn.rs 在已知 model 时调用）。
-pub fn estimate_tokens_for(messages: &[Message], tokenizer: &str) -> u64 {
+pub fn estimate_tokens_for(messages: &[WireMessage], tokenizer: &str) -> u64 {
     crate::tokens::estimate_messages(messages, tokenizer)
 }
 
@@ -96,7 +98,10 @@ pub async fn compact(
     if let Some((tier, summary)) = tiered {
         let mut rebuilt = Vec::with_capacity(2 + recent.len());
         rebuilt.push(head);
-        rebuilt.push(Message::Assistant(format!("【历史摘要·{tier}】\n{summary}")));
+        rebuilt.push(WireMessage::new(
+            Role::Assistant,
+            vec![Block::text(format!("【历史摘要·{tier}】\n{summary}"))],
+        ));
         rebuilt.extend(recent);
         let after = estimate_tokens_for(&rebuilt, &model.tokenizer);
         thread.messages = rebuilt;
@@ -114,31 +119,41 @@ pub async fn compact(
     Ok(())
 }
 
-/// L1：把保护窗口之外的 `Message::Tool` 大输出替换为占位摘要。纯函数，便于测试。
-fn elide_old_tool_outputs(messages: &mut [Message], keep_recent: usize) {
+/// L1：把保护窗口之外的工具结果大输出替换为占位摘要。纯函数，便于测试。
+fn elide_old_tool_outputs(messages: &mut [WireMessage], keep_recent: usize) {
     let len = messages.len();
     if len <= keep_recent {
         return;
     }
     let cutoff = len - keep_recent;
     for msg in messages.iter_mut().take(cutoff) {
-        if let Message::Tool { call_id, content } = msg {
-            // 已折叠过的不再处理。
-            if content.starts_with("[tool result elided") {
-                continue;
+        for block in &mut msg.content {
+            if let Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = block
+            {
+                if let ToolResultContent::Text { text } = content {
+                    // 已折叠过的不再处理。
+                    if text.starts_with("[tool result elided") {
+                        continue;
+                    }
+                    let bytes = text.len();
+                    *text = format!("[tool result elided: {bytes} bytes, call_id={tool_use_id}]");
+                }
             }
-            let bytes = content.len();
-            *content = format!("[tool result elided: {bytes} bytes, call_id={call_id}]");
         }
     }
 }
 
 /// L0：把保护窗口之外的消息文本里的 `[img:<hash>.<ext>]` 引用替换为占位文本
-/// `[image elided]`，让 genai 边界不再发对应的多模态块。返回剥离的引用条数。
+/// `[image elided]`，让 provider 边界不再发对应的多模态块。返回剥离的引用条数。
 ///
-/// 仅扫 User / Assistant / Tool 文本字段；不动 ToolCalls / System。
-/// 最近 `keep_recent` 条不动（让模型还能看到当前任务的图）。
-fn strip_old_image_refs(messages: &mut [Message], keep_recent: usize) -> usize {
+/// 历史里存的是**引用 token** 而不是图片字节（否则会话 JSONL 会被 base64 撑爆），
+/// 所以「丢掉旧图」在这里就是改写那些 token。最近 `keep_recent` 条不动 ——
+/// 当前任务的图得让模型还看得到。
+fn strip_old_image_refs(messages: &mut [WireMessage], keep_recent: usize) -> usize {
     let len = messages.len();
     if len <= keep_recent {
         return 0;
@@ -146,14 +161,10 @@ fn strip_old_image_refs(messages: &mut [Message], keep_recent: usize) -> usize {
     let cutoff = len - keep_recent;
     let mut stripped = 0usize;
     for msg in messages.iter_mut().take(cutoff) {
-        match msg {
-            Message::User(s) | Message::Assistant(s) => {
-                stripped += strip_in_str(s);
+        for block in &mut msg.content {
+            if let Block::Text { text, .. } = block {
+                stripped += strip_in_str(text);
             }
-            Message::Tool { content, .. } => {
-                stripped += strip_in_str(content);
-            }
-            _ => {}
         }
     }
     stripped
@@ -183,9 +194,9 @@ fn strip_in_str(s: &mut String) -> usize {
 /// L2 切分：首条 user（head，必留）+ 中段（middle，待摘要）+ 尾部 keep_recent 条（必留）。
 /// 返回 None 表示无法有效切分（历史太短）。纯函数，便于测试。
 fn split_for_summary(
-    messages: &[Message],
+    messages: &[WireMessage],
     keep_recent: usize,
-) -> Option<(Message, Vec<Message>, Vec<Message>)> {
+) -> Option<(WireMessage, Vec<WireMessage>, Vec<WireMessage>)> {
     if messages.is_empty() {
         return None;
     }
@@ -202,7 +213,7 @@ fn split_for_summary(
 
 /// 对中段历史调一次模型生成摘要。复用 provider.stream() 收集 TextDelta。
 async fn summarize(
-    middle: &[Message],
+    middle: &[WireMessage],
     provider: &dyn LlmProvider,
     model: &ModelInfo,
 ) -> crate::Result<String> {
@@ -223,7 +234,7 @@ fn structured_summary_system() -> &'static str {
 
 /// L3：用结构化模板生成高保真摘要。
 async fn summarize_structured(
-    middle: &[Message],
+    middle: &[WireMessage],
     provider: &dyn LlmProvider,
     model: &ModelInfo,
 ) -> crate::Result<String> {
@@ -246,20 +257,22 @@ async fn run_summary(
     provider: &dyn LlmProvider,
     model: &ModelInfo,
 ) -> crate::Result<String> {
+    let mut wire = WireRequest::new(model.api_name.clone());
+    wire.system = vec![Block::text(system)];
+    wire.messages = vec![WireMessage::user_text(format!(
+        "【待压缩历史】\n{rendered}"
+    ))];
+    wire.max_tokens = Some(max_tokens);
     let req = ChatRequest {
-        model_api_name: model.api_name.clone(),
-        system: vec![system.to_string()],
-        messages: vec![Message::User(format!("【待压缩历史】\n{rendered}"))],
-        tools: Vec::new(),
-        reasoning: None,
-        max_output_tokens: Some(max_tokens),
+        protocol: None,
+        wire,
     };
 
     let mut stream = provider.stream(req).await?;
     let mut summary = String::new();
     while let Some(ev) = stream.next().await {
-        if let Event::TextDelta(t) = ev? {
-            summary.push_str(&t);
+        if let StreamChunk::TextDelta { text, .. } = ev? {
+            summary.push_str(&text);
         }
     }
     if summary.trim().is_empty() {
@@ -291,20 +304,41 @@ pub async fn generate_title(
 }
 
 /// 把消息渲染成纯文本（供摘要输入）。
-fn render_messages(messages: &[Message]) -> String {
+///
+/// 按块展开而不是按消息：一条助手消息里可能既有思考又有工具调用，
+/// 摘要器需要看到这个次序才能叙述「它先想了什么、再做了什么」。
+fn render_messages(messages: &[WireMessage]) -> String {
     let mut out = String::new();
     for msg in messages {
-        match msg {
-            Message::System(s) => out.push_str(&format!("[system] {s}\n")),
-            Message::User(s) => out.push_str(&format!("[user] {s}\n")),
-            Message::Assistant(s) => out.push_str(&format!("[assistant] {s}\n")),
-            Message::ToolCalls(calls) => {
-                for c in calls {
-                    out.push_str(&format!("[tool_call] {}({})\n", c.name, c.args));
-                }
-            }
-            Message::Tool { call_id, content } => {
-                out.push_str(&format!("[tool_result {call_id}] {content}\n"));
+        let role = msg.role.as_str();
+        for b in &msg.content {
+            match b {
+                Block::Text { text, .. } => out.push_str(&format!(
+                    "[{role}] {text}
+"
+                )),
+                Block::Thinking { text, .. } => out.push_str(&format!(
+                    "[thinking] {text}
+"
+                )),
+                Block::ToolUse { name, input, .. } => out.push_str(&format!(
+                    "[tool_call] {name}({input})
+"
+                )),
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => out.push_str(&format!(
+                    "[tool_result {tool_use_id}] {}
+",
+                    content.as_text()
+                )),
+                Block::Image { .. } => out.push_str(
+                    "[image]
+",
+                ),
+                _ => {}
             }
         }
     }
@@ -313,16 +347,42 @@ fn render_messages(messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// v1 风格的助手文本消息构造，测试里用起来短一些。
+    fn assistant_ir(text: impl Into<String>) -> WireMessage {
+        WireMessage::new(Role::Assistant, vec![Block::text(text)])
+    }
+
     use super::*;
-    use crate::provider::{ChatRequest, EventStream, ToolCall};
+    use crate::provider::{
+        Block, ChatRequest, EventStream, FinishReason, Role, StreamChunk, ToolResultContent,
+        WireMessage,
+    };
     use crate::registry::{Pricing, ReasoningEffort};
     use serde_json::json;
 
-    fn tool_msg(id: &str, content: &str) -> Message {
-        Message::Tool {
-            call_id: id.to_string(),
-            content: content.to_string(),
-        }
+    /// 取出消息里第一个工具结果的文本。
+    fn tool_text(m: &WireMessage) -> String {
+        m.content
+            .iter()
+            .find_map(|b| match b {
+                Block::ToolResult { content, .. } => Some(content.as_text()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn tool_msg(id: &str, content: &str) -> WireMessage {
+        WireMessage::new(
+            Role::User,
+            vec![Block::ToolResult {
+                tool_use_id: id.to_string(),
+                content: ToolResultContent::Text {
+                    text: content.to_string(),
+                },
+                is_error: false,
+                cache: None,
+            }],
+        )
     }
 
     /// 返回固定一次性流的假 provider（供摘要逻辑单测，不触网）。
@@ -334,8 +394,13 @@ mod tests {
     impl LlmProvider for FakeProvider {
         async fn stream(&self, _req: ChatRequest) -> crate::Result<EventStream> {
             let events = vec![
-                Ok(Event::TextDelta(self.text.clone())),
-                Ok(Event::Done(crate::provider::StopReason::EndTurn)),
+                Ok(StreamChunk::TextDelta {
+                    index: 0,
+                    text: self.text.clone(),
+                }),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                }),
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
@@ -367,75 +432,56 @@ mod tests {
 
     #[test]
     fn estimate_grows_with_content() {
-        let short = vec![Message::User("hi".to_string())];
-        let long = vec![Message::User("x".repeat(400))];
+        let short = vec![WireMessage::user_text("hi")];
+        let long = vec![WireMessage::user_text("x".repeat(400))];
         assert!(estimate_tokens(&long) > estimate_tokens(&short));
     }
 
     #[test]
     fn l1_elides_old_tool_outputs_keeps_recent() {
         let mut msgs = vec![
-            Message::User("task".to_string()),
+            WireMessage::user_text("task"),
             tool_msg("a", &"big output ".repeat(100)),
-            Message::Assistant("thinking".to_string()),
+            assistant_ir("thinking".to_string()),
             tool_msg("b", "recent output kept"),
         ];
         // keep_recent = 2 → 最后 2 条保留，前 2 条折叠。
         elide_old_tool_outputs(&mut msgs, 2);
         // 第 1 条 Tool(a) 应被折叠。
-        if let Message::Tool { content, .. } = &msgs[1] {
-            assert!(content.starts_with("[tool result elided"));
-        } else {
-            panic!("expected tool msg");
-        }
+        assert!(tool_text(&msgs[1]).starts_with("[tool result elided"));
         // 最后一条 Tool(b) 原样。
-        if let Message::Tool { content, .. } = &msgs[3] {
-            assert_eq!(content, "recent output kept");
-        } else {
-            panic!("expected tool msg");
-        }
+        assert_eq!(tool_text(&msgs[3]), "recent output kept");
     }
 
     #[test]
     fn l1_noop_when_short() {
         let mut msgs = vec![tool_msg("a", "out")];
         elide_old_tool_outputs(&mut msgs, 6);
-        if let Message::Tool { content, .. } = &msgs[0] {
-            assert_eq!(content, "out");
-        }
+        assert_eq!(tool_text(&msgs[0]), "out");
     }
 
     #[test]
     fn strip_old_image_refs_replaces_only_old_imgs() {
         let mut msgs = vec![
-            Message::User("oldest [img:abc.png] question".into()),
-            Message::Assistant("answer".into()),
-            Message::User("recent [img:def.png] still visible".into()),
+            WireMessage::user_text("oldest [img:abc.png] question"),
+            assistant_ir("answer"),
+            WireMessage::user_text("recent [img:def.png] still visible"),
         ];
         // keep_recent = 1 → 前两条会被 strip，最后一条保留。
         let n = super::strip_old_image_refs(&mut msgs, 1);
         assert_eq!(n, 1);
-        match &msgs[0] {
-            Message::User(s) => {
-                assert!(s.contains("[image elided]"));
-                assert!(!s.contains("[img:abc"));
-            }
-            _ => panic!(),
-        }
-        match &msgs[2] {
-            Message::User(s) => {
-                assert!(s.contains("[img:def.png]"));
-            }
-            _ => panic!(),
-        }
+        let first = msgs[0].concat_text();
+        assert!(first.contains("[image elided]"));
+        assert!(!first.contains("[img:abc"));
+        assert!(msgs[2].concat_text().contains("[img:def.png]"));
     }
 
     #[test]
     fn strip_old_image_refs_returns_zero_when_no_imgs() {
         let mut msgs = vec![
-            Message::User("plain text".into()),
-            Message::Assistant("answer".into()),
-            Message::User("more text".into()),
+            WireMessage::user_text("plain text"),
+            assistant_ir("answer"),
+            WireMessage::user_text("more text"),
         ];
         let n = super::strip_old_image_refs(&mut msgs, 1);
         assert_eq!(n, 0);
@@ -444,24 +490,25 @@ mod tests {
     #[test]
     fn split_keeps_head_and_recent() {
         let msgs = vec![
-            Message::User("ORIGINAL TASK".to_string()),
-            Message::Assistant("m1".to_string()),
-            Message::ToolCalls(vec![ToolCall {
-                id: "1".into(),
-                name: "read".into(),
-                args: json!({}),
-            }]),
+            WireMessage::user_text("ORIGINAL TASK".to_string()),
+            assistant_ir("m1".to_string()),
+            WireMessage::new(
+                Role::Assistant,
+                vec![Block::ToolUse {
+                    id: "1".into(),
+                    name: "read".into(),
+                    input: json!({}),
+                    cache: None,
+                }],
+            ),
             tool_msg("1", "r1"),
-            Message::Assistant("m2".to_string()),
+            assistant_ir("m2".to_string()),
             tool_msg("2", "r2"),
         ];
         let (head, middle, recent) = split_for_summary(&msgs, 2).unwrap();
         // head 必是原始任务。
-        if let Message::User(s) = head {
-            assert_eq!(s, "ORIGINAL TASK");
-        } else {
-            panic!("head must be first user msg");
-        }
+        assert_eq!(head.role, Role::User, "head 必须是首条 user 消息");
+        assert_eq!(head.concat_text(), "ORIGINAL TASK");
         // recent 是最后 2 条。
         assert_eq!(recent.len(), 2);
         // middle 是中间剩余。
@@ -471,8 +518,8 @@ mod tests {
     #[test]
     fn split_none_when_too_short() {
         let msgs = vec![
-            Message::User("task".to_string()),
-            Message::Assistant("m1".to_string()),
+            WireMessage::user_text("task"),
+            assistant_ir("m1".to_string()),
         ];
         assert!(split_for_summary(&msgs, 8).is_none());
     }
@@ -497,17 +544,25 @@ mod tests {
             text: "## 已完成的关键决策\n- 做了 X".to_string(),
         };
         let model = fake_model();
-        let middle = vec![Message::User("hi".into()), Message::Assistant("ok".into())];
-        let out = summarize_structured(&middle, &provider, &model).await.unwrap();
+        let middle = vec![WireMessage::user_text("hi"), assistant_ir("ok")];
+        let out = summarize_structured(&middle, &provider, &model)
+            .await
+            .unwrap();
         assert!(out.contains("做了 X"));
     }
 
     #[tokio::test]
     async fn summarize_empty_text_errors() {
-        let provider = FakeProvider { text: "   ".to_string() };
+        let provider = FakeProvider {
+            text: "   ".to_string(),
+        };
         let model = fake_model();
-        let middle = vec![Message::User("hi".into())];
-        assert!(summarize_structured(&middle, &provider, &model).await.is_err());
+        let middle = vec![WireMessage::user_text("hi")];
+        assert!(
+            summarize_structured(&middle, &provider, &model)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

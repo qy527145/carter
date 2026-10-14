@@ -57,7 +57,9 @@ pub fn load(dir: &Path, name: &str) -> Option<Skill> {
 /// 手写解析 frontmatter：剥离首部 `---\n…\n---\n`，块内每行按首个 `:` 切分。
 /// `allowed-tools: a, b, c` 单行逗号形式。缺 frontmatter 或缺 name → None。
 pub fn parse_skill_md(raw: &str) -> Option<(SkillMeta, String)> {
-    let rest = raw.strip_prefix("---\n").or_else(|| raw.strip_prefix("---\r\n"))?;
+    let rest = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))?;
     // 找结束分隔行 `---`。
     let mut front = String::new();
     let mut body = String::new();
@@ -119,9 +121,8 @@ pub fn render_catalog(metas: &[SkillMeta]) -> String {
     if metas.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "可用 Skills（按需用 `skill` 工具传入对应 name 加载完整说明后再执行）：\n",
-    );
+    let mut out =
+        String::from("可用 Skills（按需用 `skill` 工具传入对应 name 加载完整说明后再执行）：\n");
     for m in metas {
         out.push_str(&format!("- {}: {}\n", m.name, m.description));
     }

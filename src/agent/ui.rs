@@ -2,10 +2,10 @@
 //! 纪律：本文件不得 import 任何 `ratatui`/`crossterm`/`genai` 类型——agent 层与终端解耦。
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::provider::{Message, ToolCall, Usage};
+use crate::provider::{Block, Role, ToolCall, Usage, WireMessage};
 use crate::tools::{TodoItem, TodoStatus};
 
 /// resume/fork 历史回放的一条消息（仅用于可视化，不发给模型）。
@@ -25,34 +25,36 @@ pub enum ReplayRole {
 }
 
 /// 把会话历史消息转成可回放的展示项（工具输出截断为单行预览）。
-pub fn replay_from_messages(msgs: &[Message]) -> Vec<ReplayMsg> {
+///
+/// 一条消息里可能有多种块（用户消息里混着工具结果、助手消息里文本与工具调用交错），
+/// 所以按块展开而不是按消息展开 —— 否则回放出来的顺序会和当初看到的对不上。
+pub fn replay_from_messages(msgs: &[WireMessage]) -> Vec<ReplayMsg> {
     let mut out = Vec::new();
     for m in msgs {
-        match m {
-            Message::User(s) => out.push(ReplayMsg {
-                role: ReplayRole::User,
-                text: s.clone(),
-            }),
-            Message::Assistant(s) => out.push(ReplayMsg {
-                role: ReplayRole::Assistant,
-                text: s.clone(),
-            }),
-            Message::ToolCalls(calls) => {
-                for c in calls {
+        for b in &m.content {
+            match (m.role, b) {
+                (Role::User, Block::Text { text, .. }) => out.push(ReplayMsg {
+                    role: ReplayRole::User,
+                    text: text.clone(),
+                }),
+                (Role::Assistant, Block::Text { text, .. }) => out.push(ReplayMsg {
+                    role: ReplayRole::Assistant,
+                    text: text.clone(),
+                }),
+                (_, Block::ToolUse { name, input, .. }) => out.push(ReplayMsg {
+                    role: ReplayRole::ToolCall,
+                    text: format!("⚙ {}({})", name, args_preview(input)),
+                }),
+                (_, Block::ToolResult { content, .. }) => {
+                    let text = content.as_text();
+                    let first = text.lines().next().unwrap_or("");
                     out.push(ReplayMsg {
-                        role: ReplayRole::ToolCall,
-                        text: format!("⚙ {}({})", c.name, args_preview(&c.args)),
+                        role: ReplayRole::ToolResult,
+                        text: truncate_inline(first, 120),
                     });
                 }
+                _ => {}
             }
-            Message::Tool { content, .. } => {
-                let first = content.lines().next().unwrap_or("");
-                out.push(ReplayMsg {
-                    role: ReplayRole::ToolResult,
-                    text: truncate_inline(first, 120),
-                });
-            }
-            Message::System(_) => {}
         }
     }
     out
@@ -201,7 +203,11 @@ impl UiSink for StdoutSink {
                 let _ = writeln!(out, "\x1b[36m⚙ {name}({args_preview})\x1b[0m");
             }
             UiEvent::ToolResult { ok, summary } => {
-                let (mark, color) = if ok { ("✓", "\x1b[32m") } else { ("✗", "\x1b[31m") };
+                let (mark, color) = if ok {
+                    ("✓", "\x1b[32m")
+                } else {
+                    ("✗", "\x1b[31m")
+                };
                 let _ = writeln!(out, "{color}  {mark} {summary}\x1b[0m");
             }
             UiEvent::TodoUpdated(todos) => {
@@ -250,11 +256,11 @@ impl UiSink for StdoutSink {
                 let _ = writeln!(
                     out,
                     "\n[tokens] in={} out={} cache_read={} cache_write={} reasoning={} | cost=${:.4} ({})",
-                    usage.input,
-                    usage.output,
-                    usage.cache_read,
-                    usage.cache_write,
-                    usage.reasoning,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache.read_tokens,
+                    usage.cache.write.total,
+                    usage.thinking_tokens,
                     cost,
                     model,
                 );
@@ -348,21 +354,31 @@ mod tests {
 
     #[test]
     fn replay_maps_roles_and_truncates_tool_output() {
-        use crate::provider::ToolCall;
         use serde_json::json;
         let msgs = vec![
-            Message::System("sys".into()), // 跳过
-            Message::User("问题".into()),
-            Message::Assistant("回答".into()),
-            Message::ToolCalls(vec![ToolCall {
-                id: "1".into(),
-                name: "read".into(),
-                args: json!({"path": "a.rs"}),
-            }]),
-            Message::Tool {
-                call_id: "1".into(),
-                content: format!("第一行\n{}", "x".repeat(500)),
-            },
+            WireMessage::new(Role::System, vec![Block::text("sys")]), // 跳过
+            WireMessage::user_text("问题"),
+            WireMessage::new(Role::Assistant, vec![Block::text("回答")]),
+            WireMessage::new(
+                Role::Assistant,
+                vec![Block::ToolUse {
+                    id: "1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "a.rs"}),
+                    cache: None,
+                }],
+            ),
+            WireMessage::new(
+                Role::User,
+                vec![Block::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: crate::provider::ToolResultContent::Text {
+                        text: format!("第一行\n{}", "x".repeat(500)),
+                    },
+                    is_error: false,
+                    cache: None,
+                }],
+            ),
         ];
         let out = replay_from_messages(&msgs);
         // System 被跳过 → 4 条。

@@ -8,7 +8,7 @@
 //!
 //! 写路径用原子写 + 修订快照（见 `memory::writer::write_atomic`）。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{Tool, ToolResult};
 
@@ -20,7 +20,11 @@ pub struct SaveMemory;
 
 /// 解析 (kind, scope) → 目标记忆文件路径 + 段标题。
 /// 返回 (path, section)；skill kind 不用 section（整文件就是一个 skill）。
-fn target_for(kind: &str, scope: &str, slug: Option<&str>) -> Result<(std::path::PathBuf, Option<&'static str>), String> {
+fn target_for(
+    kind: &str,
+    scope: &str,
+    slug: Option<&str>,
+) -> Result<(std::path::PathBuf, Option<&'static str>), String> {
     match kind {
         "facts" => match scope {
             "project" => Ok((std::path::PathBuf::from("CARTER.md"), Some(FACTS_SECTION))),
@@ -34,12 +38,17 @@ fn target_for(kind: &str, scope: &str, slug: Option<&str>) -> Result<(std::path:
                 return Err("kind=skill 必须提供 slug 参数（如 \"rust-tests\"）".to_string());
             }
             // 仅允许 url-safe 字符避免逃逸目录。
-            if !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            if !slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
                 return Err("slug 只能包含 [A-Za-z0-9_-]".to_string());
             }
             Ok((crate::config::paths::skill_memory_path(slug), None))
         }
-        other => Err(format!("未知 kind: {other}（仅支持 facts | profile | skill）")),
+        other => Err(format!(
+            "未知 kind: {other}（仅支持 facts | profile | skill）"
+        )),
     }
 }
 
@@ -95,7 +104,10 @@ impl Tool for SaveMemory {
             return ToolResult::err("content 不能为空（旧名 fact 也可）");
         }
         let kind = args.get("kind").and_then(Value::as_str).unwrap_or("facts");
-        let scope = args.get("scope").and_then(Value::as_str).unwrap_or("project");
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("project");
         let slug = args.get("slug").and_then(Value::as_str);
 
         let (path, section) = match target_for(kind, scope, slug) {

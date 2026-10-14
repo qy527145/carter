@@ -124,13 +124,18 @@ pub struct WireUsage {
 }
 
 impl From<&Usage> for WireUsage {
+    /// 底座的用量口径 → NDJSON 协议里那套字段名。
+    ///
+    /// 这个映射看着多余，但它是**协议兼容边界**：host 程序按 `input` / `cache_read`
+    /// 这些名字解析，改了就是破坏性变更。底座换了（genai → llm_adapt），
+    /// 对外那套名字不能跟着变。
     fn from(u: &Usage) -> Self {
         Self {
-            input: u.input,
-            output: u.output,
-            cache_read: u.cache_read,
-            cache_write: u.cache_write,
-            reasoning: u.reasoning,
+            input: u.input_tokens as u64,
+            output: u.output_tokens as u64,
+            cache_read: u.cache.read_tokens as u64,
+            cache_write: u.cache.write.total as u64,
+            reasoning: u.thinking_tokens as u64,
         }
     }
 }

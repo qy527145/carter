@@ -14,9 +14,9 @@ use std::time::Duration;
 #[allow(unused_imports)]
 use std::os::unix::process::CommandExt;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{arg_str, arg_u64_opt, truncate, Tool, ToolResult};
+use super::{Tool, ToolResult, arg_str, arg_u64_opt, truncate};
 
 pub struct Bash;
 
@@ -101,7 +101,9 @@ impl Tool for Bash {
                         libc::kill(-pid, libc::SIGKILL);
                     }
                 }
-                return ToolResult::err(format!("command timed out after {timeout}s (process tree killed)"));
+                return ToolResult::err(format!(
+                    "command timed out after {timeout}s (process tree killed)"
+                ));
             }
         };
 
@@ -145,9 +147,14 @@ fn sniff_dangerous(cmd: &str) -> Option<&'static str> {
     // rm -rf / -fr 两种写法 + 接根目录 / 用户目录 / `*` 等高危目标。
     let lower = normalized.to_ascii_lowercase();
     if (lower.contains("rm -rf") || lower.contains("rm -fr"))
-        && (lower.contains(" /") || lower.contains(" ~") || lower.contains(" *") || lower.contains(" .git"))
+        && (lower.contains(" /")
+            || lower.contains(" ~")
+            || lower.contains(" *")
+            || lower.contains(" .git"))
     {
-        return Some("detected `rm -rf` against a sensitive target — double-check before relying on the result");
+        return Some(
+            "detected `rm -rf` against a sensitive target — double-check before relying on the result",
+        );
     }
     // dd if=/dev/... of=/dev/sd* —— 误触会破坏磁盘。
     if lower.contains("dd ") && lower.contains("of=/dev/") {

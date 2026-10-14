@@ -27,7 +27,9 @@ license = false
 eula = false
 
 [dependencies]
-genai = "0.6.5"
+# 线协议底座：三协议编解码、SSE、内容块装配、缓存断点都在这里。
+# carter 不再自带任何协议细节 —— 旧底座 genai 已移除。
+llm_adapt_core = { path = "../llm_adapt/crates/llm_adapt_core" }
 # models.dev 元数据爬取（仅 registry/fetch.rs 使用）。rustls 避免 openssl 系统依赖。
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # scrolling-regions 已关闭：该特性用 DECSTBM 区域滚动（CSI r + CSI S）实现 insert_before，

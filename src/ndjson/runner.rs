@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
 
-use crate::agent::{run_turn, CancelToken, CompactModel, RunOptions};
+use crate::agent::{CancelToken, CompactModel, RunOptions, run_turn};
 use crate::config::Config;
 use crate::provider::LlmProvider;
 
@@ -54,7 +54,9 @@ pub async fn run_ndjson(
 
     // 2. 构建工具池（含 ask_user_question —— ui_tx 透传，让模型能反向问 host）。
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
-    let hooks = Arc::new(crate::hooks::HookRegistry::from_configs(config.hooks.clone()));
+    let hooks = Arc::new(crate::hooks::HookRegistry::from_configs(
+        config.hooks.clone(),
+    ));
     let agent_hooks = hooks.clone();
 
     // 3. 启动 stdin reader（独立 task，与 agent 并发）。
@@ -157,8 +159,8 @@ pub async fn run_ndjson(
                 crate::hooks::HookEvent::SessionEnd,
                 serde_json::json!({
                     "mode": "ndjson",
-                    "input_tokens": session_usage.input,
-                    "output_tokens": session_usage.output,
+                    "input_tokens": session_usage.input_tokens,
+                    "output_tokens": session_usage.output_tokens,
                 }),
             )
             .await;
@@ -183,4 +185,3 @@ pub async fn run_ndjson(
 
     Ok(std::process::ExitCode::SUCCESS)
 }
-

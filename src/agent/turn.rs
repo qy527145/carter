@@ -1,14 +1,28 @@
-//! Turn 状态机 + 多轮 agent 循环（M2：模型调工具→执行→回灌→再调，直到无 tool_call 或达 max_turns）。
-//! 纪律：本文件不得 import 任何 `genai::*`/`ratatui`/`crossterm` 类型，只依赖能力抽象层 + ui sink。
+//! Turn 状态机 + 多轮 agent 循环（模型调工具→执行→回灌→再调，直到无 tool_call 或达 max_turns）。
+//!
+//! 纪律：本文件不得 import 任何具体底座类型（reqwest / 各协议 codec），只依赖能力抽象层 + ui sink。
+//!
+//! ## 为什么要用块装配器而不是自己拼字符串
+//!
+//! 流式响应是碎片。以前 carter 只攒两样东西：一段正文文本 + 一串工具调用，于是
+//! **块的边界与顺序都丢了** —— 同一轮里模型先思考、再说话、再调工具的次序无法还原，
+//! 而回灌历史时这个次序是硬要求（Anthropic 要求 thinking 块排在 assistant 消息最前，
+//! 且签名原样回传）。现在交给底座的 [`BlockAssembler`]：它按块序号归并，
+//! 认不出的服务端工具活动块也一并留着。
 
-use futures::stream::FuturesOrdered;
 use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 
 use crate::config::AgentConfig;
 use crate::hooks::{HookDecision, HookEvent, HookRegistry};
-use crate::provider::{ChatRequest, Event, LlmProvider, Message, StopReason, ToolCall, Usage};
-use crate::registry::{Capability, ModelInfo};
-use crate::tools::{is_concurrent_safe, parse_todos, TodoItem, TodoStatus, ToolRegistry, ToolResult};
+use crate::provider::{
+    Block, BlockAssembler, ChatRequest, FinishReason, LlmProvider, Role, StreamChunk,
+    ThinkingConfig, ToolCall, ToolResultContent, ToolSpec, Usage, WireMessage, WireRequest,
+};
+use crate::registry::{Capability, ModelInfo, ReasoningEffort};
+use crate::tools::{
+    TodoItem, TodoStatus, ToolRegistry, ToolResult, is_concurrent_safe, parse_todos,
+};
 
 use super::context;
 use super::thread::Thread;
@@ -61,7 +75,7 @@ pub struct CompactModel {
 
 /// 跑一个 turn —— 多轮工具循环。
 /// 每轮：构建请求 → 流式 → emit text/thinking、收集 tool_call → 累计 usage。
-/// 无 tool_call → 收尾；有 → 回灌 assistant tool-call 消息 + 串行执行工具 + 回灌结果，再循环。
+/// 无 tool_call → 收尾；有 → 回灌 assistant 消息 + 执行工具 + 回灌结果，再循环。
 /// 渲染经 `ui` sink；`cancel` 命中则丢弃本轮、返回 Cancelled。
 /// 返回 (结果, 跨轮累计 usage)。
 pub async fn run_turn(
@@ -75,7 +89,7 @@ pub async fn run_turn(
     cancel: &CancelToken,
 ) -> crate::Result<(TurnOutcome, Usage)> {
     // 仅支持工具的模型才下发；循环内保持稳定（cache 友好）。
-    let tool_specs = if model.supports(&Capability::Tools) {
+    let tool_specs: Vec<ToolSpec> = if model.supports(&Capability::Tools) {
         tools.specs()
     } else {
         Vec::new()
@@ -121,7 +135,9 @@ pub async fn run_turn(
                 .await;
             match pre {
                 HookDecision::Block { reason } => {
-                    ui.emit(UiEvent::Notice(format!("[compact] skipped by hook: {reason}")));
+                    ui.emit(UiEvent::Notice(format!(
+                        "[compact] skipped by hook: {reason}"
+                    )));
                 }
                 _ => {
                     // 压缩内部已降级处理失败，错误仅记录不中断。
@@ -151,23 +167,30 @@ pub async fn run_turn(
         // 构建请求：clone 历史 + 注入 todo 复诵（推到最近注意力区，不进 append-only 历史）。
         let mut messages = thread.messages.clone();
         if !thread.todos.is_empty() {
-            messages.push(Message::User(render_todos(&thread.todos)));
+            messages.push(WireMessage::user_text(render_todos(&thread.todos)));
         }
 
+        let mut wire = WireRequest::new(model.api_name.clone());
+        wire.stream = true;
+        wire.system = run_opts.system.iter().map(Block::text).collect();
+        wire.messages = messages;
+        wire.tools = tool_specs.clone();
+        wire.max_tokens = agent_cfg.max_output_tokens;
+        wire.thinking = model
+            .default_reasoning
+            .as_ref()
+            .and_then(thinking_config_for);
+
         let req = ChatRequest {
-            model_api_name: model.api_name.clone(),
-            system: run_opts.system.clone(),
-            messages,
-            tools: tool_specs.clone(),
-            reasoning: model.default_reasoning.clone(),
-            max_output_tokens: agent_cfg.max_output_tokens,
+            protocol: None, // 交给渠道默认协议
+            wire,
         };
 
         let mut stream = provider.stream(req).await?;
 
-        let mut assistant_text = String::new();
-        let mut pending_calls: Vec<ToolCall> = Vec::new();
-        let mut stop_reason = StopReason::EndTurn;
+        // 装配器按块序号归并增量；块间交错也能还原。
+        let mut asm = BlockAssembler::new();
+        let mut stop_reason = FinishReason::Stop;
         let mut had_text_or_thinking = false;
         let mut cancelled = false;
 
@@ -182,34 +205,37 @@ pub async fn run_turn(
                 ev = stream.next() => ev,
             }
         } {
-            match ev? {
-                Event::ThinkingDelta(t) => {
-                    if run_opts.show_thinking {
-                        ui.emit(UiEvent::ThinkingDelta(t));
+            let ev = ev?;
+            match &ev {
+                StreamChunk::TextDelta { text, .. } => {
+                    ui.emit(UiEvent::AssistantTextDelta(text.clone()));
+                    had_text_or_thinking = true;
+                }
+                StreamChunk::ThinkingDelta { text, .. } => {
+                    // 签名分片不展示给用户（对模型有用，对人没意义）。
+                    if run_opts.show_thinking && !text.is_empty() {
+                        ui.emit(UiEvent::ThinkingDelta(text.clone()));
                         had_text_or_thinking = true;
                     }
                 }
-                Event::TextDelta(t) => {
-                    assistant_text.push_str(&t);
-                    ui.emit(UiEvent::AssistantTextDelta(t));
-                    had_text_or_thinking = true;
+                StreamChunk::Finish { reason } => {
+                    stop_reason = reason.clone();
                 }
-                Event::ToolCall(tc) => {
-                    pending_calls.push(tc);
+                StreamChunk::Error { error } => {
+                    // 厂商在流里报的错：告知用户，但不当致命错误 —— 已经生成的内容照常收尾。
+                    ui.emit(UiEvent::Notice(format!("[stream] {error}")));
                 }
-                Event::Usage(u) => {
+                StreamChunk::Usage { usage } => {
                     // 多轮累加（非覆盖）。
-                    total_usage.add(&u);
+                    total_usage.add(usage);
                     // 用真实 input token（该轮完整 prompt）判定是否需压缩。
-                    if agent_cfg.compact_enabled && u.input > compact_threshold {
+                    if agent_cfg.compact_enabled && usage.input_tokens as u64 > compact_threshold {
                         needs_compaction = true;
                     }
                 }
-                Event::Done(reason) => {
-                    stop_reason = reason;
-                    break;
-                }
+                _ => {}
             }
+            asm.push(&ev);
         }
 
         // 显式 drop 流，确保取消时立即断连。
@@ -219,25 +245,29 @@ pub async fn run_turn(
             ui.emit(UiEvent::AssistantTextEnd);
         }
 
-        // 取消命中 → 重置 token、收尾历史（保留已生成文本）、返回 Cancelled。
+        // 取消命中 → 重置 token、收尾历史（保留已生成的块）、返回 Cancelled。
         if cancelled {
-            if !assistant_text.is_empty() {
-                thread.append(Message::Assistant(assistant_text));
+            let blocks = asm.into_blocks();
+            if !blocks.is_empty() {
+                thread.append(WireMessage::new(Role::Assistant, blocks));
             }
             cancel.reset();
             emit_post_turn_and_stop(&run_opts.hooks, thread.turns, "cancelled", &total_usage).await;
             return Ok((TurnOutcome::Cancelled, total_usage));
         }
 
+        let blocks = asm.into_blocks();
+        let pending_calls = ToolCall::collect(&blocks);
+
         // 无工具调用 → 本 turn 收尾。
         if pending_calls.is_empty() {
             thread.turns += 1;
-            if !assistant_text.is_empty() {
-                thread.append(Message::Assistant(assistant_text));
+            if !blocks.is_empty() {
+                thread.append(WireMessage::new(Role::Assistant, blocks));
             }
             emit_usage(ui, &total_usage, model);
             let outcome = match stop_reason {
-                StopReason::MaxTokens => TurnOutcome::Limit,
+                FinishReason::Length => TurnOutcome::Limit,
                 _ => TurnOutcome::Assistant,
             };
             let outcome_label = match &outcome {
@@ -246,7 +276,8 @@ pub async fn run_turn(
                 TurnOutcome::Cancelled => "cancelled",
                 TurnOutcome::Error(_) => "error",
             };
-            emit_post_turn_and_stop(&run_opts.hooks, thread.turns, outcome_label, &total_usage).await;
+            emit_post_turn_and_stop(&run_opts.hooks, thread.turns, outcome_label, &total_usage)
+                .await;
             return Ok((outcome, total_usage));
         }
 
@@ -257,11 +288,9 @@ pub async fn run_turn(
             return Ok((TurnOutcome::Limit, total_usage));
         }
 
-        // 回灌历史：先 append 前置文本（若有），再 append assistant tool-call 消息。
-        if !assistant_text.is_empty() {
-            thread.append(Message::Assistant(assistant_text));
-        }
-        thread.append(Message::ToolCalls(pending_calls.clone()));
+        // 回灌历史：**一条** assistant 消息，块顺序原样保留（思考 → 文本 → 工具调用）。
+        // 拆成「文本一条 + 工具调用一条」会丢掉顺序，Anthropic 会因此拒绝多轮请求。
+        thread.append(WireMessage::new(Role::Assistant, blocks));
 
         // 工具批量执行：连续的"并发安全"工具一起跑；遇到 unsafe 工具切断、串行跑。
         // 顺序保持：派发顺序与回灌顺序与 model 给的 pending_calls 完全一致。
@@ -276,15 +305,55 @@ pub async fn run_turn(
                     ui.emit(UiEvent::TodoUpdated(thread.todos.clone()));
                 }
             }
-            thread.append(Message::Tool {
-                call_id: tc.id.clone(),
-                content: result.to_model_string(),
-            });
+        }
+
+        // 工具结果合成**一条** user 消息。这是 Anthropic 的规范形态（一条消息里放多个
+        // tool_result 块）；OpenAI Chat 需要拆成多条 `role:"tool"`，由它的 codec 在
+        // 编码时拆 —— IR 保持更可表达的那一侧，不被较弱的协议拉平。
+        let result_blocks: Vec<Block> = pending_calls
+            .iter()
+            .zip(results.iter())
+            .map(|(tc, result)| Block::ToolResult {
+                tool_use_id: tc.id.clone(),
+                content: ToolResultContent::Text {
+                    text: result.to_model_string(),
+                },
+                is_error: !result.ok,
+                cache: None,
+            })
+            .collect();
+        if !result_blocks.is_empty() {
+            thread.append(WireMessage::new(Role::User, result_blocks));
         }
 
         thread.turns += 1;
         // 回到循环顶部，带新历史再 stream。
     }
+}
+
+/// carter 的推理强度 → IR 的思考配置。`None` 表示**不发**思考参数。
+///
+/// 这里同时填 `effort` 与 `budget_tokens` 两个字段，是因为两家用不同表达：
+/// OpenAI 系认 `effort`（low/medium/high/…），Anthropic 认 `budget_tokens`。
+/// 各协议 codec 取自己认得的那半，不认的忽略 —— 免得为「同一件事的两种说法」
+/// 在 IR 里搞出两个字段各协议各挑一个。
+fn thinking_config_for(effort: &ReasoningEffort) -> Option<ThinkingConfig> {
+    let effort_str = |s: &str| ThinkingConfig {
+        budget_tokens: None,
+        effort: Some(s.to_string()),
+    };
+    Some(match effort {
+        ReasoningEffort::None => return None,
+        ReasoningEffort::Low => effort_str("low"),
+        ReasoningEffort::Medium => effort_str("medium"),
+        ReasoningEffort::High => effort_str("high"),
+        ReasoningEffort::XHigh => effort_str("xhigh"),
+        ReasoningEffort::Max => effort_str("max"),
+        ReasoningEffort::Budget(n) => ThinkingConfig {
+            budget_tokens: Some(*n),
+            effort: None,
+        },
+    })
 }
 
 /// 把同一轮的所有工具调用按"安全/不安全"分批执行，保持原顺序。
@@ -453,18 +522,13 @@ fn emit_tool_result(ui: &mut dyn UiSink, result: &ToolResult) {
 
 /// PostTurn + Stop hook 串行触发。outcome_label = "assistant" / "limit" / "cancelled" / "error"。
 /// Stop 在 PostTurn 之后立刻 fire，表示整个 run_turn 即将返回（与 PostTurn 的 1:1 关系）。
-async fn emit_post_turn_and_stop(
-    hooks: &HookRegistry,
-    turns: u32,
-    outcome: &str,
-    usage: &Usage,
-) {
+async fn emit_post_turn_and_stop(hooks: &HookRegistry, turns: u32, outcome: &str, usage: &Usage) {
     let usage_payload = serde_json::json!({
-        "input": usage.input,
-        "output": usage.output,
-        "cache_read": usage.cache_read,
-        "cache_write": usage.cache_write,
-        "reasoning": usage.reasoning,
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "cache_read": usage.cache.read_tokens,
+        "cache_write": usage.cache.write.total,
+        "reasoning": usage.thinking_tokens,
     });
     hooks
         .emit(
@@ -477,10 +541,7 @@ async fn emit_post_turn_and_stop(
         )
         .await;
     hooks
-        .emit(
-            HookEvent::Stop,
-            serde_json::json!({ "reason": outcome }),
-        )
+        .emit(HookEvent::Stop, serde_json::json!({ "reason": outcome }))
         .await;
 }
 
@@ -523,14 +584,22 @@ mod tests {
         }
     }
 
+    fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args,
+        }
+    }
+
     #[tokio::test]
     async fn safe_and_unsafe_batches_emit_in_call_order() {
         // 混合调用：grep(safe), bash(unsafe), read_file(safe)。
         // 期望：started 事件按原顺序 emit，结果数量与 calls 一致。
         let calls = vec![
-            ToolCall { id: "1".into(), name: "grep".into(), args: json!({"pattern":"x"}) },
-            ToolCall { id: "2".into(), name: "bash".into(), args: json!({"command":"true"}) },
-            ToolCall { id: "3".into(), name: "read_file".into(), args: json!({"path":"Cargo.toml"}) },
+            call("1", "grep", json!({"pattern":"x"})),
+            call("2", "bash", json!({"command":"true"})),
+            call("3", "read_file", json!({"path":"Cargo.toml"})),
         ];
         let reg = ToolRegistry::builtin();
         let mut thread = crate::agent::Thread::new("test");
@@ -538,10 +607,14 @@ mod tests {
         let hooks = HookRegistry::default();
         let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
         assert_eq!(results.len(), 3);
-        let starts: Vec<&str> = sink.0.iter().filter_map(|e| match e {
-            UiEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let starts: Vec<&str> = sink
+            .0
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(starts, vec!["grep", "bash", "read_file"]);
     }
 
@@ -549,10 +622,12 @@ mod tests {
     async fn all_safe_calls_run_concurrently_and_preserve_order() {
         // 多个 grep（全部 safe）一同派发；结果顺序 = 调用顺序。
         let calls: Vec<ToolCall> = (0..4)
-            .map(|i| ToolCall {
-                id: format!("g{i}"),
-                name: "grep".into(),
-                args: json!({"pattern": format!("p{i}"), "path": "."}),
+            .map(|i| {
+                call(
+                    &format!("g{i}"),
+                    "grep",
+                    json!({"pattern": format!("p{i}"), "path": "."}),
+                )
             })
             .collect();
         let reg = ToolRegistry::builtin();
@@ -562,7 +637,11 @@ mod tests {
         let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
         assert_eq!(results.len(), 4);
         // ToolCallStarted 事件个数 = 4。
-        let started_n = sink.0.iter().filter(|e| matches!(e, UiEvent::ToolCallStarted{..})).count();
+        let started_n = sink
+            .0
+            .iter()
+            .filter(|e| matches!(e, UiEvent::ToolCallStarted { .. }))
+            .count();
         assert_eq!(started_n, 4);
     }
 
@@ -577,11 +656,7 @@ mod tests {
             timeout_secs: 5,
             enabled: true,
         }]);
-        let calls = vec![ToolCall {
-            id: "1".into(),
-            name: "bash".into(),
-            args: json!({"command":"echo should-not-run"}),
-        }];
+        let calls = vec![call("1", "bash", json!({"command":"echo should-not-run"}))];
         let reg = ToolRegistry::builtin();
         let mut thread = crate::agent::Thread::new("test");
         let mut sink = VecSink::default();
@@ -597,7 +672,6 @@ mod tests {
     async fn pre_tool_use_hook_can_rewrite_args() {
         use crate::hooks::HookConfig;
         // hook 改写 read_file 的 path 为另一个文件。
-        // 用 jq 不可用 → 改用 sh + sed 简化：直接 emit 改写后 JSON。
         let hooks = HookRegistry::from_configs(vec![HookConfig {
             event: HookEvent::PreToolUse,
             command: crate::hooks::shell_cmd(
@@ -608,11 +682,11 @@ mod tests {
             timeout_secs: 5,
             enabled: true,
         }]);
-        let calls = vec![ToolCall {
-            id: "1".into(),
-            name: "read_file".into(),
-            args: json!({"path":"/nonexistent/should/fail"}),
-        }];
+        let calls = vec![call(
+            "1",
+            "read_file",
+            json!({"path":"/nonexistent/should/fail"}),
+        )];
         let reg = ToolRegistry::builtin();
         let mut thread = crate::agent::Thread::new("test");
         let mut sink = VecSink::default();
@@ -627,10 +701,8 @@ mod tests {
     async fn subagent_stop_fires_for_task_tool() {
         use crate::hooks::HookConfig;
         // hook 把命中的 SubagentStop 写到临时文件，便于检验。
-        let tmp = std::env::temp_dir().join(format!(
-            "carter-subagent-stop-{}",
-            crate::session::now_ms()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("carter-subagent-stop-{}", crate::session::now_ms()));
         // 路径统一用正斜杠：hook 在 Windows 上优先走 POSIX `sh`，反斜杠会被它
         // 当成转义字符吃掉；正斜杠两个 shell 都认。
         let tmp_str = tmp.to_string_lossy().replace("\\", "/");
@@ -642,13 +714,13 @@ mod tests {
             enabled: true,
         }]);
         // 模拟一次 task 调用（直接走 dispatch，不真正派生子 agent —— PostToolUse 路径独立）。
-        let call = ToolCall {
-            id: "t1".into(),
-            name: "task".into(),
-            args: json!({"description":"x","prompt":"do something"}),
-        };
+        let c = call(
+            "t1",
+            "task",
+            json!({"description":"x","prompt":"do something"}),
+        );
         let res = ToolResult::ok("done".to_string());
-        post_tool_hook(&hooks, &call, &res).await;
+        post_tool_hook(&hooks, &c, &res).await;
         // hook 应触发并写文件。
         let content = std::fs::read_to_string(&tmp).unwrap_or_default();
         assert!(content.contains("subagent-fired"));
@@ -658,20 +730,14 @@ mod tests {
     #[tokio::test]
     async fn pre_post_turn_and_stop_fire_in_order() {
         use crate::hooks::HookConfig;
-        let tmp = std::env::temp_dir().join(format!(
-            "carter-turn-events-{}",
-            crate::session::now_ms()
-        ));
-        // 路径统一用正斜杠：hook 在 Windows 上优先走 POSIX `sh`，反斜杠会被它
-        // 当成转义字符吃掉；正斜杠两个 shell 都认。
+        let tmp =
+            std::env::temp_dir().join(format!("carter-turn-events-{}", crate::session::now_ms()));
+        // 路径统一用正斜杠（见上）。
         let tmp_str = tmp.to_string_lossy().replace("\\", "/");
         // 三个事件都写到同一个文件，按顺序，便于检验顺序。
         let make = |event, label: &str| HookConfig {
             event,
-            command: crate::hooks::shell_cmd(
-                &format!("echo {label} >> {tmp_str}"),
-                &format!("echo {label} >> \"{tmp_str}\""),
-            ),
+            command: format!("echo {label} >> {tmp_str}"),
             r#match: None,
             timeout_secs: 5,
             enabled: true,
@@ -689,5 +755,49 @@ mod tests {
         let order: Vec<&str> = content.lines().collect();
         assert_eq!(order, vec!["pre-turn", "post-turn", "stop"]);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 认不出的服务端工具活动块不该被当成本地工具去派发。
+    #[test]
+    fn unmodeled_blocks_are_not_treated_as_tool_calls() {
+        let blocks = vec![
+            Block::Unmodeled {
+                raw: json!({"type":"web_search_tool_result","tool_use_id":"srv_1"}),
+            },
+            Block::ToolUse {
+                id: "t1".into(),
+                name: "read_file".into(),
+                input: json!({"path":"x"}),
+                cache: None,
+            },
+        ];
+        let calls = ToolCall::collect(&blocks);
+        assert_eq!(calls.len(), 1, "只有真正的 tool_use 才算待执行调用");
+        assert_eq!(calls[0].name, "read_file");
+    }
+
+    /// 助手轮的块顺序必须原样回灌：思考在最前，工具调用在后。
+    #[test]
+    fn assistant_blocks_keep_their_order() {
+        let blocks = vec![
+            Block::Thinking {
+                text: "hmm".into(),
+                signature: Some("sig".into()),
+            },
+            Block::text("let me look"),
+            Block::ToolUse {
+                id: "t1".into(),
+                name: "read_file".into(),
+                input: json!({"path":"x"}),
+                cache: None,
+            },
+        ];
+        let msg = WireMessage::new(Role::Assistant, blocks.clone());
+        assert_eq!(msg.content, blocks, "回灌时块内容与顺序都不该变");
+        assert_eq!(
+            msg.content[0].as_text(),
+            None,
+            "首个块是 thinking 而不是文本"
+        );
     }
 }

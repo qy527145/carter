@@ -6,7 +6,7 @@
 //! oneshot 模式（无 TUI）：StdoutSink 接到 AskUser 后自动用第一个 option 作答，
 //! 避免一次性执行被卡死。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;

@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use http::{HeaderName, HeaderValue};
+use rmcp::ServiceExt;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::ServiceExt;
 
 use crate::config::McpServerConfig;
 
@@ -21,7 +21,9 @@ pub async fn connect(cfg: &McpServerConfig) -> Result<Service, String> {
     match cfg.transport.as_str() {
         "stdio" => connect_stdio(cfg).await,
         "http" => connect_http(cfg).await,
-        other => Err(format!("unknown transport: {other} (expected \"stdio\" or \"http\")")),
+        other => Err(format!(
+            "unknown transport: {other} (expected \"stdio\" or \"http\")"
+        )),
     }
 }
 
@@ -33,14 +35,12 @@ async fn connect_stdio(cfg: &McpServerConfig) -> Result<Service, String> {
 
     let args = cfg.args.clone();
     let env = cfg.env.clone();
-    let transport = TokioChildProcess::new(tokio::process::Command::new(command).configure(
-        |c| {
-            c.args(&args);
-            for (k, v) in &env {
-                c.env(k, v);
-            }
-        },
-    ))
+    let transport = TokioChildProcess::new(tokio::process::Command::new(command).configure(|c| {
+        c.args(&args);
+        for (k, v) in &env {
+            c.env(k, v);
+        }
+    }))
     .map_err(|e| format!("spawn failed: {e}"))?;
 
     ().serve(transport)

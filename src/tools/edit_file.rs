@@ -1,8 +1,8 @@
 //! edit_file：精确串替换。read-before-edit 校验 old_string 存在且唯一（除非 replace_all），防脏写。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{arg_bool, arg_str, Tool, ToolResult};
+use super::{Tool, ToolResult, arg_bool, arg_str};
 
 pub struct EditFile;
 
@@ -63,7 +63,12 @@ impl Tool for EditFile {
 
 /// 纯函数核心，便于单测。返回 (新文本, 替换次数)。
 /// 错误信息力求帮助模型自纠：报告匹配次数、最近候选行号（"看似但不是"）。
-fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize), String> {
+fn apply_edit(
+    text: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
     if old.is_empty() {
         return Err("old_string must not be empty".to_string());
     }

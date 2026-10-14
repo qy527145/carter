@@ -113,12 +113,13 @@ fn create_append(path: &Path) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Message;
-    use crate::session::{now_ms, SessionMeta};
+    use crate::provider::WireMessage;
+    use crate::session::{SessionMeta, now_ms};
 
     fn meta() -> SessionMeta {
         SessionMeta {
             id: "t".into(),
+            format_version: 2,
             parent_id: None,
             forked_from: None,
             cwd: "/x".into(),
@@ -139,7 +140,7 @@ mod tests {
         // 尚未写入任何记录 → 文件不存在（空会话不落盘）。
         assert!(!path.exists());
 
-        rec.record(RecordKind::Message(Message::User("hi".into())));
+        rec.record(RecordKind::Message(WireMessage::user_text("hi")));
         assert!(path.exists());
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -150,4 +151,3 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-

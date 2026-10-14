@@ -1,8 +1,8 @@
 //! write_file：新建或整体覆盖写文件。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{arg_str, Tool, ToolResult};
+use super::{Tool, ToolResult, arg_str};
 
 pub struct WriteFile;
 

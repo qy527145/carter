@@ -37,7 +37,7 @@ use crossterm::style::{
     Attribute as CAttribute, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use crossterm::terminal::{self as cterm, Clear};
-use crossterm::{queue, QueueableCommand};
+use crossterm::{QueueableCommand, queue};
 use ratatui::backend::{Backend, ClearType, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
@@ -53,7 +53,10 @@ pub struct TrackingBackend<W: Write> {
 impl<W: Write> TrackingBackend<W> {
     /// 用初始光标位置构造（必须在 EventStream::new() 之前用真实 `cursor::position()` 取一次）。
     pub fn with_initial_cursor(writer: W, initial: Position) -> Self {
-        Self { writer, cursor: initial }
+        Self {
+            writer,
+            cursor: initial,
+        }
     }
 }
 
@@ -87,7 +90,10 @@ impl<W: Write> Backend for TrackingBackend<W> {
             last_pos = Some((x, y));
             // 文本属性变化 → SetAttributes。
             if cell.modifier != modifier {
-                let diff = ModifierDiff { from: modifier, to: cell.modifier };
+                let diff = ModifierDiff {
+                    from: modifier,
+                    to: cell.modifier,
+                };
                 diff.queue(&mut self.writer)?;
                 modifier = cell.modifier;
             }
@@ -284,16 +290,15 @@ mod tests {
 
     #[test]
     fn returns_initial_cursor_unchanged() {
-        let mut backend = TrackingBackend::with_initial_cursor(Cursor::new(Vec::new()), Position::new(3, 7));
+        let mut backend =
+            TrackingBackend::with_initial_cursor(Cursor::new(Vec::new()), Position::new(3, 7));
         assert_eq!(backend.get_cursor_position().unwrap(), Position::new(3, 7));
     }
 
     #[test]
     fn set_cursor_updates_tracked_value() {
-        let mut backend = TrackingBackend::with_initial_cursor(
-            Cursor::new(Vec::new()),
-            Position::new(0, 0),
-        );
+        let mut backend =
+            TrackingBackend::with_initial_cursor(Cursor::new(Vec::new()), Position::new(0, 0));
         backend.set_cursor_position(Position::new(10, 5)).unwrap();
         assert_eq!(backend.get_cursor_position().unwrap(), Position::new(10, 5));
     }

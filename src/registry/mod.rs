@@ -1,8 +1,8 @@
 //! ModelRegistry —— 模型元数据解析。
 //! 元数据来源 = models.dev 缓存（`~/.carter/models.json`）；用户面绑定在 config 的 `[models.X]`。
 
-mod model;
 pub mod fetch;
+mod model;
 pub mod models_dev;
 
 #[allow(unused_imports)]
@@ -56,7 +56,10 @@ pub fn resolve_model(
     // api_name 下发给端点 —— 省略时默认取**配置块名**（model_name），便于直接用真实模型名做块名。
     info.key = reference.to_string();
     info.provider = provider_name.to_string();
-    info.api_name = entry.api_name.clone().unwrap_or_else(|| model_name.to_string());
+    info.api_name = entry
+        .api_name
+        .clone()
+        .unwrap_or_else(|| model_name.to_string());
     if entry.default_reasoning.is_some() {
         info.default_reasoning = entry.default_reasoning.clone();
     }

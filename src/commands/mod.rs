@@ -41,20 +41,62 @@ pub struct Builtin {
 
 /// 全部内置命令（顺序即菜单展示顺序，常用在前）。
 pub const BUILTINS: &[Builtin] = &[
-    Builtin { name: "help", description: "显示可用命令" },
-    Builtin { name: "clear", description: "清空当前上下文（磁盘原文留存）" },
-    Builtin { name: "compact", description: "压缩对话历史" },
-    Builtin { name: "context", description: "查看上下文占用" },
-    Builtin { name: "cost", description: "查看本会话用量与成本" },
-    Builtin { name: "model", description: "切换模型" },
-    Builtin { name: "new", description: "开启新会话" },
-    Builtin { name: "resume", description: "恢复历史会话" },
-    Builtin { name: "fork", description: "从当前会话派生新会话" },
-    Builtin { name: "rewind", description: "撤销文件改动（回滚到某检查点之前）" },
-    Builtin { name: "skills", description: "列出可用 skills" },
-    Builtin { name: "mcp", description: "查看 MCP server 状态" },
-    Builtin { name: "quit", description: "退出" },
-    Builtin { name: "exit", description: "退出" },
+    Builtin {
+        name: "help",
+        description: "显示可用命令",
+    },
+    Builtin {
+        name: "clear",
+        description: "清空当前上下文（磁盘原文留存）",
+    },
+    Builtin {
+        name: "compact",
+        description: "压缩对话历史",
+    },
+    Builtin {
+        name: "context",
+        description: "查看上下文占用",
+    },
+    Builtin {
+        name: "cost",
+        description: "查看本会话用量与成本",
+    },
+    Builtin {
+        name: "model",
+        description: "切换模型",
+    },
+    Builtin {
+        name: "new",
+        description: "开启新会话",
+    },
+    Builtin {
+        name: "resume",
+        description: "恢复历史会话",
+    },
+    Builtin {
+        name: "fork",
+        description: "从当前会话派生新会话",
+    },
+    Builtin {
+        name: "rewind",
+        description: "撤销文件改动（回滚到某检查点之前）",
+    },
+    Builtin {
+        name: "skills",
+        description: "列出可用 skills",
+    },
+    Builtin {
+        name: "mcp",
+        description: "查看 MCP server 状态",
+    },
+    Builtin {
+        name: "quit",
+        description: "退出",
+    },
+    Builtin {
+        name: "exit",
+        description: "退出",
+    },
 ];
 
 /// 是否为内置命令名。

@@ -11,10 +11,9 @@ use crate::error::Result;
 
 use std::sync::Arc;
 
-use crate::agent::{run_turn, CancelToken, RunOptions, StdoutSink, Thread, TurnOutcome};
+use crate::agent::{CancelToken, RunOptions, StdoutSink, Thread, TurnOutcome, run_turn};
 use crate::config::Config;
-use crate::provider::genai_provider::GenaiProvider;
-use crate::provider::LlmProvider;
+use crate::provider::{LlmProvider, wire::WireProvider};
 use crate::registry::fetch;
 use crate::tui::ChannelSink;
 
@@ -299,25 +298,33 @@ fn assemble_system(
 }
 
 /// 解析模型引用 → (ModelInfo, provider)。按 model.provider 查 `[providers.*]`，
-/// 命中则配置驱动接入，否则回落 genai 默认。startup 与会话内 `/model` 共用。
+/// 没配的按 provider 名合成一份（key 从环境变量取）。startup 与会话内 `/model` 共用。
 fn resolve_provider(
     config: &Config,
     cache_json: &str,
     model_ref: &str,
 ) -> Result<(crate::registry::ModelInfo, Arc<dyn LlmProvider>)> {
     let model = crate::registry::resolve_model(config, cache_json, model_ref)?;
-    // LLM 请求日志目录：config 覆盖 or 默认 ~/.carter/debug/llm_log。
-    let log_dir = config
-        .debug
-        .llm_log_dir
-        .clone()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(crate::config::paths::llm_log_dir);
-    let debug = config.debug.log_requests;
-    let provider: Arc<dyn LlmProvider> = match config.providers.get(&model.provider) {
-        Some(pcfg) => Arc::new(GenaiProvider::from_provider_config(pcfg, debug, log_dir)?),
-        None => Arc::new(GenaiProvider::new(debug, log_dir)),
-    };
+    let pcfg = config.provider_for(&model.provider);
+    let protocol = pcfg.protocol();
+    let client_config = pcfg.to_client_config()?;
+
+    // 请求报文日志：只在 `[debug] log_requests` 打开时挂。
+    // 它是底座的 RequestHook，拿到的是**最终字节** —— 记下来的是真正的原始报文
+    // （旧底座只能给归一化视图，排障时经常对不上）。
+    let hook: Option<Arc<dyn llm_adapt_core::RequestHook>> = config.debug.log_requests.then(|| {
+        let dir = config
+            .debug
+            .llm_log_dir
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(crate::config::paths::llm_log_dir);
+        Arc::new(crate::provider::llm_log::LlmLogHook::new(dir))
+            as Arc<dyn llm_adapt_core::RequestHook>
+    });
+
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(WireProvider::new(client_config, protocol, hook)?);
     Ok((model, provider))
 }
 
@@ -359,8 +366,10 @@ fn find_session(cwd: &std::path::Path, sel: &str) -> Result<crate::session::Sess
         }
     }
     // id 前缀（如状态栏/列表显示的 8 位短 id）。
-    let prefixed: Vec<&crate::session::SessionEntry> =
-        entries.iter().filter(|e| e.meta.id.starts_with(sel)).collect();
+    let prefixed: Vec<&crate::session::SessionEntry> = entries
+        .iter()
+        .filter(|e| e.meta.id.starts_with(sel))
+        .collect();
     match prefixed.len() {
         1 => Ok(prefixed[0].clone()),
         0 => Err(crate::error::CarterError::Config(format!(
@@ -495,7 +504,9 @@ async fn run_oneshot(
     // 续接时 thread 已含历史；追加本次 prompt（并落盘）。
     // `@图片.png` 等内联图片附件先转成 `[img:...]` token，便于 provider 边界组多模态。
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::from_configs(config.hooks.clone()));
+    let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::from_configs(
+        config.hooks.clone(),
+    ));
     let prompt = crate::media::inline_user_attachments(&prompt, &cwd);
     // UserPromptSubmit hook：可改写 prompt，可阻断。
     let prompt = crate::hooks::run_user_prompt_submit(&hooks, prompt).await;
@@ -563,8 +574,8 @@ async fn run_oneshot(
             crate::hooks::HookEvent::SessionEnd,
             serde_json::json!({
                 "mode": "oneshot",
-                "input_tokens": usage.input,
-                "output_tokens": usage.output,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
             }),
         )
         .await;
@@ -599,7 +610,9 @@ async fn run_tui(
     let mcp_tool_count = mcp_tools.len();
 
     // 生命周期 hook 注册表（按事件分桶）。
-    let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::from_configs(config.hooks.clone()));
+    let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::from_configs(
+        config.hooks.clone(),
+    ));
 
     // 自定义斜杠命令：按 cwd 发现一次，移入 agent 任务。
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -913,13 +926,19 @@ async fn dispatch_builtin(
                     messages: Vec::new(),
                 });
             }
-            sink.emit(notice("已清空上下文（磁盘原文保留，可 resume 审计）".into()));
+            sink.emit(notice(
+                "已清空上下文（磁盘原文保留，可 resume 审计）".into(),
+            ));
             sink.emit(UiEvent::Divider(
                 "上下文已清空 · 以下为新对话（之前内容不再发送给模型）".into(),
             ));
         }
         "new" => {
-            match crate::session::start_new(cwd, &model.api_name, &crate::session::SessionOpts::default()) {
+            match crate::session::start_new(
+                cwd,
+                &model.api_name,
+                &crate::session::SessionOpts::default(),
+            ) {
                 Ok((t, _m)) => {
                     *thread = t;
                     *needs_title = true;
@@ -973,11 +992,7 @@ async fn dispatch_builtin(
                 for p in provs {
                     let mut ms: Vec<&String> = config.providers[p].models.keys().collect();
                     ms.sort();
-                    let list = ms
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let list = ms.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
                     let kind = &config.providers[p].kind;
                     out.push_str(&format!("\n  {p} [{kind}]: {list}"));
                 }
@@ -1000,7 +1015,8 @@ async fn dispatch_builtin(
         }
         "compact" => {
             // 强制压缩（阈值 0）；用 fast 模型。compact 内部已降级处理失败。
-            match crate::agent::context::compact(thread, &**fast_provider, fast_model, 0, sink).await
+            match crate::agent::context::compact(thread, &**fast_provider, fast_model, 0, sink)
+                .await
             {
                 Ok(()) => sink.emit(UiEvent::Divider("上下文已压缩".into())),
                 Err(e) => sink.emit(notice(format!("压缩失败：{e}"))),
@@ -1023,7 +1039,7 @@ async fn dispatch_builtin(
             let cost = crate::cost::compute(session_usage, &model.pricing);
             sink.emit(notice(format!(
                 "本会话累计 in={} out={} | 约 ${cost:.4}",
-                session_usage.input, session_usage.output
+                session_usage.input_tokens, session_usage.output_tokens
             )));
         }
         "rewind" => {
@@ -1126,6 +1142,7 @@ fn session_label(meta: &crate::session::SessionMeta) -> String {
 fn current_meta_placeholder() -> crate::session::SessionMeta {
     crate::session::SessionMeta {
         id: String::new(),
+        format_version: crate::session::CURRENT_FORMAT_VERSION,
         parent_id: None,
         forked_from: None,
         cwd: String::new(),

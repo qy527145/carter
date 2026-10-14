@@ -116,7 +116,11 @@ fn downsample_if_needed(bytes: &[u8], ext_hint: Option<&str>) -> (Vec<u8>, Strin
         return (bytes.to_vec(), fallback_ext());
     }
     // 按比例缩到长边 = MAX_DIMENSION。Lanczos3 质量好但慢；图片不大，足够。
-    let resized = img.resize(MAX_DIMENSION, MAX_DIMENSION, image::imageops::FilterType::Lanczos3);
+    let resized = img.resize(
+        MAX_DIMENSION,
+        MAX_DIMENSION,
+        image::imageops::FilterType::Lanczos3,
+    );
     let mut out: Vec<u8> = Vec::new();
     // 统一编码为 PNG（无损、跨 provider 一致）。
     if resized
@@ -131,10 +135,7 @@ fn downsample_if_needed(bytes: &[u8], ext_hint: Option<&str>) -> (Vec<u8>, Strin
 /// 从磁盘路径导入：读字节，扩展名从源文件名取。
 pub fn put_path(src: &Path) -> std::io::Result<ImageRef> {
     let bytes = std::fs::read(src)?;
-    let ext = src
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_string);
+    let ext = src.extension().and_then(|s| s.to_str()).map(str::to_string);
     put_bytes(&bytes, ext.as_deref())
 }
 
@@ -221,10 +222,12 @@ pub fn mime_from_ext(ext: &str) -> &'static str {
 pub fn is_image_path(p: &Path) -> bool {
     p.extension()
         .and_then(|s| s.to_str())
-        .map(|e| matches!(
-            e.to_ascii_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-        ))
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -353,7 +356,10 @@ mod tests {
 
     #[test]
     fn token_roundtrip() {
-        let r = ImageRef { hash: "abc".into(), ext: "png".into() };
+        let r = ImageRef {
+            hash: "abc".into(),
+            ext: "png".into(),
+        };
         let segs = parse_segments(&r.token());
         assert_eq!(segs.len(), 1);
         assert!(matches!(&segs[0], Segment::Image(x) if x == &r));
@@ -395,7 +401,9 @@ mod tests {
         // 用临时目录避免污染真实 home。
         let tmp = std::env::temp_dir().join(format!("carter-imgtest-{}", crate::session::now_ms()));
         // SAFETY: 单进程测试，且我们用唯一目录。
-        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("CARTER_HOME", &tmp);
+        }
         let bytes = b"\x89PNG\r\n\x1a\nfake";
         let a = put_bytes(bytes, None).unwrap();
         let b = put_bytes(bytes, None).unwrap();
@@ -405,7 +413,9 @@ mod tests {
         assert!(a.path().exists());
         // 清理
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::remove_var("CARTER_HOME"); }
+        unsafe {
+            std::env::remove_var("CARTER_HOME");
+        }
     }
 
     #[test]
@@ -421,7 +431,9 @@ mod tests {
         let txt = cwd.join("notes.txt");
         std::fs::write(&txt, b"hi").unwrap();
         // SAFETY: 单进程测试。
-        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("CARTER_HOME", &tmp);
+        }
 
         // 命中：相对路径图片 → 被替换为 token。
         let out = inline_user_attachments("看下 @pic.png 这张图", &cwd);
@@ -442,7 +454,9 @@ mod tests {
 
         // 清理
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::remove_var("CARTER_HOME"); }
+        unsafe {
+            std::env::remove_var("CARTER_HOME");
+        }
     }
 
     #[test]
@@ -450,7 +464,9 @@ mod tests {
         // 构造一张 2000×1000 的纯色 PNG，put_bytes 应当 downsample。
         let _g = home_test_lock();
         let tmp = std::env::temp_dir().join(format!("carter-dsample-{}", crate::session::now_ms()));
-        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("CARTER_HOME", &tmp);
+        }
 
         let big = image::RgbaImage::from_pixel(2000, 1000, image::Rgba([42, 99, 200, 255]));
         let mut png = Vec::new();
@@ -483,15 +499,20 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::remove_var("CARTER_HOME"); }
+        unsafe {
+            std::env::remove_var("CARTER_HOME");
+        }
     }
 
     #[test]
     fn small_image_skips_downsample() {
         // 800×600 在阈值内 → 原样落盘，不重编码。
         let _g = home_test_lock();
-        let tmp = std::env::temp_dir().join(format!("carter-dsample-skip-{}", crate::session::now_ms()));
-        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+        let tmp =
+            std::env::temp_dir().join(format!("carter-dsample-skip-{}", crate::session::now_ms()));
+        unsafe {
+            std::env::set_var("CARTER_HOME", &tmp);
+        }
 
         let small = image::RgbaImage::from_pixel(800, 600, image::Rgba([10, 20, 30, 255]));
         let mut png = Vec::new();
@@ -505,15 +526,20 @@ mod tests {
         assert_eq!(stored, png);
 
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::remove_var("CARTER_HOME"); }
+        unsafe {
+            std::env::remove_var("CARTER_HOME");
+        }
     }
 
     #[test]
     fn non_image_bytes_passthrough() {
         // 不是图片的字节：image::load_from_memory 会失败，落盘是原始 bytes，ext 走嗅探/hint。
         let _g = home_test_lock();
-        let tmp = std::env::temp_dir().join(format!("carter-dsample-raw-{}", crate::session::now_ms()));
-        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+        let tmp =
+            std::env::temp_dir().join(format!("carter-dsample-raw-{}", crate::session::now_ms()));
+        unsafe {
+            std::env::set_var("CARTER_HOME", &tmp);
+        }
 
         let garbage = b"this is not an image at all, just some bytes";
         let rf = put_bytes(garbage, Some("bin")).unwrap();
@@ -521,6 +547,8 @@ mod tests {
         assert_eq!(stored, garbage);
 
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::remove_var("CARTER_HOME"); }
+        unsafe {
+            std::env::remove_var("CARTER_HOME");
+        }
     }
 }

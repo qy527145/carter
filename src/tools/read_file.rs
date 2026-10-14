@@ -1,9 +1,9 @@
 //! read_file：读文件，cat -n 风格行号输出，支持 offset/limit。
 //! 图片文件（png/jpg/jpeg/gif/webp/bmp）会被存入多模态 image store 并返回 `[img:...]` 引用 token。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{arg_str, arg_u64_opt, truncate, Tool, ToolResult};
+use super::{Tool, ToolResult, arg_str, arg_u64_opt, truncate};
 use crate::media;
 
 pub struct ReadFile;

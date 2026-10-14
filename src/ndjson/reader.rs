@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::CancelToken;
 
-use super::protocol::{parse_line, Command};
+use super::protocol::{Command, parse_line};
 use super::sink::PendingAsks;
 
 /// 读取 stdin 直到 EOF。每行解析一个 Command 并 dispatch。
@@ -83,7 +83,9 @@ async fn dispatch(
     cmd: Command,
     input_tx: &UnboundedSender<String>,
     cancel: &CancelToken,
-    asks: &Arc<std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<String>>>>,
+    asks: &Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<String>>>,
+    >,
 ) -> Option<bool> {
     match cmd {
         Command::UserPrompt { text } => {

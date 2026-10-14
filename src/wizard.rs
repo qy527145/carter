@@ -20,11 +20,41 @@ struct Answers {
 
 /// 预置协议：(kind, 展示名, 默认 provider 名, meta 的 provider 段, 默认模型名)。
 const PRESETS: &[(&str, &str, &str, &str, &str)] = &[
-    ("anthropic", "Anthropic Messages", "anthropic", "anthropic", "claude-sonnet-4-5"),
-    ("openai_compat", "OpenAI 兼容 (Chat Completions：vLLM/LiteLLM/Azure/OpenRouter…)", "openai", "openai", "gpt-4o"),
-    ("openai_responses", "OpenAI Responses", "openai", "openai", "gpt-5"),
-    ("gemini", "Google Gemini", "gemini", "google", "gemini-2.5-pro"),
-    ("deepseek", "DeepSeek", "deepseek", "deepseek", "deepseek-chat"),
+    (
+        "anthropic",
+        "Anthropic Messages",
+        "anthropic",
+        "anthropic",
+        "claude-sonnet-4-5",
+    ),
+    (
+        "openai_compat",
+        "OpenAI 兼容 (Chat Completions：vLLM/LiteLLM/Azure/OpenRouter…)",
+        "openai",
+        "openai",
+        "gpt-4o",
+    ),
+    (
+        "openai_responses",
+        "OpenAI Responses",
+        "openai",
+        "openai",
+        "gpt-5",
+    ),
+    (
+        "gemini",
+        "Google Gemini",
+        "gemini",
+        "google",
+        "gemini-2.5-pro",
+    ),
+    (
+        "deepseek",
+        "DeepSeek",
+        "deepseek",
+        "deepseek",
+        "deepseek-chat",
+    ),
 ];
 
 /// 若 config.toml 缺失且处于交互式终端，引导生成并写盘。
@@ -37,7 +67,9 @@ pub async fn ensure_config() -> crate::Result<bool> {
 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!("未找到配置文件 {}。", path.display());
-        eprintln!("在交互式终端运行 `carter` 可进入配置向导，或手动创建该文件（字段见 docs/config.example.toml）。");
+        eprintln!(
+            "在交互式终端运行 `carter` 可进入配置向导，或手动创建该文件（字段见 docs/config.example.toml）。"
+        );
         return Ok(false);
     }
 
@@ -72,12 +104,17 @@ pub async fn ensure_config() -> crate::Result<bool> {
 
 /// 逐项收集答案。任一必填项遇 EOF → None（中止）。
 fn collect() -> Option<Answers> {
-    let idx = choose("选择模型服务商协议", PRESETS.iter().map(|p| p.1).collect::<Vec<_>>().as_slice(), 0)?;
+    let idx = choose(
+        "选择模型服务商协议",
+        PRESETS.iter().map(|p| p.1).collect::<Vec<_>>().as_slice(),
+        0,
+    )?;
     let (kind, _label, def_name, meta_provider, def_model) = PRESETS[idx];
 
     let provider_name = prompt_default("provider 名称（引用与切换时用，如 mycorp）", def_name)?;
     let base_url = prompt_optional("base_url（自定义端点；回车=用官方默认端点）")?;
-    let api_key = prompt_optional("api_key（直接粘贴；也可填 ${ENV_NAME} 走环境变量；回车=暂不填）")?;
+    let api_key =
+        prompt_optional("api_key（直接粘贴；也可填 ${ENV_NAME} 走环境变量；回车=暂不填）")?;
     let model_name = prompt_default("模型名（端点实际模型名，同时作为引用块名）", def_model)?;
     let default_meta = format!("{meta_provider}/{model_name}");
     let meta = prompt_default(
@@ -103,7 +140,12 @@ fn collect() -> Option<Answers> {
 async fn ensure_models_cache(a: &Answers) {
     let cache_path = paths::models_cache_path();
     if !cache_path.exists() {
-        if yes_no("尚无模型元数据缓存，现在从 models.dev 拉取？（需联网，约数 MB）", true).unwrap_or(false) {
+        if yes_no(
+            "尚无模型元数据缓存，现在从 models.dev 拉取？（需联网，约数 MB）",
+            true,
+        )
+        .unwrap_or(false)
+        {
             match crate::registry::fetch::fetch_models_dev().await {
                 Ok(json) => match crate::registry::fetch::write_cache(&json) {
                     Ok(()) => println!("已缓存模型元数据到 {}", cache_path.display()),
@@ -136,7 +178,10 @@ fn render_config(a: &Answers) -> String {
 
     s.push_str("[agent]\n");
     s.push_str("# 默认模型，引用格式 provider/model。可被 CLI --model 覆盖。\n");
-    s.push_str(&format!("model = \"{}/{}\"\n", a.provider_name, a.model_name));
+    s.push_str(&format!(
+        "model = \"{}/{}\"\n",
+        a.provider_name, a.model_name
+    ));
     s.push_str("max_output_tokens = 16000\n");
     s.push_str("# fast_model = \"<provider>/<model>\"   # 压缩/标题用的快模型，省略则用主模型。\n");
     s.push_str("# system_prompt_file = \"~/.carter/system.md\"   # 覆盖内置「特工卡特」人设。\n\n");
@@ -150,26 +195,37 @@ fn render_config(a: &Answers) -> String {
         s.push_str(&format!("https_proxy = \"{}\"\n", toml_escape(proxy)));
         s.push_str(&format!("http_proxy = \"{}\"\n\n", toml_escape(proxy)));
     } else {
-        s.push_str("# [env]\n# https_proxy = \"http://127.0.0.1:7890\"   # 需要代理时取消注释。\n\n");
+        s.push_str(
+            "# [env]\n# https_proxy = \"http://127.0.0.1:7890\"   # 需要代理时取消注释。\n\n",
+        );
     }
 
-    s.push_str("# [debug]\n# log_requests = true   # 记录每次 LLM 请求到 ~/.carter/debug/llm_log/。\n\n");
+    s.push_str(
+        "# [debug]\n# log_requests = true   # 记录每次 LLM 请求到 ~/.carter/debug/llm_log/。\n\n",
+    );
 
     s.push_str("# ---- 服务商：协议 + 端点 + 密钥 ----\n");
     s.push_str(&format!("[providers.{}]\n", a.provider_name));
     s.push_str(&format!("kind = \"{}\"\n", a.kind));
     match &a.base_url {
         Some(b) => s.push_str(&format!("base_url = \"{}\"\n", toml_escape(b))),
-        None => s.push_str("# base_url = \"https://your-endpoint/...\"   # 自定义端点；省略用官方默认。\n"),
+        None => s.push_str(
+            "# base_url = \"https://your-endpoint/...\"   # 自定义端点；省略用官方默认。\n",
+        ),
     }
     match &a.api_key {
         Some(k) => s.push_str(&format!("api_key = \"{}\"\n", toml_escape(k))),
-        None => s.push_str("# api_key = \"${YOUR_API_KEY}\"   # 建议用 ${ENV} 插值，避免硬编码。\n"),
+        None => {
+            s.push_str("# api_key = \"${YOUR_API_KEY}\"   # 建议用 ${ENV} 插值，避免硬编码。\n")
+        }
     }
     s.push('\n');
 
     s.push_str("# 块名即引用里的 model；省略 api_name 时默认取块名做端点模型名。\n");
-    s.push_str(&format!("  [providers.{}.models.{}]\n", a.provider_name, a.model_name));
+    s.push_str(&format!(
+        "  [providers.{}.models.{}]\n",
+        a.provider_name, a.model_name
+    ));
     s.push_str("  # meta = models.dev 的 provider_id/model_id，用于查上下文窗口/价格。\n");
     s.push_str(&format!("  meta = \"{}\"\n", toml_escape(&a.meta)));
     s
@@ -192,7 +248,11 @@ fn prompt_default(label: &str, default: &str) -> Option<String> {
     print!("{label} [{default}]: ");
     let _ = io::stdout().flush();
     let line = read_line()?;
-    Some(if line.is_empty() { default.to_string() } else { line })
+    Some(if line.is_empty() {
+        default.to_string()
+    } else {
+        line
+    })
 }
 
 /// 可选项。空输入→None（表示「不填」）。EOF→None。
@@ -286,11 +346,17 @@ mod tests {
         assert_eq!(cfg.agent.model, "mycorp/claude-sonnet-4-6");
         let p = cfg.providers.get("mycorp").expect("provider 应存在");
         assert_eq!(p.kind, "anthropic");
-        assert_eq!(p.base_url.as_deref(), Some("https://gw.example.com/anthropic/v1/"));
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some("https://gw.example.com/anthropic/v1/")
+        );
         assert_eq!(p.api_key.as_deref(), Some("sk-abc"));
         let m = p.models.get("claude-sonnet-4-6").expect("模型块应存在");
         assert_eq!(m.meta, "anthropic/claude-sonnet-4-5");
-        assert_eq!(cfg.env.get("https_proxy").map(String::as_str), Some("http://127.0.0.1:7890"));
+        assert_eq!(
+            cfg.env.get("https_proxy").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
     }
 
     #[test]

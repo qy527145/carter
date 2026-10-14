@@ -103,19 +103,25 @@ mod tests {
     fn write_atomic_creates_parent_dirs() {
         let _g = home_lock();
         let tmp = unique_home();
-        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("CARTER_HOME", &tmp);
+        }
         let target = tmp.join("nested").join("a").join("file.md");
         write_atomic(&target, "hello").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::remove_var("CARTER_HOME"); }
+        unsafe {
+            std::env::remove_var("CARTER_HOME");
+        }
     }
 
     #[test]
     fn write_atomic_backs_up_existing_then_replaces() {
         let _g = home_lock();
         let tmp = unique_home();
-        unsafe { std::env::set_var("CARTER_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("CARTER_HOME", &tmp);
+        }
         std::fs::create_dir_all(&tmp).unwrap();
         let target = tmp.join("CARTER.md");
         std::fs::write(&target, "v1").unwrap();
@@ -134,12 +140,18 @@ mod tests {
         // 备份内容是 v1（取最新一个）。
         let latest = backups
             .iter()
-            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH))
+            .max_by_key(|e| {
+                e.metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            })
             .unwrap();
         let backup_content = std::fs::read_to_string(latest.path()).unwrap();
         assert_eq!(backup_content, "v1");
 
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::remove_var("CARTER_HOME"); }
+        unsafe {
+            std::env::remove_var("CARTER_HOME");
+        }
     }
 }

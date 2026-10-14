@@ -57,11 +57,11 @@ impl McpManager {
     }
 
     /// 列远端工具并映射成 `McpTool`（每个持克隆 peer）。
-    async fn collect_tools(service: &Service, server: &str) -> Result<Vec<std::sync::Arc<dyn Tool>>, String> {
-        let listed = service
-            .list_all_tools()
-            .await
-            .map_err(|e| format!("{e}"))?;
+    async fn collect_tools(
+        service: &Service,
+        server: &str,
+    ) -> Result<Vec<std::sync::Arc<dyn Tool>>, String> {
+        let listed = service.list_all_tools().await.map_err(|e| format!("{e}"))?;
 
         let mut out: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         for t in listed {

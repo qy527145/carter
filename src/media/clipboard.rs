@@ -11,7 +11,7 @@
 //! 失败语义：剪贴板没图片 / 后端访问失败 → 返回 `Ok(None)`，让调用方 fallback 到普通文本粘贴。
 //! 真正的 IO 错误（编码失败 / 写盘失败）才返回 `Err`。
 
-use super::{put_bytes, ImageRef};
+use super::{ImageRef, put_bytes};
 
 /// 尝试从系统剪贴板读取图片并入库。成功返回 `Some(ImageRef)`；剪贴板无图片返回 `None`。
 pub fn paste_image() -> std::io::Result<Option<ImageRef>> {

@@ -6,14 +6,17 @@
 mod recorder;
 mod store;
 
+/// 会话格式迁移（老文件只读升级，不原地改写）。
+pub mod migrate;
+
 pub mod history;
 
 pub use recorder::Recorder;
-pub use store::{fork, gc, latest, list, load, start_new, SessionEntry, SessionOpts};
+pub use store::{SessionEntry, SessionOpts, fork, gc, latest, list, load, start_new};
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::Message;
+use crate::provider::{Block, ToolResultContent, WireMessage};
 use crate::tools::TodoItem;
 
 /// epoch 毫秒（无需引入日期 crate；文件名前缀用它保证可排序）。
@@ -51,6 +54,12 @@ pub fn date_utc(ms: u64) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub id: String,
+    /// 会话文件格式版本。
+    ///
+    /// 缺省（老文件没有这个字段）一律视为 1 —— 只读迁移靠它判断要不要转换。
+    /// 当前版本见 [`CURRENT_FORMAT_VERSION`]。
+    #[serde(default = "legacy_format_version")]
+    pub format_version: u32,
     /// resume 的来源（同一文件追加时为空；保留给将来语义）。
     #[serde(default)]
     pub parent_id: Option<String>,
@@ -80,11 +89,16 @@ pub struct GitInfo {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RecordKind {
     SessionMeta(SessionMeta),
-    Title { title: String },
-    Message(Message),
+    Title {
+        title: String,
+    },
+    Message(WireMessage),
     Todo(Vec<TodoItem>),
     /// 压缩后的全量快照（head + 摘要 + recent），等价 Codex 的 replacement_history。
-    Compacted { tier: String, messages: Vec<Message> },
+    Compacted {
+        tier: String,
+        messages: Vec<WireMessage>,
+    },
     /// 文件检查点：write_file/edit_file 等工具执行前的快照（供 /rewind）。
     /// 跨会话持久化：resume 时 fold_file 把这些恢复进 thread.checkpoints。
     Checkpoint {
@@ -115,41 +129,56 @@ impl Record {
     }
 }
 
-/// 单条 `Message::Tool` 落盘上限（治膨胀，对应 docs 原则 4）。超出截断 + 标记。
+/// 当前会话文件格式版本。改动消息形态时必须 +1，并在 `session::migrate` 里补一条升级路径。
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
+
+/// 老会话文件没有 `format_version` 字段，一律当 v1。
+fn legacy_format_version() -> u32 {
+    1
+}
+
+/// 单条工具结果落盘上限（治膨胀，对应 docs 原则 4）。超出截断 + 标记。
 pub const TOOL_OUTPUT_PERSIST_CAP: usize = 32 * 1024;
 
 /// 落盘前对消息做体积约束：仅截断超大的工具输出，其余原样。
-pub fn cap_for_persist(msg: &Message) -> Message {
-    match msg {
-        Message::Tool { call_id, content } if content.len() > TOOL_OUTPUT_PERSIST_CAP => {
-            let kept: String = content.chars().take(TOOL_OUTPUT_PERSIST_CAP).collect();
-            Message::Tool {
-                call_id: call_id.clone(),
-                content: format!(
-                    "{kept}\n[tool result truncated for session log: {} bytes total]",
-                    content.len()
-                ),
+pub fn cap_for_persist(msg: &WireMessage) -> WireMessage {
+    let mut out = msg.clone();
+    for block in &mut out.content {
+        if let Block::ToolResult { content, .. } = block {
+            if let ToolResultContent::Text { text } = content {
+                let total = text.len();
+                if total > TOOL_OUTPUT_PERSIST_CAP {
+                    let kept: String = text.chars().take(TOOL_OUTPUT_PERSIST_CAP).collect();
+                    *text = format!(
+                        "{kept}
+[tool result truncated for session log: {total} bytes total]"
+                    );
+                }
             }
         }
-        other => other.clone(),
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{Block, Role, ToolResultContent};
 
     /// 每行落盘格式 = `{ts, type, payload}`，且 flatten + 标签枚举可往返。
     #[test]
     fn record_roundtrips_with_flattened_tag() {
-        let rec = Record::new(RecordKind::Message(Message::User("你好".into())));
+        let rec = Record::new(RecordKind::Message(WireMessage::user_text("你好")));
         let line = serde_json::to_string(&rec).unwrap();
         assert!(line.contains("\"type\":\"message\""));
         assert!(line.contains("\"payload\""));
         assert!(line.contains("\"ts\""));
         let back: Record = serde_json::from_str(&line).unwrap();
         match back.kind {
-            RecordKind::Message(Message::User(s)) => assert_eq!(s, "你好"),
+            RecordKind::Message(m) => {
+                assert_eq!(m.role, Role::User);
+                assert_eq!(m.concat_text(), "你好");
+            }
             _ => panic!("variant mismatch"),
         }
     }
@@ -158,6 +187,7 @@ mod tests {
     fn meta_and_compacted_roundtrip() {
         let meta = SessionMeta {
             id: "abc".into(),
+            format_version: CURRENT_FORMAT_VERSION,
             parent_id: None,
             forked_from: Some("p".into()),
             cwd: "/x".into(),
@@ -176,7 +206,7 @@ mod tests {
 
         let comp = Record::new(RecordKind::Compacted {
             tier: "L3".into(),
-            messages: vec![Message::Assistant("摘要".into())],
+            messages: vec![WireMessage::new(Role::Assistant, vec![Block::text("摘要")])],
         });
         let back: Record = serde_json::from_str(&serde_json::to_string(&comp).unwrap()).unwrap();
         match back.kind {
@@ -190,25 +220,42 @@ mod tests {
 
     #[test]
     fn cap_truncates_only_oversized_tool_output() {
-        let small = Message::Tool {
-            call_id: "1".into(),
-            content: "ok".into(),
-        };
-        assert!(matches!(cap_for_persist(&small), Message::Tool { content, .. } if content == "ok"));
+        let small = tool_msg("1", "ok");
+        assert_eq!(tool_text(&cap_for_persist(&small)), "ok");
 
-        let big = Message::Tool {
-            call_id: "1".into(),
-            content: "x".repeat(TOOL_OUTPUT_PERSIST_CAP + 10),
-        };
-        if let Message::Tool { content, .. } = cap_for_persist(&big) {
-            assert!(content.contains("truncated for session log"));
-            assert!(content.len() < TOOL_OUTPUT_PERSIST_CAP + 200);
-        } else {
-            panic!("expected tool msg");
-        }
+        let big = tool_msg("1", &"x".repeat(TOOL_OUTPUT_PERSIST_CAP + 10));
+        let capped = tool_text(&cap_for_persist(&big));
+        assert!(capped.contains("truncated for session log"));
+        assert!(capped.len() < TOOL_OUTPUT_PERSIST_CAP + 200);
 
         // 非工具消息原样。
-        let user = Message::User("hi".into());
-        assert!(matches!(cap_for_persist(&user), Message::User(s) if s == "hi"));
+        let user = WireMessage::user_text("hi");
+        let capped = cap_for_persist(&user);
+        assert_eq!(capped.role, Role::User);
+        assert_eq!(capped.concat_text(), "hi");
+    }
+
+    fn tool_msg(id: &str, content: &str) -> WireMessage {
+        WireMessage::new(
+            Role::User,
+            vec![Block::ToolResult {
+                tool_use_id: id.to_string(),
+                content: ToolResultContent::Text {
+                    text: content.to_string(),
+                },
+                is_error: false,
+                cache: None,
+            }],
+        )
+    }
+
+    fn tool_text(m: &WireMessage) -> String {
+        m.content
+            .iter()
+            .find_map(|b| match b {
+                Block::ToolResult { content, .. } => Some(content.as_text()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }

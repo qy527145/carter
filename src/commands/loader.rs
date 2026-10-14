@@ -90,7 +90,10 @@ fn parse(name: String, raw: &str, scope: Scope) -> SlashCommand {
 /// 切分 frontmatter。首行须为 `---`，到下一行 `---` 为止。返回 (键值对, 正文)。
 fn split_frontmatter(raw: &str) -> (Vec<(String, String)>, &str) {
     let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw); // 去 BOM
-    let rest = match trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---\r\n")) {
+    let rest = match trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
+    {
         Some(r) => r,
         None => return (Vec::new(), trimmed),
     };
@@ -168,7 +171,10 @@ mod tests {
             command_name(dir, Path::new("/c/git/commit.md")).as_deref(),
             Some("git:commit")
         );
-        assert_eq!(command_name(dir, Path::new("/c/foo.md")).as_deref(), Some("foo"));
+        assert_eq!(
+            command_name(dir, Path::new("/c/foo.md")).as_deref(),
+            Some("foo")
+        );
     }
 
     #[test]

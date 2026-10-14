@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::agent::ui::{UiEvent, UiSink};
 
-use super::protocol::{to_line, Event, WireTodo, WireUsage};
+use super::protocol::{Event, WireTodo, WireUsage, to_line};
 
 /// 等待 host 回复的 AskUser 表：id → 已脱离 UiEvent 的 oneshot Sender。
 pub type PendingAsks = Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>;

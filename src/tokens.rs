@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use tiktoken_rs::CoreBPE;
 
-use crate::provider::Message;
+use crate::provider::{Block, WireMessage};
 
 static CL100K: OnceLock<Option<CoreBPE>> = OnceLock::new();
 static O200K: OnceLock<Option<CoreBPE>> = OnceLock::new();
@@ -31,21 +31,19 @@ fn encoder_for(tokenizer: &str) -> Option<&'static CoreBPE> {
         "o200k" | "o200k_base" | "o1" | "o3" => O200K
             .get_or_init(|| tiktoken_rs::o200k_base().ok())
             .as_ref(),
-        "p50k" | "p50k_base" => P50K
-            .get_or_init(|| tiktoken_rs::p50k_base().ok())
-            .as_ref(),
+        "p50k" | "p50k_base" => P50K.get_or_init(|| tiktoken_rs::p50k_base().ok()).as_ref(),
         _ => None,
     }
 }
 
 /// 估算单条消息的 token 数。失败/未知 tokenizer 走 chars/4。
-pub fn estimate_message(msg: &Message, tokenizer: &str) -> u64 {
+pub fn estimate_message(msg: &WireMessage, tokenizer: &str) -> u64 {
     let text = render_for_counting(msg);
     count_text(&text, tokenizer)
 }
 
 /// 估算一组消息的 token 数（含每条 +4 结构化开销，模拟 OpenAI 消息封包成本）。
-pub fn estimate_messages(messages: &[Message], tokenizer: &str) -> u64 {
+pub fn estimate_messages(messages: &[WireMessage], tokenizer: &str) -> u64 {
     messages
         .iter()
         .map(|m| estimate_message(m, tokenizer) + 4)
@@ -68,16 +66,25 @@ fn fallback_estimate(text: &str) -> u64 {
 /// 把单条消息渲染成适合 BPE 计数的纯文本。图片引用 `[img:...]` 当字面量计入（约 8 token），
 /// 因为真实图片的 token 成本由 provider 计算（一张图大约 1568px 边 → 1.5k tokens），
 /// 我们按字面量估算只是为了**触发压缩决策**而非精确计费。
-fn render_for_counting(msg: &Message) -> String {
-    match msg {
-        Message::System(s) | Message::User(s) | Message::Assistant(s) => s.clone(),
-        Message::Tool { content, call_id } => format!("[tool:{call_id}] {content}"),
-        Message::ToolCalls(calls) => calls
-            .iter()
-            .map(|c| format!("[call:{}] {}({})", c.id, c.name, c.args))
-            .collect::<Vec<_>>()
-            .join("\n"),
+fn render_for_counting(msg: &WireMessage) -> String {
+    let mut out = String::new();
+    // 角色不同不影响 BPE 计数，故不区分。
+    for b in &msg.content {
+        match b {
+            Block::Text { text, .. } => out.push_str(text),
+            Block::Thinking { text, .. } => out.push_str(text),
+            Block::ToolUse { name, input, .. } => {
+                out.push_str(name);
+                out.push_str(&input.to_string());
+            }
+            Block::ToolResult { content, .. } => out.push_str(&content.as_text()),
+            // 图片的 token 成本由 provider 按像素算（1568px 边约 1.5k tokens），
+            // 这里只想要个能触发压缩决策的量级，给个常数即可。
+            Block::Image { .. } => out.push_str("[image]"),
+            Block::RedactedThinking { .. } | Block::Unmodeled { .. } => {}
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -114,7 +121,13 @@ mod tests {
 
     #[test]
     fn estimate_messages_sums_with_envelope_overhead() {
-        let msgs = vec![Message::User("hi".to_string()), Message::Assistant("ok".to_string())];
+        let msgs = vec![
+            WireMessage::user_text("hi"),
+            WireMessage {
+                role: crate::provider::Role::Assistant,
+                content: vec![Block::text("ok")],
+            },
+        ];
         let n = estimate_messages(&msgs, "cl100k");
         // 每条 +4 envelope，两条至少 8 + 内容 token。
         assert!(n >= 8);

@@ -130,7 +130,9 @@ mod tests {
                 ),
             ),
         ]);
-        let d = r.dispatch(HookEvent::UserPromptSubmit, json!({"prompt":"orig"})).await;
+        let d = r
+            .dispatch(HookEvent::UserPromptSubmit, json!({"prompt":"orig"}))
+            .await;
         match d {
             HookDecision::Rewrite(v) => {
                 assert_eq!(v.get("prompt").and_then(|x| x.as_str()), Some("step2"));

@@ -124,7 +124,11 @@ mod tests {
     fn skips_malformed_lines() {
         let path = temp("malformed");
         let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, "not json\n{\"ts\":1,\"session_id\":\"s\",\"text\":\"ok\"}\n").unwrap();
+        std::fs::write(
+            &path,
+            "not json\n{\"ts\":1,\"session_id\":\"s\",\"text\":\"ok\"}\n",
+        )
+        .unwrap();
         assert_eq!(load_from(&path, 10), vec!["ok".to_string()]);
         let _ = std::fs::remove_file(&path);
     }

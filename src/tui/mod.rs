@@ -19,7 +19,7 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -29,8 +29,8 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use unicode_width::UnicodeWidthStr;
 
-use crate::agent::ui::{UiEvent, UiSink};
 use crate::agent::CancelToken;
+use crate::agent::ui::{UiEvent, UiSink};
 use crate::provider::Usage;
 use crate::tools::{TodoItem, TodoStatus};
 
@@ -95,7 +95,10 @@ enum Block_ {
     /// 累积中的 assistant 正文（流式追加）。
     Assistant(String),
     Thinking(String),
-    Tool { ok: Option<bool>, line: String },
+    Tool {
+        ok: Option<bool>,
+        line: String,
+    },
     Todos(Vec<TodoItem>),
     Notice(String),
     /// 带标签的分隔线（上下文边界可视化）。
@@ -249,10 +252,7 @@ impl App {
     }
 
     /// 注入会话候选动态来源（/resume·/fork）。
-    fn with_session_candidates(
-        mut self,
-        f: Box<dyn Fn() -> Vec<CompletionItem> + Send>,
-    ) -> Self {
+    fn with_session_candidates(mut self, f: Box<dyn Fn() -> Vec<CompletionItem> + Send>) -> Self {
         self.session_candidates = Some(f);
         self
     }
@@ -357,7 +357,11 @@ impl App {
                     response_tx,
                 });
             }
-            UiEvent::TurnUsage { usage, cost, model: _ } => {
+            UiEvent::TurnUsage {
+                usage,
+                cost,
+                model: _,
+            } => {
                 self.flush_pending();
                 // 模型名由 ModelChanged 权威维护，这里不覆盖（避免「请求后才同步」）。
                 self.accumulate(&usage, cost);
@@ -413,8 +417,8 @@ impl App {
     }
 
     fn accumulate(&mut self, usage: &Usage, cost: f64) {
-        self.status.total_in += usage.input;
-        self.status.total_out += usage.output;
+        self.status.total_in += usage.input_tokens as u64;
+        self.status.total_out += usage.output_tokens as u64;
         self.status.total_cost += cost;
     }
 
@@ -445,9 +449,7 @@ impl App {
         }
         if let Some(start) = token_ends_at(&self.input, self.cursor) {
             // 顺手吃掉 token 紧前的一个空格（粘贴时自带），保持视觉干净。
-            let real_start = if start > 0
-                && self.input.as_bytes().get(start - 1) == Some(&b' ')
-            {
+            let real_start = if start > 0 && self.input.as_bytes().get(start - 1) == Some(&b' ') {
                 start - 1
             } else {
                 start
@@ -592,7 +594,10 @@ impl App {
                 Some((cmd, _)) => {
                     // 先取完 before 借用相关的值（cmd/tok_start/query 都 owned），再做可变借用。
                     let cmd = cmd.to_string();
-                    let tok_start = before.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+                    let tok_start = before
+                        .rfind(char::is_whitespace)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
                     let query = self.input[tok_start..self.cursor].to_string();
                     if let Some(cands) = self.arg_candidates_cached(&cmd) {
                         self.build_arg_completion(tok_start, query, cands);
@@ -649,8 +654,12 @@ impl App {
             .filter_map(|(i, c)| fuzzy_score(&query, &c.name).map(|s| (s, i)))
             .collect();
         scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| self.commands[a.1].name.len().cmp(&self.commands[b.1].name.len()))
+            b.0.cmp(&a.0).then_with(|| {
+                self.commands[a.1]
+                    .name
+                    .len()
+                    .cmp(&self.commands[b.1].name.len())
+            })
         });
         let entries: Vec<CompletionEntry> = scored
             .into_iter()
@@ -666,7 +675,12 @@ impl App {
         self.completion = if entries.is_empty() {
             None
         } else {
-            Some(CompletionState { kind: CompletionKind::Slash, start: 0, entries, selected: 0 })
+            Some(CompletionState {
+                kind: CompletionKind::Slash,
+                start: 0,
+                entries,
+                selected: 0,
+            })
         };
     }
 
@@ -695,7 +709,12 @@ impl App {
         self.completion = if entries.is_empty() {
             None
         } else {
-            Some(CompletionState { kind: CompletionKind::File, start, entries, selected: 0 })
+            Some(CompletionState {
+                kind: CompletionKind::File,
+                start,
+                entries,
+                selected: 0,
+            })
         };
     }
 
@@ -723,7 +742,12 @@ impl App {
         self.completion = if entries.is_empty() {
             None
         } else {
-            Some(CompletionState { kind: CompletionKind::Arg, start, entries, selected: 0 })
+            Some(CompletionState {
+                kind: CompletionKind::Arg,
+                start,
+                entries,
+                selected: 0,
+            })
         };
     }
 
@@ -774,7 +798,14 @@ impl App {
 /// 扫描工作目录收集相对文件路径（供 `@` 补全）。跳过重目录/隐藏项，限深限量。
 fn scan_files(root: &std::path::Path) -> Vec<String> {
     const SKIP: &[&str] = &[
-        ".git", "target", "node_modules", ".carter", "dist", "build", ".idea", ".vscode",
+        ".git",
+        "target",
+        "node_modules",
+        ".carter",
+        "dist",
+        "build",
+        ".idea",
+        ".vscode",
     ];
     const MAX_FILES: usize = 5000;
     const MAX_DEPTH: usize = 10;
@@ -887,7 +918,9 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
                 }
                 return Action::None;
             }
-            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) && !app.input.is_empty() => {
+            KeyCode::Enter
+                if !key.modifiers.contains(KeyModifiers::SHIFT) && !app.input.is_empty() =>
+            {
                 let ask = app.pending_ask.take().unwrap();
                 let answer = std::mem::take(&mut app.input);
                 app.cursor = 0;
@@ -933,9 +966,8 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
                 Action::Cancel
             } else {
                 // 空闲时首次 Ctrl+C：提示再按一次退出。
-                app.outbox.push(Block_::Notice(
-                    "再按一次 Ctrl+C 退出（或 /quit）".into(),
-                ));
+                app.outbox
+                    .push(Block_::Notice("再按一次 Ctrl+C 退出（或 /quit）".into()));
                 Action::None
             }
         }
@@ -955,9 +987,9 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
         }
         KeyCode::Enter => {
             // 带 Shift/Alt/Ctrl 任一修饰 → 插入换行（多行输入）；裸 Enter → 发送。
-            let newline_mod = key.modifiers.intersects(
-                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-            );
+            let newline_mod = key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
             if newline_mod {
                 app.input_insert('\n');
                 return Action::None;
@@ -1041,9 +1073,13 @@ fn banner_lines() -> Vec<Line<'static>> {
         r"| |___ / ___ \|  _ < | | | |___|  _ < ",
         r" \____/_/   \_\_| \_\|_| |_____|_| \_\",
     ];
-    let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let mut lines: Vec<Line<'static>> =
-        art.iter().map(|l| Line::from(Span::styled(l.to_string(), cyan))).collect();
+    let cyan = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = art
+        .iter()
+        .map(|l| Line::from(Span::styled(l.to_string(), cyan)))
+        .collect();
     lines.push(Line::from(Span::styled(
         "特工卡特已就位 · Agent Carter reporting for duty".to_string(),
         Style::default().fg(Color::DarkGray),
@@ -1154,7 +1190,9 @@ fn block_to_lines(block: &Block_) -> Vec<Line<'static>> {
     match block {
         Block_::User(s) => {
             // 多行用户输入：逐逻辑行渲染，保留换行（首行加前缀，续行对齐缩进）。
-            let style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
             for (i, l) in s.split('\n').enumerate() {
                 let text = if i == 0 {
                     format!("› {l}")
@@ -1221,9 +1259,7 @@ fn block_to_lines(block: &Block_) -> Vec<Line<'static>> {
             };
             lines.push(Line::from(Span::styled(
                 text,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::DIM),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
             )));
         }
     }
@@ -1320,7 +1356,9 @@ fn render_viewport(f: &mut Frame, app: &mut App) {
 /// 流式残行预览：画当前 pending 块未满一行的内容（无则空）。
 fn render_preview(f: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = match &app.pending {
-        Some(b @ (Block_::Assistant(s) | Block_::Thinking(s))) if !s.is_empty() => block_to_lines(b),
+        Some(b @ (Block_::Assistant(s) | Block_::Thinking(s))) if !s.is_empty() => {
+            block_to_lines(b)
+        }
         _ => Vec::new(),
     };
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -1360,7 +1398,9 @@ fn render_completion(f: &mut Frame, app: &App, area: Rect) {
         let mut spans = vec![
             Span::styled(
                 format!(" {trigger}{}", item.value),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(hint, Style::default().fg(Color::DarkGray)),
         ];
@@ -1419,10 +1459,13 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     // 暗色底栏 + 语义着色的分段。各段以暗灰 `│` 分隔。
     let bar = Style::default().bg(Color::Indexed(236));
-    let sep = || Span::styled(" │ ", Style::default().fg(Color::DarkGray).bg(Color::Indexed(236)));
-    let seg = |s: String, c: Color| {
-        Span::styled(s, Style::default().fg(c).bg(Color::Indexed(236)))
+    let sep = || {
+        Span::styled(
+            " │ ",
+            Style::default().fg(Color::DarkGray).bg(Color::Indexed(236)),
+        )
     };
+    let seg = |s: String, c: Color| Span::styled(s, Style::default().fg(c).bg(Color::Indexed(236)));
 
     let mut spans: Vec<Span> = Vec::new();
     // 状态指示：streaming 黄、idle 绿。
@@ -1454,12 +1497,19 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     spans.push(sep());
     // token 用量（k 格式）。
     spans.push(seg(
-        format!("↑{} ↓{}", fmt_tokens(app.status.total_in), fmt_tokens(app.status.total_out)),
+        format!(
+            "↑{} ↓{}",
+            fmt_tokens(app.status.total_in),
+            fmt_tokens(app.status.total_out)
+        ),
         Color::Gray,
     ));
     spans.push(sep());
     // 成本。
-    spans.push(seg(format!("${:.4}", app.status.total_cost), Color::LightGreen));
+    spans.push(seg(
+        format!("${:.4}", app.status.total_cost),
+        Color::LightGreen,
+    ));
 
     let para = Paragraph::new(Line::from(spans)).style(bar);
     f.render_widget(para, area);
@@ -1731,8 +1781,8 @@ mod tests {
         let mut app = App::new("m".into());
         app.streaming = true;
         let usage = Usage {
-            input: 10,
-            output: 5,
+            input_tokens: 10,
+            output_tokens: 5,
             ..Default::default()
         };
         app.apply(UiEvent::TurnUsage {
@@ -1761,10 +1811,22 @@ mod tests {
         let mut app = App::new("m".into());
         app.apply(UiEvent::Divider("恢复会话 标题 (abcd1234)".into()));
         app.apply(UiEvent::ReplayHistory(vec![
-            ReplayMsg { role: ReplayRole::User, text: "问题".into() },
-            ReplayMsg { role: ReplayRole::Assistant, text: "回答".into() },
-            ReplayMsg { role: ReplayRole::ToolCall, text: "⚙ read(x)".into() },
-            ReplayMsg { role: ReplayRole::ToolResult, text: "ok".into() },
+            ReplayMsg {
+                role: ReplayRole::User,
+                text: "问题".into(),
+            },
+            ReplayMsg {
+                role: ReplayRole::Assistant,
+                text: "回答".into(),
+            },
+            ReplayMsg {
+                role: ReplayRole::ToolCall,
+                text: "⚙ read(x)".into(),
+            },
+            ReplayMsg {
+                role: ReplayRole::ToolResult,
+                text: "ok".into(),
+            },
         ]));
         // 1 分隔线 + 4 回放块。
         assert_eq!(app.outbox.len(), 5);
@@ -1772,7 +1834,10 @@ mod tests {
         assert!(matches!(&app.outbox[1], Block_::User(s) if s == "问题"));
         assert!(matches!(&app.outbox[2], Block_::Assistant(s) if s == "回答"));
         assert!(matches!(&app.outbox[3], Block_::Tool { ok: None, .. }));
-        assert!(matches!(&app.outbox[4], Block_::Tool { ok: Some(true), .. }));
+        assert!(matches!(
+            &app.outbox[4],
+            Block_::Tool { ok: Some(true), .. }
+        ));
     }
 
     #[test]
@@ -1827,9 +1892,21 @@ mod tests {
 
     fn app_with_cmds() -> App {
         App::new("m".into()).with_commands(vec![
-            CompletionItem { name: "clear".into(), description: "清空".into(), hint: None },
-            CompletionItem { name: "compact".into(), description: "压缩".into(), hint: None },
-            CompletionItem { name: "cost".into(), description: "成本".into(), hint: None },
+            CompletionItem {
+                name: "clear".into(),
+                description: "清空".into(),
+                hint: None,
+            },
+            CompletionItem {
+                name: "compact".into(),
+                description: "压缩".into(),
+                hint: None,
+            },
+            CompletionItem {
+                name: "cost".into(),
+                description: "成本".into(),
+                hint: None,
+            },
             CompletionItem {
                 name: "git:commit".into(),
                 description: "提交".into(),
@@ -1903,8 +1980,16 @@ mod tests {
         let mut app = App::new("m".into()).with_arg_completions(vec![(
             "model".into(),
             vec![
-                CompletionItem { name: "ws/sonnet".into(), description: "[anthropic]".into(), hint: None },
-                CompletionItem { name: "ws/gpt".into(), description: "[openai]".into(), hint: None },
+                CompletionItem {
+                    name: "ws/sonnet".into(),
+                    description: "[anthropic]".into(),
+                    hint: None,
+                },
+                CompletionItem {
+                    name: "ws/gpt".into(),
+                    description: "[openai]".into(),
+                    hint: None,
+                },
             ],
         )]);
         // "/model " → 参数补全列出全部 2 项。
@@ -1930,7 +2015,11 @@ mod tests {
     fn arg_completion_only_for_known_commands() {
         let mut app = App::new("m".into()).with_arg_completions(vec![(
             "model".into(),
-            vec![CompletionItem { name: "ws/x".into(), description: String::new(), hint: None }],
+            vec![CompletionItem {
+                name: "ws/x".into(),
+                description: String::new(),
+                hint: None,
+            }],
         )]);
         // /clear 无参数候选 → 输入空格后不弹窗。
         for ch in "/clear ".chars() {
@@ -2109,13 +2198,20 @@ mod tests {
 
     #[test]
     fn shift_enter_inserts_newline_bare_enter_submits() {
-        for m in [KeyModifiers::SHIFT, KeyModifiers::ALT, KeyModifiers::CONTROL] {
+        for m in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+        ] {
             let mut app = App::new("m".into());
             app.input = "hi".into();
             app.cursor = app.input.len();
             let a = handle_key(KeyEvent::new(KeyCode::Enter, m), &mut app);
             assert!(matches!(a, Action::None));
-            assert!(app.input.contains('\n'), "modifier {m:?} should insert newline");
+            assert!(
+                app.input.contains('\n'),
+                "modifier {m:?} should insert newline"
+            );
         }
         // 裸 Enter → 提交。
         let mut app = App::new("m".into());
@@ -2135,15 +2231,11 @@ mod tests {
         assert!(app.pending.is_none());
     }
 
-
     #[test]
     fn enter_submits_nonempty_input() {
         let mut app = App::new("m".into());
         app.input = "hello".into();
-        let action = handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut app,
-        );
+        let action = handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
         assert!(matches!(action, Action::Submit(t) if t == "hello"));
         assert!(app.input.is_empty());
     }
@@ -2152,10 +2244,7 @@ mod tests {
     fn slash_quit_quits() {
         let mut app = App::new("m".into());
         app.input = "/quit".into();
-        let action = handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut app,
-        );
+        let action = handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
         assert!(matches!(action, Action::Quit));
     }
 
@@ -2164,10 +2253,7 @@ mod tests {
         let mut app = App::new("m".into());
         app.input = "hi".into();
         app.streaming = true;
-        let a = handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut app,
-        );
+        let a = handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
         assert!(matches!(a, Action::None));
     }
 
@@ -2215,7 +2301,10 @@ mod tests {
         );
         assert!(app.armed_quit);
         // 敲普通字符 → 解除预备状态。
-        handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &mut app);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut app,
+        );
         assert!(!app.armed_quit);
     }
 

@@ -210,7 +210,10 @@ fn decide(event: HookEvent, exit_code: i32, stdout: &str) -> HookDecision {
                 };
                 HookDecision::Block { reason }
             } else {
-                tracing::warn!("hooks: exit 2 from non-blockable event {:?}; ignored", event);
+                tracing::warn!(
+                    "hooks: exit 2 from non-blockable event {:?}; ignored",
+                    event
+                );
                 HookDecision::Continue
             }
         }
@@ -303,7 +306,10 @@ mod tests {
     async fn exit_two_blocks_for_blockable_event() {
         let cfg = HookConfig {
             event: HookEvent::PreToolUse,
-            command: crate::hooks::shell_cmd("echo not allowed; exit 2", "echo not allowed & exit /b 2"),
+            command: crate::hooks::shell_cmd(
+                "echo not allowed; exit 2",
+                "echo not allowed & exit /b 2",
+            ),
             r#match: None,
             timeout_secs: 5,
             enabled: true,

@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::config::{paths, Config};
+use crate::config::{Config, paths};
 use crate::session::GitInfo;
 
 /// 内置系统提示词。人设取自「特工卡特」——沉着、精准、足智多谋的终端软件工程特工；
@@ -85,7 +85,10 @@ pub fn base(config: &Config) -> String {
 /// 运行环境动态段（system 数组末段）：日期、工作目录、操作系统、模型、git。
 pub fn project_info(cwd: &Path, model_label: &str, git: Option<&GitInfo>, now_ms: u64) -> String {
     let mut out = String::from("# 运行环境（动态）\n");
-    out.push_str(&format!("- 日期：{}（UTC）\n", crate::session::date_utc(now_ms)));
+    out.push_str(&format!(
+        "- 日期：{}（UTC）\n",
+        crate::session::date_utc(now_ms)
+    ));
     out.push_str(&format!("- 工作目录：{}\n", cwd.display()));
     out.push_str(&format!("- 操作系统：{}\n", std::env::consts::OS));
     out.push_str(&format!("- 模型：{model_label}\n"));

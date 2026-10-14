@@ -154,7 +154,11 @@ pub fn mutating_paths(name: &str, args: &serde_json::Value) -> Vec<PathBuf> {
             .unwrap_or_default(),
         // save_memory 追加写 CARTER.md：按 scope 推断路径，纳入 /rewind。
         "save_memory" => {
-            let path = match args.get("scope").and_then(|v| v.as_str()).unwrap_or("project") {
+            let path = match args
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("project")
+            {
                 "global" => crate::config::paths::global_memory_path(),
                 _ => PathBuf::from("CARTER.md"),
             };
@@ -170,10 +174,8 @@ mod tests {
     use serde_json::json;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "carter-ckpt-{tag}-{}",
-            crate::session::now_ms()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("carter-ckpt-{tag}-{}", crate::session::now_ms()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
