@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::agent::{CancelToken, RunOptions, StdoutSink, Thread, TurnOutcome, run_turn};
 use crate::config::Config;
-use crate::provider::{LlmProvider, wire::WireProvider};
+use crate::provider::LlmProvider;
 use crate::registry::fetch;
 use crate::tui::ChannelSink;
 
@@ -185,12 +185,12 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
         .model
         .clone()
         .unwrap_or_else(|| config.agent.model.clone());
-    let (model, provider) = resolve_provider(&config, &cache_json, &model_name)?;
+    let (model, provider) = crate::provider::resolve_provider(&config, &cache_json, &model_name)?;
 
     // Fast 模型（压缩 / 标题）：配了 agent.fast_model 则解析，否则回落主模型/主 provider。
     let (fast_model, fast_provider): (crate::registry::ModelInfo, Arc<dyn LlmProvider>) =
         match &config.agent.fast_model {
-            Some(reference) => resolve_provider(&config, &cache_json, reference)?,
+            Some(reference) => crate::provider::resolve_provider(&config, &cache_json, reference)?,
             None => (model.clone(), provider.clone()),
         };
 
@@ -209,7 +209,7 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
     let (thread, session_meta) = resolve_session(&cwd, &model_name, &args)?;
 
     // system 分段数组（按序：人设 + skills + 多层记忆 + 运行环境）。供 oneshot 与 TUI 共用。
-    let system = assemble_system(
+    let system = crate::prompt::assemble_system(
         &config,
         &cwd,
         &model.key,
@@ -265,67 +265,6 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
         )
         .await
     }
-}
-
-/// 组装 system 分段数组：人设（内置或自定义文件）→ skills 目录 → 多层记忆 → 运行环境。
-/// 每段非空才入数组；底座据此发往 wire 的 system 数组。`memory_enabled=false` 跳过记忆段。
-fn assemble_system(
-    config: &Config,
-    cwd: &std::path::Path,
-    model_label: &str,
-    git: Option<&crate::session::GitInfo>,
-    skill_metas: &[crate::skills::SkillMeta],
-    memory_enabled: bool,
-) -> Vec<String> {
-    let mut system: Vec<String> = Vec::new();
-    system.push(crate::prompt::base(config));
-    if !skill_metas.is_empty() {
-        system.push(crate::skills::render_catalog(skill_metas));
-    }
-    if memory_enabled {
-        let memory = crate::memory::load(cwd);
-        if !memory.is_empty() {
-            system.push(memory);
-        }
-    }
-    system.push(crate::prompt::project_info(
-        cwd,
-        model_label,
-        git,
-        crate::session::now_ms(),
-    ));
-    system
-}
-
-/// 解析模型引用 → (ModelInfo, provider)。按 model.provider 查 `[providers.*]`，
-/// 没配的按 provider 名合成一份（key 从环境变量取）。startup 与会话内 `/model` 共用。
-fn resolve_provider(
-    config: &Config,
-    cache_json: &str,
-    model_ref: &str,
-) -> Result<(crate::registry::ModelInfo, Arc<dyn LlmProvider>)> {
-    let model = crate::registry::resolve_model(config, cache_json, model_ref)?;
-    let pcfg = config.provider_for(&model.provider);
-    let protocol = pcfg.protocol();
-    let client_config = pcfg.to_client_config()?;
-
-    // 请求报文日志：只在 `[debug] log_requests` 打开时挂。
-    // 它是底座的 RequestHook，拿到的是**最终字节** —— 记下来的是真正的原始报文
-    // （旧底座只能给归一化视图，排障时经常对不上）。
-    let hook: Option<Arc<dyn llm_adapt_core::RequestHook>> = config.debug.log_requests.then(|| {
-        let dir = config
-            .debug
-            .llm_log_dir
-            .clone()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(crate::config::paths::llm_log_dir);
-        Arc::new(crate::provider::llm_log::LlmLogHook::new(dir))
-            as Arc<dyn llm_adapt_core::RequestHook>
-    });
-
-    let provider: Arc<dyn LlmProvider> =
-        Arc::new(WireProvider::new(client_config, protocol, hook)?);
-    Ok((model, provider))
 }
 
 /// 按 CLI 标志解析会话：resume / fork / continue / 新建。
@@ -998,7 +937,7 @@ async fn dispatch_builtin(
                 }
                 sink.emit(notice(out));
             } else {
-                match resolve_provider(config, cache_json, args) {
+                match crate::provider::resolve_provider(config, cache_json, args) {
                     Ok((m, p)) => {
                         let key = m.key.clone();
                         *model = m;

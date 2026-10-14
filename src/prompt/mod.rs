@@ -149,3 +149,33 @@ mod tests {
         assert!(info.contains("分支 main @ abc1234"));
     }
 }
+
+/// 组装 system 分段数组：人设（内置或自定义文件）→ skills 目录 → 多层记忆 → 运行环境。
+/// 每段非空才入数组；底座据此发往 wire 的 system 数组。`memory_enabled=false` 跳过记忆段。
+pub fn assemble_system(
+    config: &Config,
+    cwd: &std::path::Path,
+    model_label: &str,
+    git: Option<&crate::session::GitInfo>,
+    skill_metas: &[crate::skills::SkillMeta],
+    memory_enabled: bool,
+) -> Vec<String> {
+    let mut system: Vec<String> = Vec::new();
+    system.push(crate::prompt::base(config));
+    if !skill_metas.is_empty() {
+        system.push(crate::skills::render_catalog(skill_metas));
+    }
+    if memory_enabled {
+        let memory = crate::memory::load(cwd);
+        if !memory.is_empty() {
+            system.push(memory);
+        }
+    }
+    system.push(crate::prompt::project_info(
+        cwd,
+        model_label,
+        git,
+        crate::session::now_ms(),
+    ));
+    system
+}
