@@ -63,3 +63,19 @@ pub async fn run_user_prompt_submit(
         }
     }
 }
+
+/// 测试用：按当前平台挑一段等价的 hook 命令。
+///
+/// hook 在 Windows 上走 `cmd /C`、其它平台走 `sh -c`（见 `runner.rs`），两边的
+/// echo 引号规则与退出码语法不通用。测试若不按平台选写法，在 Windows 上就会
+/// **以错误的理由通过**（命令报「不是内部命令」→ 退出码 1 → 被当成 Continue），
+/// 于是测试套件常年带红/带假绿，真正的回归反而看不出来。
+#[cfg(test)]
+pub(crate) fn shell_cmd(posix: &str, cmd: &str) -> String {
+    if runner::hook_shell().0 == "sh" {
+        posix
+    } else {
+        cmd
+    }
+    .to_string()
+}

@@ -7,6 +7,19 @@ license = "Apache-2.0"
 repository = "https://github.com/qy527145/carter"
 authors = ["wmymz"]
 
+[lib]
+name = "carter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "carter"
+path = "src/main.rs"
+
+# 空 `[workspace]` 表让 carter 自己成为 workspace 根。
+# 没有它的话，carter-app 通过 path 依赖引用本包时会把 carter 连同其 target 目录
+# 一起吸收进自己的 workspace —— 两边的 feature 与 profile 会互相干扰。
+[workspace]
+
 [package.metadata.wix]
 upgrade-guid = "8DA53E86-0AC9-4997-AB7E-6D0166E34E82"
 path-guid = "BF5405DD-55D3-4E11-9108-10B42B03AE2E"

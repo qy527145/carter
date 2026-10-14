@@ -572,7 +572,7 @@ mod tests {
         // 注册一个对 bash 阻断的 PreToolUse hook。
         let hooks = HookRegistry::from_configs(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: "echo nope; exit 2".to_string(),
+            command: crate::hooks::shell_cmd("echo nope; exit 2", "echo nope & exit /b 2"),
             r#match: None,
             timeout_secs: 5,
             enabled: true,
@@ -600,7 +600,10 @@ mod tests {
         // 用 jq 不可用 → 改用 sh + sed 简化：直接 emit 改写后 JSON。
         let hooks = HookRegistry::from_configs(vec![HookConfig {
             event: HookEvent::PreToolUse,
-            command: r#"echo '{"decision":"rewrite","data":{"args":{"path":"Cargo.toml"}}}'"#.to_string(),
+            command: crate::hooks::shell_cmd(
+                r#"echo '{"decision":"rewrite","data":{"args":{"path":"Cargo.toml"}}}'"#,
+                r#"echo {"decision":"rewrite","data":{"args":{"path":"Cargo.toml"}}}"#,
+            ),
             r#match: None,
             timeout_secs: 5,
             enabled: true,
@@ -628,7 +631,9 @@ mod tests {
             "carter-subagent-stop-{}",
             crate::session::now_ms()
         ));
-        let tmp_str = tmp.to_string_lossy().to_string();
+        // 路径统一用正斜杠：hook 在 Windows 上优先走 POSIX `sh`，反斜杠会被它
+        // 当成转义字符吃掉；正斜杠两个 shell 都认。
+        let tmp_str = tmp.to_string_lossy().replace("\\", "/");
         let hooks = HookRegistry::from_configs(vec![HookConfig {
             event: HookEvent::SubagentStop,
             command: format!("echo subagent-fired >> {tmp_str}"),
@@ -657,11 +662,16 @@ mod tests {
             "carter-turn-events-{}",
             crate::session::now_ms()
         ));
-        let tmp_str = tmp.to_string_lossy().to_string();
+        // 路径统一用正斜杠：hook 在 Windows 上优先走 POSIX `sh`，反斜杠会被它
+        // 当成转义字符吃掉；正斜杠两个 shell 都认。
+        let tmp_str = tmp.to_string_lossy().replace("\\", "/");
         // 三个事件都写到同一个文件，按顺序，便于检验顺序。
         let make = |event, label: &str| HookConfig {
             event,
-            command: format!("echo {label} >> {tmp_str}"),
+            command: crate::hooks::shell_cmd(
+                &format!("echo {label} >> {tmp_str}"),
+                &format!("echo {label} >> \"{tmp_str}\""),
+            ),
             r#match: None,
             timeout_secs: 5,
             enabled: true,

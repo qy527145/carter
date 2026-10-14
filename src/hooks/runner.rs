@@ -8,6 +8,46 @@ use tokio::io::AsyncWriteExt;
 
 use super::types::{HookConfig, HookDecision, HookEvent, HookOutcome, HookPayload};
 
+/// hook 命令用哪个 shell 跑：`(可执行文件, 传命令的开关)`。
+///
+/// **优先 POSIX `sh`。** hook 命令的文档与全部测试都按 POSIX 写
+/// （`echo '{"k":"v"}'`、`cmd1; exit 2`）。Windows 上若直接用 `cmd /C`，这些写法会
+/// **静默失效**：命令报「不是内部命令」→ 退出码非 0 → 被当成 `Continue`，
+/// 用户以为 hook 生效了，其实一次都没跑。装了 Git for Windows / MSYS / WSL 的机器上
+/// 都有 `sh`，优先用它可以让同一份配置跨平台通用；确实没有才退回 `cmd /C`，
+/// 那时必须写 cmd 语法。
+///
+/// 只探测一次，结果缓存。
+pub fn hook_shell() -> &'static (&'static str, &'static str) {
+    static SHELL: std::sync::OnceLock<(&'static str, &'static str)> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| {
+        if cfg!(windows) && which("sh").is_none() {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        }
+    })
+}
+
+/// 在 `PATH` 里找一个可执行文件。只用来在启动时探测 shell，不做通用用途。
+fn which(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// 执行单个 hook，返回决策。
 /// 失败 / 超时 / 非协议退出码 → 记 warn，按 `Continue` 处理（坏 hook 不杀会话）。
 pub async fn run_hook(cfg: &HookConfig, payload: &HookPayload) -> HookOutcome {
@@ -43,7 +83,7 @@ pub async fn run_hook(cfg: &HookConfig, payload: &HookPayload) -> HookOutcome {
     };
 
     // 2. spawn shell 子进程。
-    let (program, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let (program, flag) = *hook_shell();
     let mut child = match tokio::process::Command::new(program)
         .arg(flag)
         .arg(&cfg.command)
@@ -249,7 +289,7 @@ mod tests {
     async fn exit_zero_continues() {
         let cfg = HookConfig {
             event: HookEvent::PreToolUse,
-            command: "true".into(),
+            command: crate::hooks::shell_cmd("true", "exit /b 0"),
             r#match: None,
             timeout_secs: 5,
             enabled: true,
@@ -263,7 +303,7 @@ mod tests {
     async fn exit_two_blocks_for_blockable_event() {
         let cfg = HookConfig {
             event: HookEvent::PreToolUse,
-            command: "echo not allowed; exit 2".into(),
+            command: crate::hooks::shell_cmd("echo not allowed; exit 2", "echo not allowed & exit /b 2"),
             r#match: None,
             timeout_secs: 5,
             enabled: true,
@@ -294,7 +334,10 @@ mod tests {
     async fn rewrite_via_stdout_json() {
         let cfg = HookConfig {
             event: HookEvent::UserPromptSubmit,
-            command: r#"echo '{"prompt":"REWRITTEN"}'"#.into(),
+            command: crate::hooks::shell_cmd(
+                r#"echo '{"prompt":"REWRITTEN"}'"#,
+                r#"echo {"prompt":"REWRITTEN"}"#,
+            ),
             r#match: None,
             timeout_secs: 5,
             enabled: true,

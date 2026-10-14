@@ -117,11 +117,17 @@ mod tests {
         let r = HookRegistry::from_configs(vec![
             make(
                 HookEvent::UserPromptSubmit,
-                r#"echo '{"prompt":"step1"}'"#,
+                &crate::hooks::shell_cmd(
+                    r#"echo '{"prompt":"step1"}'"#,
+                    r#"echo {"prompt":"step1"}"#,
+                ),
             ),
             make(
                 HookEvent::UserPromptSubmit,
-                r#"echo '{"prompt":"step2"}'"#,
+                &crate::hooks::shell_cmd(
+                    r#"echo '{"prompt":"step2"}'"#,
+                    r#"echo {"prompt":"step2"}"#,
+                ),
             ),
         ]);
         let d = r.dispatch(HookEvent::UserPromptSubmit, json!({"prompt":"orig"})).await;
