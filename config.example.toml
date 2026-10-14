@@ -33,10 +33,29 @@ log_requests = false             # 把 LLM 请求 / 响应写到 ~/.carter/debug
 
 # ----- providers -----
 [providers.ws]
-kind = "anthropic"               # anthropic / openai / openai_responses / gemini /
-                                 # openai_compat / ollama / groq / deepseek / xai / openrouter / custom
+# 渠道种类决定走哪种**线协议**。可用的名字：
+#   anthropic / anthropic_v2         → Anthropic Messages
+#   openai / openai_compat / custom  → OpenAI Chat Completions
+#   openai_responses / responses     → OpenAI Responses
+#   gemini / ollama / groq / deepseek / xai / openrouter
+#                                    → OpenAI Chat Completions + 各自的默认端点
+# 名字只是别名，最终都归一到上面三种协议之一。认不出的名字必须自带 base_url，
+# 否则启动时报错而不是猜 —— 猜错会把请求连同 API key 发到没打算用的域名上。
+kind = "anthropic"
 base_url = "https://example/anthropic/v1/"
 api_key = "${API_KEY}"           # 支持 ${ENV} 展开
+
+# 这个渠道要走哪些**服务端工具**（厂商自己执行的，本地没有可跑的东西）。
+# 注意：Chat Completions 没有服务端工具的对应物，在这些渠道上写了也只会在
+# 启动时被报出来并忽略 —— 不会静默生效，也不会假装成一个本地工具。
+#   anthropic 认得：web_search / web_fetch / code_execution
+#   responses 认得：web_search / code_execution / file_search
+server_tools = ["web_search"]
+# 单次响应里最多调用几次（Anthropic 的 max_uses）。
+server_tool_max_uses = 5
+# 逃生舱：厂商给这些工具带版本号（web_search_20250305），内置表必然滞后，
+# 要换新版本或传内置表没覆盖的参数时，在这里原样给一个声明对象。
+# server_tool_specs = [{ type = "web_search_20260101", name = "web_search", max_uses = 9 }]
 
   [providers.ws.models.sonnet]
   meta = "anthropic/claude-sonnet-4-5"
