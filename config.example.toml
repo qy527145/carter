@@ -66,6 +66,10 @@ server_tool_max_uses = 5
 
 # ----- MCP servers -----
 [mcp.servers.fs]
+# enabled = false 可临时停用（配置留着不连），默认 true。
+# 比删掉整段再写回来方便 —— 排障时经常要关掉某个 server，而它的
+# command/args/env 又长又难复原。
+enabled = true
 transport = "stdio"
 command = "npx"
 args = ["-y", "server-filesystem", "/tmp"]
