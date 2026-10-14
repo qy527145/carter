@@ -16,8 +16,9 @@ use futures::stream::FuturesOrdered;
 use crate::config::AgentConfig;
 use crate::hooks::{HookDecision, HookEvent, HookRegistry};
 use crate::provider::{
-    Block, BlockAssembler, ChatRequest, FinishReason, LlmProvider, Role, StreamChunk,
-    ThinkingConfig, ToolCall, ToolResultContent, ToolSpec, Usage, WireMessage, WireRequest,
+    Block, BlockAssembler, ChatRequest, FinishReason, LlmProvider, RequestMeta, RequestPurpose,
+    Role, StreamChunk, ThinkingConfig, ToolCall, ToolResultContent, ToolSpec, Usage, WireMessage,
+    WireRequest,
 };
 use crate::registry::{Capability, ModelInfo, ReasoningEffort};
 use crate::tools::{
@@ -64,6 +65,9 @@ pub struct RunOptions {
     pub compact_model: Option<CompactModel>,
     /// Hook 注册表（pre/post tool use 等事件触发）。默认为空注册表 = 全 Continue。
     pub hooks: std::sync::Arc<HookRegistry>,
+    /// 这次调用是干什么的。抓包面板靠它把主对话、压缩、子 agent 的请求分开 ——
+    /// 混在一起时排障的人分不清「这条报文为什么长这样」。
+    pub purpose: RequestPurpose,
 }
 
 /// 压缩专用模型句柄：owned + Clone 友好，避免给 run_turn 加 `&dyn` 参数。
@@ -101,6 +105,8 @@ pub async fn run_turn(
     let compact_threshold =
         (model.context_window as f64 * agent_cfg.compact_threshold_ratio) as u64;
     let mut needs_compaction = false;
+    // 同一轮里工具回灌后会有多次模型调用，`round` 把它们区分开。
+    let mut round: u32 = 0;
 
     loop {
         // PreTurn hook：观察型。提供本轮的元数据（轮次、消息条数）。
@@ -180,6 +186,14 @@ pub async fn run_turn(
             .default_reasoning
             .as_ref()
             .and_then(thinking_config_for);
+        // 抓包时靠这个把 HTTP 请求对回「哪条对话的哪一轮」。不上 wire。
+        wire.meta = RequestMeta {
+            session_id: thread.session_id.clone(),
+            turn: thread.turns,
+            round,
+            purpose: run_opts.purpose,
+        };
+        round += 1;
 
         let req = ChatRequest {
             protocol: None, // 交给渠道默认协议

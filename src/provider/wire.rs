@@ -51,6 +51,7 @@ impl WireProvider {
         default_protocol: super::ProtocolId,
         server_tools: ServerToolConfig,
         hook: Option<Arc<dyn RequestHook>>,
+        extra_hooks: Vec<Arc<dyn RequestHook>>,
     ) -> Result<Self> {
         // 服务端工具按渠道声明的协议解析。自定义协议没有内置表，只能靠原样下发。
         let (mut specs, mut dropped) = match default_protocol.protocol() {
@@ -77,6 +78,10 @@ impl WireProvider {
 
         let mut builder: LLMClientBuilder = LLMClient::builder(config);
         if let Some(h) = hook {
+            builder = builder.hook(h);
+        }
+        // 宿主（GUI）自己的钩子：抓包、指标之类。
+        for h in extra_hooks {
             builder = builder.hook(h);
         }
         let client = builder.build()?;

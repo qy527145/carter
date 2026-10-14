@@ -22,7 +22,7 @@ use crate::error::Result;
 // 协议与 IR 的词汇直接从底座再导出，避免 carter 各处散落 `llm_adapt_core::` 前缀。
 pub use llm_adapt_core::{
     Block, BlockAssembler, CacheUsage, CacheWriteUsage, FinishReason, ImageSource, Protocol,
-    ProtocolId, Role, StreamChunk, ThinkingConfig, ToolChoice, ToolResultContent, ToolSpec, Usage,
+    ProtocolId, RequestMeta, RequestPurpose, Role, StreamChunk, ThinkingConfig, ToolChoice, ToolResultContent, ToolSpec, Usage,
     WireMessage, WireRequest,
 };
 

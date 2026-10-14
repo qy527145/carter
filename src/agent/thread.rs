@@ -16,6 +16,9 @@ use super::checkpoint::CheckpointStore;
 
 #[derive(Debug, Default)]
 pub struct Thread {
+    /// 所属会话 id。抓包时靠它把「这次请求」对回某条对话。
+    /// None = 没有会话（一次性调用 / 测试）。
+    pub session_id: Option<String>,
     pub messages: Vec<WireMessage>,
     pub turns: u32,
     /// 最新 todo 快照（todo_write 工具整表覆盖）。压缩中保留、每轮复诵到 context 末尾。
@@ -31,6 +34,7 @@ impl Thread {
     #[allow(dead_code)] // 子 agent 改用 new_empty + 手动 push 后此构造未被生产路径使用，但单测仍用。
     pub fn new(user_prompt: impl Into<String>) -> Self {
         Self {
+            session_id: None,
             messages: vec![WireMessage::user_text(user_prompt)],
             turns: 0,
             todos: Vec::new(),
@@ -46,11 +50,13 @@ impl Thread {
 
     /// 从已加载的历史重建（resume/fork 用）。不重复落盘已有消息。
     pub fn from_parts(
+        session_id: String,
         messages: Vec<WireMessage>,
         todos: Vec<TodoItem>,
         recorder: Arc<Recorder>,
     ) -> Self {
         Self {
+            session_id: Some(session_id),
             messages,
             turns: 0,
             todos,
@@ -62,6 +68,11 @@ impl Thread {
     /// 挂上录制器（新会话）。
     pub fn set_recorder(&mut self, recorder: Arc<Recorder>) {
         self.recorder = Some(recorder);
+    }
+
+    /// 标记所属会话（新会话建好 meta 之后调）。
+    pub fn set_session_id(&mut self, id: String) {
+        self.session_id = Some(id);
     }
 
     /// 取录制器句柄（供 main 落标题等会话级记录）。

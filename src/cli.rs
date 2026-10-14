@@ -185,14 +185,14 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
         .model
         .clone()
         .unwrap_or_else(|| config.agent.model.clone());
-    let resolved = crate::provider::resolve_provider(&config, &cache_json, &model_name)?;
+    let resolved = crate::provider::resolve_provider(&config, &cache_json, &model_name, Vec::new())?;
     let (model, provider) = (resolved.model, resolved.provider);
 
     // Fast 模型（压缩 / 标题）：配了 agent.fast_model 则解析，否则回落主模型/主 provider。
     let (fast_model, fast_provider): (crate::registry::ModelInfo, Arc<dyn LlmProvider>) =
         match &config.agent.fast_model {
             Some(reference) => {
-                let r = crate::provider::resolve_provider(&config, &cache_json, reference)?;
+                let r = crate::provider::resolve_provider(&config, &cache_json, reference, Vec::new())?;
                 (r.model, r.provider)
             }
             None => (model.clone(), provider.clone()),
@@ -468,7 +468,8 @@ async fn run_oneshot(
             model: fast_model,
         }),
         hooks: hooks.clone(),
-    };
+                purpose: crate::provider::RequestPurpose::MainTurn,
+};
     let cancel = CancelToken::new();
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
     let tools = crate::agent::build_tools(
@@ -648,7 +649,8 @@ async fn run_tui(
                 model: fast_model.clone(),
             }),
             hooks: agent_hooks.clone(),
-        };
+                    purpose: crate::provider::RequestPurpose::MainTurn,
+};
         let tools = crate::agent::build_tools(
             config.skills.enabled,
             provider.clone(),
@@ -941,7 +943,7 @@ async fn dispatch_builtin(
                 }
                 sink.emit(notice(out));
             } else {
-                match crate::provider::resolve_provider(config, cache_json, args)
+                match crate::provider::resolve_provider(config, cache_json, args, Vec::new())
                     .map(|r| (r.model, r.provider))
                 {
                     Ok((m, p)) => {

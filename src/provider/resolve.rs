@@ -24,6 +24,7 @@ pub fn resolve_provider(
     config: &Config,
     cache_json: &str,
     model_ref: &str,
+    extra_hooks: Vec<Arc<dyn llm_adapt_core::RequestHook>>,
 ) -> Result<ResolvedProvider> {
     let model = crate::registry::resolve_model(config, cache_json, model_ref)?;
     let pcfg = config.provider_for(&model.provider);
@@ -50,7 +51,7 @@ pub fn resolve_provider(
         max_uses: pcfg.server_tool_max_uses,
     };
 
-    let provider = WireProvider::new(client_config, protocol, server_tools, hook)?;
+    let provider = WireProvider::new(client_config, protocol, server_tools, hook, extra_hooks)?;
     let unsupported = provider.unsupported_server_tools().to_vec();
     Ok(ResolvedProvider {
         model,

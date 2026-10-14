@@ -284,7 +284,8 @@ async fn spawn_one(
         system: vec![base_system],
         compact_model: None,
         hooks: Arc::new(crate::hooks::HookRegistry::default()),
-    };
+        purpose: crate::provider::RequestPurpose::Subagent,
+};
     let mut cfg = agent_cfg;
     cfg.max_turns = SUBAGENT_MAX_TURNS;
     // 透传 depth 给子的 subagent_max_depth 检查（深度 +1 已经在外面 child_depth 算好）。

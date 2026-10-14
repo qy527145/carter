@@ -4,8 +4,9 @@
 //! 就是最终要发出去的**字节**。旧底座（genai）只能给出归一化视图，排障时经常对不上
 //! 真实报文 —— 现在记下来的是原名原样的东西。
 //!
-//! 只记请求与（非流式的）响应头/体。**流式响应的逐帧**要等 M5 的捕获层，
-//! 那时会连 SSE 帧与耗时一起落到 SQLite，供对话里的「查看原始报文」用。
+//! 只记请求与（非流式的）响应头/体。**流式响应的逐帧不在这里** ——
+//! 逐块往按天滚的文件里追加只会得到一堆碎片；那部分由客户端的捕获面板负责，
+//! 它按会话分文件、按交换归拢，并带时序。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +66,7 @@ impl RequestHook for LlmLogHook {
             "request",
             seq,
             json!({
+                "correlation": req.correlation,
                 "method": format!("{:?}", req.method),
                 "url": req.url,
                 "headers": redact(&req.headers),
@@ -73,19 +75,26 @@ impl RequestHook for LlmLogHook {
         );
     }
 
-    fn after_raw_response(&self, resp: &RawHttpResponse) {
-        // 用当前序号减一：请求先记，紧接着才是它的响应。
-        let seq = self.seq.load(Ordering::Relaxed).saturating_sub(1);
+    fn after_raw_response(&self, req: &HttpRequest, resp: &RawHttpResponse) {
+        // 配对键是「请求的关联标签 + URL」。钩子会同时服务并发请求，
+        // 靠「上一条请求」这种顺序假设配对，并发一上来就错。
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.append(
             "response",
             seq,
             json!({
+                "correlation": req.correlation,
+                "url": req.url,
                 "status": resp.status,
                 "headers": redact(&resp.headers),
                 "body": parse_body(&resp.body),
             }),
         );
     }
+
+    // 刻意不实现 `on_stream_chunk`：流式响应体逐块来，往这个按天滚的文件里
+    // 逐块追加会把它变成一堆碎片。要看 SSE 逐帧请用客户端的捕获面板 ——
+    // 那里按会话分文件、并按交换归拢。
 }
 
 /// 密钥落盘前脱敏。日志是给人看的，不该顺手把 key 抄一份到磁盘上。

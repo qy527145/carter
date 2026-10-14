@@ -81,7 +81,8 @@ pub async fn run_ndjson(
                 model: fast_model.clone(),
             }),
             hooks: agent_hooks.clone(),
-        };
+                    purpose: crate::provider::RequestPurpose::MainTurn,
+};
 
         let tools = crate::agent::build_tools(
             config.skills.enabled,

@@ -106,6 +106,7 @@ pub fn start_new(
     let recorder = Arc::new(Recorder::deferred(&path, &header));
     let mut thread = Thread::new_empty();
     thread.set_recorder(recorder);
+    thread.set_session_id(meta.id.clone());
     Ok((thread, meta))
 }
 
@@ -169,7 +170,7 @@ fn fold_file(
 pub fn load(entry: &SessionEntry) -> crate::Result<(Thread, SessionMeta)> {
     let (messages, todos, meta, checkpoints) = fold_file(&entry.path)?;
     let recorder = Arc::new(Recorder::open(&entry.path)?);
-    let mut thread = Thread::from_parts(messages, todos, recorder);
+    let mut thread = Thread::from_parts(meta.id.clone(), messages, todos, recorder);
     // 回放 checkpoint：let /rewind 在 resume 后仍可用。
     for (label, snaps) in checkpoints {
         thread.checkpoints.restore_from_record(label, snaps);
@@ -209,7 +210,7 @@ pub fn fork(entry: &SessionEntry) -> crate::Result<(Thread, SessionMeta)> {
     if !todos.is_empty() {
         recorder.record(RecordKind::Todo(todos.clone()));
     }
-    Ok((Thread::from_parts(messages, todos, recorder), meta))
+    Ok((Thread::from_parts(meta.id.clone(), messages, todos, recorder), meta))
 }
 
 /// 列举会话。`all=false` 仅当前 cwd；`all=true` 跨所有项目。按创建时间倒序。
