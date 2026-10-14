@@ -20,7 +20,12 @@ pub struct Thread {
     /// None = 没有会话（一次性调用 / 测试）。
     pub session_id: Option<String>,
     pub messages: Vec<WireMessage>,
+    /// **模型调用轮数**。工具回灌会让一次用户输入发多次请求，每次都算一轮。
+    /// 它是 `max_turns` 那个安全上限的计量单位，不是「用户说了几句话」。
     pub turns: u32,
+    /// **用户轮序号**。一次用户输入 = 一轮，哪怕它内部发了 5 次模型请求。
+    /// 界面上的「第 N 轮」与抓包按轮筛选都用它 —— 用 `turns` 会一筛只出一条。
+    pub user_turns: u32,
     /// 最新 todo 快照（todo_write 工具整表覆盖）。压缩中保留、每轮复诵到 context 末尾。
     pub todos: Vec<TodoItem>,
     /// 会话级写前文件检查点栈（`/rewind` 用）。
@@ -37,6 +42,7 @@ impl Thread {
             session_id: None,
             messages: vec![WireMessage::user_text(user_prompt)],
             turns: 0,
+            user_turns: 0,
             todos: Vec::new(),
             checkpoints: CheckpointStore::default(),
             recorder: None,
@@ -59,6 +65,7 @@ impl Thread {
             session_id: Some(session_id),
             messages,
             turns: 0,
+            user_turns: 0,
             todos,
             checkpoints: CheckpointStore::default(),
             recorder: Some(recorder),

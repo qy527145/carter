@@ -88,6 +88,12 @@ pub struct McpConfig {
 /// `${ENV}` 占位经现有 `interpolate()` 自动展开。
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
+    /// 是否启用。false = 配置留着但不连接。
+    ///
+    /// 比「删掉再写回来」方便得多 —— 排障时常常要临时关掉某个 server，
+    /// 而它的 command/args/env 又长又难复原。
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub transport: String,
     #[serde(default)]
     pub command: Option<String>,
@@ -251,6 +257,10 @@ impl Config {
             server_tool_max_uses: None,
         }
     }
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 impl Default for Config {

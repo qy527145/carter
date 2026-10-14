@@ -33,6 +33,10 @@ impl McpManager {
 
         for name in names {
             let server_cfg = &cfg.servers[name];
+            if !server_cfg.enabled {
+                tracing::info!(server = %name, "mcp server disabled; skipping");
+                continue;
+            }
             match tokio::time::timeout(PER_SERVER_TIMEOUT, transport::connect(server_cfg)).await {
                 Ok(Ok(service)) => match Self::collect_tools(&service, name).await {
                     Ok(server_tools) => {

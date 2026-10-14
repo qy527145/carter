@@ -107,6 +107,10 @@ pub async fn run_turn(
     let mut needs_compaction = false;
     // 同一轮里工具回灌后会有多次模型调用，`round` 把它们区分开。
     let mut round: u32 = 0;
+    // 本次用户输入的轮序号。run_turn 一次 = 一轮用户输入，
+    // 与内部发了几次模型请求无关 —— 抓包按轮筛选、界面标「第 N 轮」都用它。
+    let user_turn = thread.user_turns;
+    thread.user_turns = thread.user_turns.saturating_add(1);
 
     loop {
         // PreTurn hook：观察型。提供本轮的元数据（轮次、消息条数）。
@@ -189,7 +193,7 @@ pub async fn run_turn(
         // 抓包时靠这个把 HTTP 请求对回「哪条对话的哪一轮」。不上 wire。
         wire.meta = RequestMeta {
             session_id: thread.session_id.clone(),
-            turn: thread.turns,
+            turn: user_turn,
             round,
             purpose: run_opts.purpose,
         };
