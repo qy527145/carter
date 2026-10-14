@@ -9,6 +9,17 @@ use crate::error::{CarterError, Result};
 
 use super::{Block, ChatRequest, EventStream, LlmProvider, WireRequest};
 
+/// 一个渠道声明的服务端工具。
+#[derive(Debug, Default, Clone)]
+pub struct ServerToolConfig {
+    /// 走内置表的名字（`web_search` 等）。
+    pub names: Vec<String>,
+    /// 原样下发的声明对象。
+    pub raw_specs: Vec<serde_json::Value>,
+    /// 单次响应内的调用次数上限。
+    pub max_uses: Option<u32>,
+}
+
 /// 用 llm_adapt 的客户端实现 [`LlmProvider`]。
 ///
 /// 它只做三件事：收下请求、转给底座、把错误类型换掉。协议、重试、代理、
@@ -18,6 +29,11 @@ pub struct WireProvider {
     client: LLMClient,
     /// 默认协议：请求没显式指定时用它。carter 的渠道配置决定。
     default_protocol: super::ProtocolId,
+    /// 该渠道声明的服务端工具（厂商自己执行的，如 web_search）。
+    server_tools: Vec<super::ToolSpec>,
+    /// 声明不出去的名字：该协议没有对应物、或压根不认识。
+    /// 启动时会报给用户，不含糊过去。
+    unsupported_server_tools: Vec<String>,
 }
 
 impl std::fmt::Debug for WireProvider {
@@ -33,8 +49,32 @@ impl WireProvider {
     pub fn new(
         config: ClientConfig,
         default_protocol: super::ProtocolId,
+        server_tools: ServerToolConfig,
         hook: Option<Arc<dyn RequestHook>>,
     ) -> Result<Self> {
+        // 服务端工具按渠道声明的协议解析。自定义协议没有内置表，只能靠原样下发。
+        let (mut specs, mut dropped) = match default_protocol.protocol() {
+            Some(proto) => llm_adapt_core::resolve_specs(
+                proto,
+                &server_tools.names,
+                server_tools.max_uses,
+            ),
+            None => (Vec::new(), server_tools.names.clone()),
+        };
+        for raw in &server_tools.raw_specs {
+            match llm_adapt_core::spec_from_raw(raw) {
+                Some(spec) => specs.push(spec),
+                None => dropped.push("(缺少 type 字段的 server_tool_specs 条目)".to_string()),
+            }
+        }
+        if !dropped.is_empty() {
+            tracing::warn!(
+                protocol = %default_protocol,
+                dropped = ?dropped,
+                "这些服务端工具声明不出去：该协议没有对应物或名字不认识"
+            );
+        }
+
         let mut builder: LLMClientBuilder = LLMClient::builder(config);
         if let Some(h) = hook {
             builder = builder.hook(h);
@@ -43,11 +83,18 @@ impl WireProvider {
         Ok(Self {
             client,
             default_protocol,
+            server_tools: specs,
+            unsupported_server_tools: dropped,
         })
     }
 
     pub fn protocol(&self) -> &super::ProtocolId {
         &self.default_protocol
+    }
+
+    /// 声明不出去的服务端工具名字。空 = 全部生效。
+    pub fn unsupported_server_tools(&self) -> &[String] {
+        &self.unsupported_server_tools
     }
 }
 
@@ -60,6 +107,12 @@ impl LlmProvider for WireProvider {
             .unwrap_or_else(|| self.default_protocol.clone());
         let mut wire = req.wire;
         expand_image_refs(&mut wire);
+        // 服务端工具是**渠道能力**，不是本地工具表的一部分 ——
+        // 由这里并进去，而不是让 ToolRegistry 产出它们（那会让执行层看见一堆
+        // 本地根本没有实现的名字）。
+        if !self.server_tools.is_empty() {
+            wire.tools.extend(self.server_tools.iter().cloned());
+        }
         let stream = self.client.chat_stream_ir(&protocol, &wire).await?;
         // 错误在流的边界上就地转成 carter 的类型，上层不必认识底座。
         Ok(Box::pin(stream.map(|item| item.map_err(CarterError::from))))

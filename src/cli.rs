@@ -185,12 +185,16 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
         .model
         .clone()
         .unwrap_or_else(|| config.agent.model.clone());
-    let (model, provider) = crate::provider::resolve_provider(&config, &cache_json, &model_name)?;
+    let resolved = crate::provider::resolve_provider(&config, &cache_json, &model_name)?;
+    let (model, provider) = (resolved.model, resolved.provider);
 
     // Fast 模型（压缩 / 标题）：配了 agent.fast_model 则解析，否则回落主模型/主 provider。
     let (fast_model, fast_provider): (crate::registry::ModelInfo, Arc<dyn LlmProvider>) =
         match &config.agent.fast_model {
-            Some(reference) => crate::provider::resolve_provider(&config, &cache_json, reference)?,
+            Some(reference) => {
+                let r = crate::provider::resolve_provider(&config, &cache_json, reference)?;
+                (r.model, r.provider)
+            }
             None => (model.clone(), provider.clone()),
         };
 
@@ -937,7 +941,9 @@ async fn dispatch_builtin(
                 }
                 sink.emit(notice(out));
             } else {
-                match crate::provider::resolve_provider(config, cache_json, args) {
+                match crate::provider::resolve_provider(config, cache_json, args)
+                    .map(|r| (r.model, r.provider))
+                {
                     Ok((m, p)) => {
                         let key = m.key.clone();
                         *model = m;

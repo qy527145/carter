@@ -124,6 +124,23 @@ pub struct ProviderConfig {
     /// provider 内部的模型定义：块名即模型名（`provider/model` 引用）。
     #[serde(default)]
     pub models: HashMap<String, ModelEntry>,
+
+    /// 要声明的**服务端工具**（厂商自己执行的，如 `web_search`）。
+    ///
+    /// 它由厂商执行，本地没有可跑的东西。认不出的名字、或该协议没有对应物的
+    /// （Chat Completions 全都没有），会在启动时被报出来而不是静默丢弃 ——
+    /// 否则用户以为开了联网搜索，模型其实一个结果都拿不到。
+    #[serde(default)]
+    pub server_tools: Vec<String>,
+    /// 原样下发的服务端工具声明。
+    ///
+    /// 逃生舱：厂商给这些工具带版本号（`web_search_20250305`），内置表必然滞后，
+    /// 或者你要用的参数超出内置表覆盖范围时，在这里直接给一个对象。
+    #[serde(default)]
+    pub server_tool_specs: Vec<serde_json::Value>,
+    /// 服务端工具在单次响应里的调用次数上限（Anthropic 的 `max_uses`）。
+    #[serde(default)]
+    pub server_tool_max_uses: Option<u32>,
 }
 
 /// 渠道种类 → (线协议, 默认端点, 覆盖路径)。
@@ -229,6 +246,9 @@ impl Config {
             api_key: std::env::var(&env_key).ok(),
             base_url: None,
             models: HashMap::new(),
+            server_tools: Vec::new(),
+            server_tool_specs: Vec::new(),
+            server_tool_max_uses: None,
         }
     }
 }

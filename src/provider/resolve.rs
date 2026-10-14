@@ -7,16 +7,24 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::provider::wire::WireProvider;
+use crate::provider::wire::{ServerToolConfig, WireProvider};
 use crate::provider::LlmProvider;
 
-/// 解析模型引用 → (ModelInfo, provider)。按 model.provider 查 `[providers.*]`，
+/// 解析结果。带上「哪些服务端工具没能声明出去」，供界面提示 ——
+/// 静默丢弃会让用户以为开了联网搜索而实际没有。
+pub struct ResolvedProvider {
+    pub model: crate::registry::ModelInfo,
+    pub provider: Arc<dyn LlmProvider>,
+    pub unsupported_server_tools: Vec<String>,
+}
+
+/// 解析模型引用 → 模型元数据 + provider。按 model.provider 查 `[providers.*]`，
 /// 没配的按 provider 名合成一份（key 从环境变量取）。startup 与会话内 `/model` 共用。
 pub fn resolve_provider(
     config: &Config,
     cache_json: &str,
     model_ref: &str,
-) -> Result<(crate::registry::ModelInfo, Arc<dyn LlmProvider>)> {
+) -> Result<ResolvedProvider> {
     let model = crate::registry::resolve_model(config, cache_json, model_ref)?;
     let pcfg = config.provider_for(&model.provider);
     let protocol = pcfg.protocol();
@@ -36,7 +44,17 @@ pub fn resolve_provider(
             as Arc<dyn llm_adapt_core::RequestHook>
     });
 
-    let provider: Arc<dyn LlmProvider> =
-        Arc::new(WireProvider::new(client_config, protocol, hook)?);
-    Ok((model, provider))
+    let server_tools = ServerToolConfig {
+        names: pcfg.server_tools.clone(),
+        raw_specs: pcfg.server_tool_specs.clone(),
+        max_uses: pcfg.server_tool_max_uses,
+    };
+
+    let provider = WireProvider::new(client_config, protocol, server_tools, hook)?;
+    let unsupported = provider.unsupported_server_tools().to_vec();
+    Ok(ResolvedProvider {
+        model,
+        provider: Arc::new(provider),
+        unsupported_server_tools: unsupported,
+    })
 }
