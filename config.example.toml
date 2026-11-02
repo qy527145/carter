@@ -56,6 +56,10 @@ server_tool_max_uses = 5
 # 逃生舱：厂商给这些工具带版本号（web_search_20250305），内置表必然滞后，
 # 要换新版本或传内置表没覆盖的参数时，在这里原样给一个声明对象。
 # server_tool_specs = [{ type = "web_search_20260101", name = "web_search", max_uses = 9 }]
+# 超时（秒，可省）。stream_timeout_secs 是读空闲超时：连续这么久一个字节都没
+# 收到才断，回答在持续输出时不会被掐；request_timeout_secs 只管非流式请求的总时长。
+# stream_timeout_secs = 300
+# request_timeout_secs = 600
 
   [providers.ws.models.sonnet]
   meta = "anthropic/claude-sonnet-4-5"

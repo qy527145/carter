@@ -147,6 +147,17 @@ pub struct ProviderConfig {
     /// 服务端工具在单次响应里的调用次数上限（Anthropic 的 `max_uses`）。
     #[serde(default)]
     pub server_tool_max_uses: Option<u32>,
+
+    /// 读空闲超时（秒）：连续这么久没收到任何字节才算超时，流式回答每来一块
+    /// 数据就重新计时。省略 = 底座默认值（300）。
+    ///
+    /// 不提供「流式总时长」这种开关是刻意的：长回答跑几分钟是常态，按总时长
+    /// 掐断只会随机砍掉正在输出的回答。
+    #[serde(default)]
+    pub stream_timeout_secs: Option<u64>,
+    /// 非流式请求（标题生成等）的总超时（秒）。省略 = 底座默认值（600）。
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 /// 渠道种类 → (线协议, 默认端点, 覆盖路径)。
@@ -224,12 +235,19 @@ impl ProviderConfig {
                     self.kind
                 ))
             })?;
-        Ok(ClientConfig {
+        let mut cfg = ClientConfig {
             base_url,
             path: preset_path.map(str::to_string),
             api_key: self.api_key.clone().unwrap_or_default(),
             ..Default::default()
-        })
+        };
+        if let Some(secs) = self.stream_timeout_secs {
+            cfg.stream_timeout = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = self.request_timeout_secs {
+            cfg.request_timeout = std::time::Duration::from_secs(secs);
+        }
+        Ok(cfg)
     }
 }
 
@@ -255,6 +273,8 @@ impl Config {
             server_tools: Vec::new(),
             server_tool_specs: Vec::new(),
             server_tool_max_uses: None,
+            stream_timeout_secs: None,
+            request_timeout_secs: None,
         }
     }
 }
