@@ -752,7 +752,13 @@ async fn run_tui(
                     needs_title = false;
                     // fast 模型短输出；失败静默忽略（错误即数据，不阻断会话）。
                     if let Ok(title) =
-                        crate::agent::generate_title(&prompt, &*fast_provider, &fast_model).await
+                        crate::agent::generate_title(
+                            &prompt,
+                            thread.session_id.as_deref(),
+                            &*fast_provider,
+                            &fast_model,
+                        )
+                        .await
                     {
                         if !title.is_empty() {
                             if let Some(rec) = thread.recorder() {

@@ -174,6 +174,9 @@ impl Tool for TaskTool {
 
         // 跑所有子 agent —— 串行 or 并发。
         // 因 TaskTool 持 `&self`，每次派生都重建 thread/tools/cancel，无共享可变状态，可安全并发。
+        // 子 agent 的请求挂在父会话下（各自再带一个 agent id 单独成线）。
+        // 必须在 spawn 之前取：任务局部变量不会跟进新任务。
+        let session_id = crate::agent::current_session_id();
         let mut handles = Vec::with_capacity(prompts.len());
         for (i, prompt) in prompts.iter().enumerate() {
             let prompt = prompt.clone();
@@ -185,9 +188,11 @@ impl Tool for TaskTool {
             let agent_cfg = self.agent_cfg.clone();
             let whitelist = whitelist.clone();
             let child_depth = self.depth + 1;
+            let session_id = session_id.clone();
             handles.push(tokio::spawn(async move {
                 let res = spawn_one(
                     prompt,
+                    session_id,
                     Vec::new(),
                     provider,
                     model,
@@ -249,6 +254,7 @@ impl Tool for TaskTool {
 #[allow(clippy::too_many_arguments)]
 async fn spawn_one(
     prompt: String,
+    session_id: Option<String>,
     initial_messages: Vec<WireMessage>,
     provider: Arc<dyn LlmProvider>,
     model: ModelInfo,
@@ -294,6 +300,9 @@ async fn spawn_one(
     // thread：起点 = initial_messages（fork 的父历史）+ 本次 prompt。
     // 子 agent 不挂 recorder（不持久化中间过程；最终输出会 ToolResult 进父 thread 落盘）。
     let mut thread = Thread::new_empty();
+    thread.session_id = session_id;
+    // 每个子 agent 一个新 id：并行派出的几个 system 提示完全一样，只能靠它区分。
+    thread.set_agent_id(uuid::Uuid::new_v4().to_string());
     for m in initial_messages {
         thread.messages.push(m);
     }
@@ -423,6 +432,56 @@ mod tests {
             },
             default_reasoning: Some(ReasoningEffort::Medium),
         }
+    }
+
+    /// 记下每次请求的归属信息，回一段固定文本。
+    #[derive(Default)]
+    struct MetaRecorder(std::sync::Mutex<Vec<crate::provider::RequestMeta>>);
+    #[async_trait::async_trait]
+    impl LlmProvider for MetaRecorder {
+        async fn stream(&self, req: ChatRequest) -> crate::Result<EventStream> {
+            self.0.lock().unwrap().push(req.wire.meta);
+            FixedProvider("ok".into()).stream(req_placeholder()).await
+        }
+    }
+
+    fn req_placeholder() -> ChatRequest {
+        ChatRequest {
+            protocol: None,
+            wire: crate::provider::WireRequest::new("m"),
+        }
+    }
+
+    /// 并行派出的子 agent：都挂在父会话下，各自的 agent id 不同。
+    #[tokio::test]
+    async fn parallel_subagents_share_session_but_not_agent_id() {
+        let rec = Arc::new(MetaRecorder::default());
+        let factory: ToolFactory = Arc::new(|| Vec::new());
+        let task = TaskTool::new(
+            rec.clone(),
+            fake_model(),
+            AgentConfig::default(),
+            "system".to_string(),
+            CancelToken::new(),
+            factory,
+            0,
+        );
+        let res = super::super::turn::SESSION_ID
+            .scope(
+                Some("parent".to_string()),
+                task.execute(serde_json::json!({ "prompts": ["a", "b"] })),
+            )
+            .await;
+        assert!(res.ok, "{}", res.content);
+
+        let metas = rec.0.lock().unwrap().clone();
+        assert_eq!(metas.len(), 2);
+        for m in &metas {
+            assert_eq!(m.session_id.as_deref(), Some("parent"));
+            assert_eq!(m.purpose, crate::provider::RequestPurpose::Subagent);
+            assert!(m.agent_id.is_some());
+        }
+        assert_ne!(metas[0].agent_id, metas[1].agent_id);
     }
 
     #[tokio::test]

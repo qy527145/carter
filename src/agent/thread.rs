@@ -19,6 +19,9 @@ pub struct Thread {
     /// 所属会话 id。抓包时靠它把「这次请求」对回某条对话。
     /// None = 没有会话（一次性调用 / 测试）。
     pub session_id: Option<String>,
+    /// 子 agent 的 id（同一个子 agent 的每次调用相同，并行派出的各不相同）。
+    /// 主对话为 None。会作为请求头发出去，让网关把子 agent 单独归成一条线。
+    pub agent_id: Option<String>,
     pub messages: Vec<WireMessage>,
     /// **模型调用轮数**。工具回灌会让一次用户输入发多次请求，每次都算一轮。
     /// 它是 `max_turns` 那个安全上限的计量单位，不是「用户说了几句话」。
@@ -40,6 +43,7 @@ impl Thread {
     pub fn new(user_prompt: impl Into<String>) -> Self {
         Self {
             session_id: None,
+            agent_id: None,
             messages: vec![WireMessage::user_text(user_prompt)],
             turns: 0,
             user_turns: 0,
@@ -63,6 +67,7 @@ impl Thread {
     ) -> Self {
         Self {
             session_id: Some(session_id),
+            agent_id: None,
             messages,
             turns: 0,
             user_turns: 0,
@@ -80,6 +85,11 @@ impl Thread {
     /// 标记所属会话（新会话建好 meta 之后调）。
     pub fn set_session_id(&mut self, id: String) {
         self.session_id = Some(id);
+    }
+
+    /// 标记为某个子 agent 的线程（派生子 agent 时调）。
+    pub fn set_agent_id(&mut self, id: String) {
+        self.agent_id = Some(id);
     }
 
     /// 取录制器句柄（供 main 落标题等会话级记录）。

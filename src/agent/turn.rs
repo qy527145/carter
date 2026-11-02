@@ -55,6 +55,20 @@ pub enum TurnOutcome {
     Error(String),
 }
 
+tokio::task_local! {
+    /// 正在执行工具的那一轮所属的会话 id。
+    pub(crate) static SESSION_ID: Option<String>;
+}
+
+/// 工具执行时取所属会话的 id。派生子 agent 的工具靠它让子 agent 的请求挂在父会话下。
+///
+/// 走任务局部变量而不是在构造工具时传进去：工具在启动期就建好了，而会话会在之后
+/// 换掉（`/new`、`/resume`）—— 构造时记下的 id 会一直指着旧会话。
+/// 不在 [`run_turn`] 的工具执行里调用时为 None。
+pub fn current_session_id() -> Option<String> {
+    SESSION_ID.try_with(|s| s.clone()).ok().flatten()
+}
+
 /// 控制流式输出的渲染选项。
 pub struct RunOptions {
     pub show_thinking: bool,
@@ -193,6 +207,7 @@ pub async fn run_turn(
         // 抓包时靠这个把 HTTP 请求对回「哪条对话的哪一轮」。不上 wire。
         wire.meta = RequestMeta {
             session_id: thread.session_id.clone(),
+            agent_id: thread.agent_id.clone(),
             turn: user_turn,
             round,
             purpose: run_opts.purpose,
@@ -313,7 +328,13 @@ pub async fn run_turn(
         // 工具批量执行：连续的"并发安全"工具一起跑；遇到 unsafe 工具切断、串行跑。
         // 顺序保持：派发顺序与回灌顺序与 model 给的 pending_calls 完全一致。
         // hook 在每个工具前后触发（PreToolUse 可改写 args / 阻断；PostToolUse 仅观测）。
-        let results = execute_tool_calls(&pending_calls, tools, thread, ui, &run_opts.hooks).await;
+        let session_id = thread.session_id.clone();
+        let results = SESSION_ID
+            .scope(
+                session_id,
+                execute_tool_calls(&pending_calls, tools, thread, ui, &run_opts.hooks),
+            )
+            .await;
 
         // 写盘 + 特判 todo_write（成功则把 todo 写入 Thread.todos）。
         for (tc, result) in pending_calls.iter().zip(results.iter()) {

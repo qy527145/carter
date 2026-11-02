@@ -4,7 +4,8 @@
 use futures::StreamExt;
 
 use crate::provider::{
-    Block, ChatRequest, LlmProvider, Role, StreamChunk, ToolResultContent, WireMessage, WireRequest,
+    Block, ChatRequest, LlmProvider, RequestMeta, RequestPurpose, Role, StreamChunk,
+    ToolResultContent, WireMessage, WireRequest,
 };
 use crate::registry::ModelInfo;
 
@@ -67,6 +68,14 @@ pub async fn compact(
     }
 
     // L2：切分 head / middle / recent，对 middle 摘要。
+    // 摘要请求归到这条会话（子 agent 的则归到它那条线）下，挂在最近一轮上。
+    let meta = RequestMeta {
+        session_id: thread.session_id.clone(),
+        agent_id: thread.agent_id.clone(),
+        turn: thread.user_turns.saturating_sub(1),
+        round: 0,
+        purpose: RequestPurpose::Compaction,
+    };
     let Some((head, middle, recent)) = split_for_summary(&thread.messages, L2_KEEP_RECENT) else {
         // 历史太短无法切分（仅 head + recent），L1 已尽力。
         return Ok(());
@@ -77,13 +86,13 @@ pub async fn compact(
 
     // L3 优先（结构化高保真）；仅当 L3 返回空/解析失败才回落 L2（传输错误大概率 L2 也失败，
     // 不浪费一次调用）；两者都拿不到 → 保留 L1 结果，不中断主循环。
-    let tiered = match summarize_structured(&middle, provider, model).await {
+    let tiered = match summarize_structured(&middle, provider, model, &meta).await {
         Ok(s) => Some(("L3", s)),
         Err(e3) => {
             ui.emit(UiEvent::Notice(format!(
                 "[compact] L3 structured summary failed ({e3}); trying L2"
             )));
-            match summarize(&middle, provider, model).await {
+            match summarize(&middle, provider, model, &meta).await {
                 Ok(s) => Some(("L2", s)),
                 Err(e2) => {
                     ui.emit(UiEvent::Notice(format!(
@@ -216,12 +225,13 @@ async fn summarize(
     middle: &[WireMessage],
     provider: &dyn LlmProvider,
     model: &ModelInfo,
+    meta: &RequestMeta,
 ) -> crate::Result<String> {
     let rendered = render_messages(middle);
     let system = "你是上下文压缩器。把以下 agent 执行历史压成简洁要点，\
                   务必保留：已做的关键决策、尝试过的方案、重要发现/文件路径、未决问题与下一步。\
                   丢弃冗长的原始工具输出。用紧凑的中文列点。";
-    run_summary(&rendered, system, SUMMARY_MAX_TOKENS, provider, model).await
+    run_summary(&rendered, system, SUMMARY_MAX_TOKENS, provider, model, meta).await
 }
 
 /// L3 结构化高保真摘要的 system 提示。固定分节，便于模型与人都能稳定解析。
@@ -237,6 +247,7 @@ async fn summarize_structured(
     middle: &[WireMessage],
     provider: &dyn LlmProvider,
     model: &ModelInfo,
+    meta: &RequestMeta,
 ) -> crate::Result<String> {
     let rendered = render_messages(middle);
     run_summary(
@@ -245,17 +256,20 @@ async fn summarize_structured(
         L3_SUMMARY_MAX_TOKENS,
         provider,
         model,
+        meta,
     )
     .await
 }
 
 /// 摘要请求公共流程：发一次 system+rendered，收集 TextDelta，空输出视为失败。
+/// `meta` 决定这次请求归到哪条会话 —— 它会变成请求头，网关按它归类。
 async fn run_summary(
     rendered: &str,
     system: &str,
     max_tokens: u32,
     provider: &dyn LlmProvider,
     model: &ModelInfo,
+    meta: &RequestMeta,
 ) -> crate::Result<String> {
     let mut wire = WireRequest::new(model.api_name.clone());
     wire.system = vec![Block::text(system)];
@@ -263,6 +277,7 @@ async fn run_summary(
         "【待压缩历史】\n{rendered}"
     ))];
     wire.max_tokens = Some(max_tokens);
+    wire.meta = meta.clone();
     let req = ChatRequest {
         protocol: None,
         wire,
@@ -285,14 +300,23 @@ async fn run_summary(
 
 /// 为会话生成简短标题：用首条 user prompt 调一次（fast）模型，取首行去引号。
 /// 整个会话只调一次（由调用方保证）。失败由调用方静默忽略。
+///
+/// `session_id` 是这个标题所属的会话：起标题的请求也算这条对话的一部分，
+/// 网关要靠它把请求归进来。
 pub async fn generate_title(
     first_prompt: &str,
+    session_id: Option<&str>,
     provider: &dyn LlmProvider,
     model: &ModelInfo,
 ) -> crate::Result<String> {
     let system = "为下面这条用户消息开启的对话生成一个简洁的 3-6 词中文标题。\
                   只输出标题本身，不要引号、不要标点结尾、不要解释。";
-    let out = run_summary(first_prompt, system, 32, provider, model).await?;
+    let meta = RequestMeta {
+        session_id: session_id.map(str::to_string),
+        purpose: RequestPurpose::Title,
+        ..Default::default()
+    };
+    let out = run_summary(first_prompt, system, 32, provider, model, &meta).await?;
     let title = out
         .lines()
         .next()
@@ -545,7 +569,7 @@ mod tests {
         };
         let model = fake_model();
         let middle = vec![WireMessage::user_text("hi"), assistant_ir("ok")];
-        let out = summarize_structured(&middle, &provider, &model)
+        let out = summarize_structured(&middle, &provider, &model, &RequestMeta::default())
             .await
             .unwrap();
         assert!(out.contains("做了 X"));
@@ -559,7 +583,7 @@ mod tests {
         let model = fake_model();
         let middle = vec![WireMessage::user_text("hi")];
         assert!(
-            summarize_structured(&middle, &provider, &model)
+            summarize_structured(&middle, &provider, &model, &RequestMeta::default())
                 .await
                 .is_err()
         );
@@ -571,7 +595,7 @@ mod tests {
             text: "\"修复字间隔\"\n多余的第二行".to_string(),
         };
         let model = fake_model();
-        let title = generate_title("帮我修复对话历史字间隔过宽", &provider, &model)
+        let title = generate_title("帮我修复对话历史字间隔过宽", None, &provider, &model)
             .await
             .unwrap();
         assert_eq!(title, "修复字间隔");
