@@ -120,7 +120,9 @@ pub struct ModelEntry {
     pub default_reasoning: Option<ReasoningEffort>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// 派生 `Default` 是给下游用的：宿主手搓一个 `ProviderConfig` 时写
+/// `..Default::default()`，以后这里加字段就不会把它们编译炸掉。
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderConfig {
     pub kind: String,
     #[serde(default)]
