@@ -1,6 +1,6 @@
 [package]
 name = "carter"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Carter — a Rust agent CLI with an interactive TUI, multi-provider LLM support, skills, and MCP integration."
 license = "Apache-2.0"
@@ -32,7 +32,7 @@ eula = false
 # 只走 crates.io，不挂 path：CI 与发布机上没有隔壁 ../llm_adapt 目录，
 # 而 cargo 在 path 不存在时不会回退到 registry —— 直接报错。
 # 本地要连隔壁源码调试，用 ~/.cargo/config.toml 的 [patch.crates-io]（不进仓库）。
-llm_adapt_core = "0.1.0"
+llm_adapt_core = "0.1.2"
 # models.dev 元数据爬取（仅 registry/fetch.rs 使用）。rustls 避免 openssl 系统依赖。
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # scrolling-regions 已关闭：该特性用 DECSTBM 区域滚动（CSI r + CSI S）实现 insert_before，
