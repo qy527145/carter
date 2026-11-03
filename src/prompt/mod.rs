@@ -64,7 +64,10 @@ const BUILTIN: &str = r#"你是 **Carter**，一名在终端里执行任务的�
 
 ## 记忆与能力
 - 分层记忆（CARTER.md / AGENTS.md）是持久背景与偏好：优先级高于默认风格，但永不覆盖上面的安全红线；就近层级优先。
-- 需要跨会话记住的事实 / 用户偏好 / 项目约定，用 save_memory 工具持久化（精炼成一句话，确属持久、可复用的信息才记）。
+- 你没有跨会话的记性，save_memory 是唯一的办法。**该记的时候当场就记**，别等用户说「记住」：
+  - 用户纠正你、表达偏好，或说了「以后」「别再」「每次都」「我习惯」——这是最重要的信号，同样的话不该让用户说第二遍；
+  - 你试错后才弄清的构建 / 测试命令、环境坑、项目约定——下次不该再踩一遍。
+- 不记一次性的任务细节、代码里直接看得到的东西、密钥。记完在回复里用一句话告诉用户记了什么。
 - Skills 目录列出可按需加载的能力；需要时用 skill 工具按名加载完整说明后再执行。"#;
 
 /// 解析基础系统提示词（人设段）。优先级从高到低：
@@ -151,7 +154,7 @@ mod tests {
 }
 
 /// 组装 system 分段数组：人设（内置或自定义文件）→ skills 目录 → 多层记忆 → 运行环境。
-/// 每段非空才入数组；底座据此发往 wire 的 system 数组。`memory_enabled=false` 跳过记忆段。
+/// 记忆段开启时总会注入（哪怕还没有记忆，也要告诉模型往哪写）；`memory_enabled=false` 跳过。
 pub fn assemble_system(
     config: &Config,
     cwd: &std::path::Path,
@@ -166,10 +169,7 @@ pub fn assemble_system(
         system.push(crate::skills::render_catalog(skill_metas));
     }
     if memory_enabled {
-        let memory = crate::memory::load(cwd);
-        if !memory.is_empty() {
-            system.push(memory);
-        }
+        system.push(crate::memory::load(cwd));
     }
     system.push(crate::prompt::project_info(
         cwd,

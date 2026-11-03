@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::provider::ToolSpec;
 
+pub use save_memory::SaveMemory;
 pub use todo_write::{TodoItem, TodoStatus, parse_todos};
 
 /// 结构化工具输出（docs §4.4 简化版：去掉权限元数据）。
@@ -87,7 +88,7 @@ impl ToolRegistry {
                 Arc::new(glob_tool::Glob),
                 Arc::new(grep::Grep),
                 Arc::new(todo_write::TodoWrite),
-                Arc::new(save_memory::SaveMemory),
+                Arc::new(save_memory::SaveMemory::in_process_cwd()),
             ],
         }
     }

@@ -36,7 +36,7 @@ pub fn global_memory_path() -> PathBuf {
     carter_home().join("CARTER.md")
 }
 
-/// `<root>/facts.md`（全局事实记忆；save_memory kind=facts scope=global 写入）。
+/// `<root>/facts.md`（全局事实记忆；save_memory kind=facts scope=user 写入）。
 pub fn global_facts_path() -> PathBuf {
     carter_home().join("facts.md")
 }
@@ -44,11 +44,6 @@ pub fn global_facts_path() -> PathBuf {
 /// `<root>/profile.md`（全局用户画像；save_memory kind=profile 写入）。
 pub fn global_profile_path() -> PathBuf {
     carter_home().join("profile.md")
-}
-
-/// `<root>/skills/<slug>.md`（save_memory kind=skill 写入；与 skills_dir 共目录复用）。
-pub fn skill_memory_path(slug: &str) -> PathBuf {
-    skills_dir().join(format!("{slug}.md"))
 }
 
 /// `<root>/memory_revisions/`（记忆文件每次修改前的快照备份目录）。

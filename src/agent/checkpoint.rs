@@ -152,17 +152,23 @@ pub fn mutating_paths(name: &str, args: &serde_json::Value) -> Vec<PathBuf> {
             .and_then(|v| v.as_str())
             .map(|p| vec![PathBuf::from(p)])
             .unwrap_or_default(),
-        // save_memory 追加写 CARTER.md：按 scope 推断路径，纳入 /rewind。
+        // save_memory 追加写记忆文件：按 kind/scope 推断路径，纳入 /rewind。
+        // 命令行下项目级记忆跟随进程 cwd（与 SaveMemory::in_process_cwd 一致）。
         "save_memory" => {
-            let path = match args
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("project")
-            {
-                "global" => crate::config::paths::global_memory_path(),
-                _ => PathBuf::from("CARTER.md"),
+            let get = |k: &str, d: &'static str| {
+                args.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(d)
+                    .to_string()
             };
-            vec![path]
+            let (Ok(kind), Ok(scope)) = (
+                crate::memory::Kind::parse(&get("kind", "facts")),
+                crate::memory::Scope::parse(&get("scope", "project")),
+            ) else {
+                return Vec::new();
+            };
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            vec![crate::memory::target_path(kind, scope, &cwd)]
         }
         _ => Vec::new(),
     }
