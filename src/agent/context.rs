@@ -231,7 +231,15 @@ async fn summarize(
     let system = "你是上下文压缩器。把以下 agent 执行历史压成简洁要点，\
                   务必保留：已做的关键决策、尝试过的方案、重要发现/文件路径、未决问题与下一步。\
                   丢弃冗长的原始工具输出。用紧凑的中文列点。";
-    run_summary(&rendered, system, SUMMARY_MAX_TOKENS, provider, model, meta).await
+    run_prompt(
+        &compact_input(&rendered),
+        system,
+        SUMMARY_MAX_TOKENS,
+        provider,
+        model,
+        meta,
+    )
+    .await
 }
 
 /// L3 结构化高保真摘要的 system 提示。固定分节，便于模型与人都能稳定解析。
@@ -250,8 +258,8 @@ async fn summarize_structured(
     meta: &RequestMeta,
 ) -> crate::Result<String> {
     let rendered = render_messages(middle);
-    run_summary(
-        &rendered,
+    run_prompt(
+        &compact_input(&rendered),
         structured_summary_system(),
         L3_SUMMARY_MAX_TOKENS,
         provider,
@@ -261,10 +269,25 @@ async fn summarize_structured(
     .await
 }
 
-/// 摘要请求公共流程：发一次 system+rendered，收集 TextDelta，空输出视为失败。
-/// `meta` 决定这次请求归到哪条会话 —— 它会变成请求头，网关按它归类。
-async fn run_summary(
-    rendered: &str,
+/// 压缩历史在用户消息里的抬头。
+///
+/// **只给压缩 / 摘要用。** 生成标题也走同一条单次请求的路，但那句用户消息是用户
+/// 自己说的第一句话，不是「一段待压缩的历史」—— 给它加这个抬头，模型会一边被告知
+/// 这是要压缩的历史、一边被要求在 system 提示里起标题，两边打架。
+const COMPACT_HEADING: &str = "【待压缩历史】";
+
+/// 把要压缩的历史包成用户消息。
+fn compact_input(rendered: &str) -> String {
+    format!("{COMPACT_HEADING}\n{rendered}")
+}
+
+/// 单次请求公共流程：发一次 system + 用户消息，收集 TextDelta，空输出视为失败。
+///
+/// `user_text` 由调用方准备好：压缩路径带 [`COMPACT_HEADING`] 抬头，起标题路径
+/// 就是原样的那句话。`meta` 决定这次请求归到哪条会话 —— 它会变成请求头，网关
+/// 按它归类。
+async fn run_prompt(
+    user_text: &str,
     system: &str,
     max_tokens: u32,
     provider: &dyn LlmProvider,
@@ -273,9 +296,7 @@ async fn run_summary(
 ) -> crate::Result<String> {
     let mut wire = WireRequest::new(model.api_name.clone());
     wire.system = vec![Block::text(system)];
-    wire.messages = vec![WireMessage::user_text(format!(
-        "【待压缩历史】\n{rendered}"
-    ))];
+    wire.messages = vec![WireMessage::user_text(user_text)];
     wire.max_tokens = Some(max_tokens);
     wire.meta = meta.clone();
     let req = ChatRequest {
@@ -316,7 +337,8 @@ pub async fn generate_title(
         purpose: RequestPurpose::Title,
         ..Default::default()
     };
-    let out = run_summary(first_prompt, system, 32, provider, model, &meta).await?;
+    // 用户那句话原样发：它不是一段待压缩的历史（见 `COMPACT_HEADING`）。
+    let out = run_prompt(first_prompt, system, 32, provider, model, &meta).await?;
     let title = out
         .lines()
         .next()
@@ -412,11 +434,19 @@ mod tests {
     /// 返回固定一次性流的假 provider（供摘要逻辑单测，不触网）。
     struct FakeProvider {
         text: String,
+        /// 收到的用户消息文本（起标题不该带任何「待压缩」抬头）。
+        seen: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
     impl LlmProvider for FakeProvider {
-        async fn stream(&self, _req: ChatRequest) -> crate::Result<EventStream> {
+        async fn stream(&self, req: ChatRequest) -> crate::Result<EventStream> {
+            let user = req.wire.messages.iter().find_map(|m| {
+                m.content
+                    .iter()
+                    .find_map(|b| b.as_text().map(str::to_string))
+            });
+            *self.seen.lock().unwrap() = user;
             let events = vec![
                 Ok(StreamChunk::TextDelta {
                     index: 0,
@@ -566,6 +596,7 @@ mod tests {
     async fn l3_summarize_returns_text() {
         let provider = FakeProvider {
             text: "## 已完成的关键决策\n- 做了 X".to_string(),
+            seen: Default::default(),
         };
         let model = fake_model();
         let middle = vec![WireMessage::user_text("hi"), assistant_ir("ok")];
@@ -579,6 +610,7 @@ mod tests {
     async fn summarize_empty_text_errors() {
         let provider = FakeProvider {
             text: "   ".to_string(),
+            seen: Default::default(),
         };
         let model = fake_model();
         let middle = vec![WireMessage::user_text("hi")];
@@ -589,15 +621,27 @@ mod tests {
         );
     }
 
+    /// 压缩路径仍然带着抬头 —— 顺手把「去掉前缀」这件事的范围钉住。
+    #[test]
+    fn compaction_input_keeps_its_heading() {
+        assert_eq!(compact_input("用户: 你好"), "【待压缩历史】\n用户: 你好");
+    }
+
     #[tokio::test]
     async fn generate_title_strips_quotes_and_takes_first_line() {
         let provider = FakeProvider {
             text: "\"修复字间隔\"\n多余的第二行".to_string(),
+            seen: Default::default(),
         };
         let model = fake_model();
         let title = generate_title("帮我修复对话历史字间隔过宽", None, &provider, &model)
             .await
             .unwrap();
         assert_eq!(title, "修复字间隔");
+        // 用户那句话原样过去：标题不是在压缩一段历史，不能带压缩器的抬头。
+        assert_eq!(
+            provider.seen.lock().unwrap().as_deref(),
+            Some("帮我修复对话历史字间隔过宽")
+        );
     }
 }
