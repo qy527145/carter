@@ -147,13 +147,16 @@ impl CancelToken {
     }
 
     /// await 到被取消为止。若已取消则立即返回。
-    /// 注意：必须在进入可能阻塞的 await 前调用 `cancelled()` 拿到 future，
-    /// 以避免 set→await 之间的丢失唤醒（Notify 仅唤醒已注册的等待者）。
     pub async fn cancelled(&self) {
+        // 先登记再查标志：反过来的话，查完到登记之间的那次 `set` 会被漏掉
+        // （`notify_waiters` 只叫得醒已登记的），这里就再也醒不过来。
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 

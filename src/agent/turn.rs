@@ -58,6 +58,18 @@ pub enum TurnOutcome {
 tokio::task_local! {
     /// 正在执行工具的那一轮所属的会话 id。
     pub(crate) static SESSION_ID: Option<String>;
+    /// 正在执行的这次工具调用的编号（模型给的 `ToolCall.id`）。
+    static CALL_ID: String;
+}
+
+/// 工具执行时取这次调用的编号。
+///
+/// [`crate::tools::Tool::execute`] 的签名里没有它，而宿主要拿它把「界面上的这张卡片」
+/// 与「正在跑的这次调用」对上（单条命令的中断 / 转后台靠这个）。并发批里的几个调用
+/// 跑在同一个任务上，`scope` 按 poll 切换，互不串。
+/// 不在 [`run_turn`] 的工具执行里调用时为 None。
+pub fn current_call_id() -> Option<String> {
+    CALL_ID.try_with(|id| id.clone()).ok()
 }
 
 /// 工具执行时取所属会话的 id。派生子 agent 的工具靠它让子 agent 的请求挂在父会话下。
@@ -127,6 +139,11 @@ pub async fn run_turn(
     thread.user_turns = thread.user_turns.saturating_add(1);
 
     loop {
+        // 工具跑到一半被取消时走到这里：结果已经回灌，历史是完整的，别再发一次请求。
+        if cancel.is_cancelled() {
+            return finish_cancelled(thread, &total_usage, model, run_opts, ui, cancel).await;
+        }
+
         // PreTurn hook：观察型。提供本轮的元数据（轮次、消息条数）。
         run_opts
             .hooks
@@ -164,12 +181,16 @@ pub async fn run_turn(
                     )));
                 }
                 _ => {
+                    // 摘要是一次完整的模型请求，同样要能被取消打断。
+                    let compacted = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => None,
+                        r = context::compact(thread, cprov, cmodel, compact_threshold, ui) => Some(r),
+                    };
                     // 压缩内部已降级处理失败，错误仅记录不中断。
-                    if let Err(e) =
-                        context::compact(thread, cprov, cmodel, compact_threshold, ui).await
-                    {
+                    if let Some(Err(e)) = &compacted {
                         ui.emit(UiEvent::Notice(format!("[compact] error: {e}")));
-                    } else {
+                    } else if compacted.is_some() {
                         // 压缩成功 → fire Notification（语义对应"有重要状态变化要告知用户"）。
                         run_opts
                             .hooks
@@ -219,12 +240,20 @@ pub async fn run_turn(
             wire,
         };
 
-        let mut stream = provider.stream(req).await?;
+        // 等响应头这段也要听取消：上游迟迟不开口时，用户按了停止不能干等着。
+        let mut stream = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return finish_cancelled(thread, &total_usage, model, run_opts, ui, cancel).await;
+            }
+            r = provider.stream(req) => r?,
+        };
 
         // 装配器按块序号归并增量；块间交错也能还原。
         let mut asm = BlockAssembler::new();
         let mut stop_reason = FinishReason::Stop;
-        let mut had_text_or_thinking = false;
+        // 有一段正文 / 思考还没封口。「正文 → 思考 → 正文」要各成一段，不能粘在一起。
+        let mut block_open = false;
         let mut cancelled = false;
 
         while let Some(ev) = {
@@ -242,13 +271,13 @@ pub async fn run_turn(
             match &ev {
                 StreamChunk::TextDelta { text, .. } => {
                     ui.emit(UiEvent::AssistantTextDelta(text.clone()));
-                    had_text_or_thinking = true;
+                    block_open = true;
                 }
                 StreamChunk::ThinkingDelta { text, .. } => {
                     // 签名分片不展示给用户（对模型有用，对人没意义）。
                     if run_opts.show_thinking && !text.is_empty() {
                         ui.emit(UiEvent::ThinkingDelta(text.clone()));
-                        had_text_or_thinking = true;
+                        block_open = true;
                     }
                 }
                 StreamChunk::Finish { reason } => {
@@ -258,13 +287,9 @@ pub async fn run_turn(
                     // 厂商在流里报的错：告知用户，但不当致命错误 —— 已经生成的内容照常收尾。
                     ui.emit(UiEvent::Notice(format!("[stream] {error}")));
                 }
-                StreamChunk::Usage { usage } => {
-                    // 多轮累加（非覆盖）。
-                    total_usage.add(usage);
-                    // 用真实 input token（该轮完整 prompt）判定是否需压缩。
-                    if agent_cfg.compact_enabled && usage.input_tokens as u64 > compact_threshold {
-                        needs_compaction = true;
-                    }
+                StreamChunk::BlockStop { .. } if block_open => {
+                    ui.emit(UiEvent::AssistantTextEnd);
+                    block_open = false;
                 }
                 _ => {}
             }
@@ -274,19 +299,31 @@ pub async fn run_turn(
         // 显式 drop 流，确保取消时立即断连。
         drop(stream);
 
-        if had_text_or_thinking {
+        // 流断在半段上（被取消、或上游没发块结束）：也要封口。
+        if block_open {
             ui.emit(UiEvent::AssistantTextEnd);
         }
 
-        // 取消命中 → 重置 token、收尾历史（保留已生成的块）、返回 Cancelled。
+        // 用量按「一次请求」算：一次请求的用量常拆成几帧下发（Claude 的 `message_start`
+        // 报输入、`message_delta` 报输出，后者还可能把输入再报一遍），逐帧累加会重复计费。
+        // 装配器已经按非零合并好了。
+        let usage = asm.usage().clone();
+        total_usage.add(&usage);
+        // 压缩按「这次请求的完整规模」判：输入含缓存命中与写入，输出下一次请求就要带上。
+        // 只看 `input_tokens` 的话，开了 prompt caching 之后那只是未命中缓存的一截 ——
+        // 一条 150k 的对话命中 140k 时只看见 10k，永远不压，直到上游报「超出上下文」。
+        let scale = u64::from(usage.total_input_billed()) + u64::from(usage.output_tokens);
+        if agent_cfg.compact_enabled && scale > compact_threshold {
+            needs_compaction = true;
+        }
+
+        // 取消命中 → 收尾历史（保留已生成的块）、重置 token、返回 Cancelled。
         if cancelled {
             let blocks = asm.into_blocks();
             if !blocks.is_empty() {
                 thread.append(WireMessage::new(Role::Assistant, blocks));
             }
-            cancel.reset();
-            emit_post_turn_and_stop(&run_opts.hooks, thread.turns, "cancelled", &total_usage).await;
-            return Ok((TurnOutcome::Cancelled, total_usage));
+            return finish_cancelled(thread, &total_usage, model, run_opts, ui, cancel).await;
         }
 
         let blocks = asm.into_blocks();
@@ -332,7 +369,7 @@ pub async fn run_turn(
         let results = SESSION_ID
             .scope(
                 session_id,
-                execute_tool_calls(&pending_calls, tools, thread, ui, &run_opts.hooks),
+                execute_tool_calls(&pending_calls, tools, thread, ui, &run_opts.hooks, cancel),
             )
             .await;
 
@@ -369,6 +406,27 @@ pub async fn run_turn(
         // 回到循环顶部，带新历史再 stream。
     }
 }
+
+/// 被取消的那条收尾：重置令牌、报用量、发 hook。
+async fn finish_cancelled(
+    thread: &Thread,
+    usage: &Usage,
+    model: &ModelInfo,
+    run_opts: &RunOptions,
+    ui: &mut dyn UiSink,
+    cancel: &CancelToken,
+) -> crate::Result<(TurnOutcome, Usage)> {
+    cancel.reset();
+    if !usage.is_empty() {
+        emit_usage(ui, usage, model);
+    }
+    emit_post_turn_and_stop(&run_opts.hooks, thread.turns, "cancelled", usage).await;
+    Ok((TurnOutcome::Cancelled, usage.clone()))
+}
+
+/// 已被取消时，还没开始跑的工具不再执行。结果仍要有 —— 每个 `tool_use` 都得有对应的
+/// `tool_result`，否则下一次请求会被上游拒掉。
+const SKIPPED_BY_CANCEL: &str = "这一轮已被用户中断，这个工具没有执行。";
 
 /// carter 的推理强度 → IR 的思考配置。`None` 表示**不发**思考参数。
 ///
@@ -413,6 +471,7 @@ async fn execute_tool_calls(
     thread: &mut super::thread::Thread,
     ui: &mut dyn UiSink,
     hooks: &HookRegistry,
+    cancel: &CancelToken,
 ) -> Vec<ToolResult> {
     // 第 1 阶段：对每个调用过一遍 PreToolUse hook，得到一个"待执行"列表
     // （可能改写过 args，可能直接被阻断为 ToolResult::err）。
@@ -480,7 +539,13 @@ async fn execute_tool_calls(
                 .map(|p| {
                     let name = p.call.name.clone();
                     let args = p.call.args.clone();
-                    async move { tools.dispatch(&name, args).await }
+                    let id = p.call.id.clone();
+                    async move {
+                        if cancel.is_cancelled() {
+                            return ToolResult::err(SKIPPED_BY_CANCEL);
+                        }
+                        CALL_ID.scope(id, tools.dispatch(&name, args)).await
+                    }
                 })
                 .collect();
             let mut batch_results: Vec<ToolResult> = Vec::with_capacity(batch.len());
@@ -497,6 +562,14 @@ async fn execute_tool_calls(
             // 串行：unsafe 工具单独跑，先抓写前快照。
             let tc = &prepared[i].call;
             ui.emit(super::ui::tool_call_started(tc));
+            if cancel.is_cancelled() {
+                let res = ToolResult::err(SKIPPED_BY_CANCEL);
+                emit_tool_result(ui, &res);
+                post_tool_hook(hooks, tc, &res).await;
+                out.push(res);
+                i += 1;
+                continue;
+            }
             let paths = super::checkpoint::mutating_paths(&tc.name, &tc.args);
             if !paths.is_empty() {
                 let recorder = thread.recorder();
@@ -506,7 +579,9 @@ async fn execute_tool_calls(
                     recorder.as_deref(),
                 );
             }
-            let res = tools.dispatch(&tc.name, tc.args.clone()).await;
+            let res = CALL_ID
+                .scope(tc.id.clone(), tools.dispatch(&tc.name, tc.args.clone()))
+                .await;
             emit_tool_result(ui, &res);
             post_tool_hook(hooks, tc, &res).await;
             out.push(res);
@@ -644,7 +719,15 @@ mod tests {
         let mut thread = crate::agent::Thread::new("test");
         let mut sink = VecSink::default();
         let hooks = HookRegistry::default();
-        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        let results = execute_tool_calls(
+            &calls,
+            &reg,
+            &mut thread,
+            &mut sink,
+            &hooks,
+            &CancelToken::new(),
+        )
+        .await;
         assert_eq!(results.len(), 3);
         let starts: Vec<&str> = sink
             .0
@@ -673,7 +756,15 @@ mod tests {
         let mut thread = crate::agent::Thread::new("test");
         let mut sink = VecSink::default();
         let hooks = HookRegistry::default();
-        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        let results = execute_tool_calls(
+            &calls,
+            &reg,
+            &mut thread,
+            &mut sink,
+            &hooks,
+            &CancelToken::new(),
+        )
+        .await;
         assert_eq!(results.len(), 4);
         // ToolCallStarted 事件个数 = 4。
         let started_n = sink
@@ -699,7 +790,15 @@ mod tests {
         let reg = ToolRegistry::builtin();
         let mut thread = crate::agent::Thread::new("test");
         let mut sink = VecSink::default();
-        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        let results = execute_tool_calls(
+            &calls,
+            &reg,
+            &mut thread,
+            &mut sink,
+            &hooks,
+            &CancelToken::new(),
+        )
+        .await;
         assert_eq!(results.len(), 1);
         assert!(!results[0].ok, "hook 应阻断 bash 执行");
         assert!(results[0].content.contains("blocked by hook"));
@@ -729,7 +828,15 @@ mod tests {
         let reg = ToolRegistry::builtin();
         let mut thread = crate::agent::Thread::new("test");
         let mut sink = VecSink::default();
-        let results = execute_tool_calls(&calls, &reg, &mut thread, &mut sink, &hooks).await;
+        let results = execute_tool_calls(
+            &calls,
+            &reg,
+            &mut thread,
+            &mut sink,
+            &hooks,
+            &CancelToken::new(),
+        )
+        .await;
         assert_eq!(results.len(), 1);
         // 改写后读 Cargo.toml 应该成功（项目根有这个文件）。
         assert!(results[0].ok, "hook 改写 path → Cargo.toml 应该读成功");
@@ -838,5 +945,374 @@ mod tests {
             None,
             "首个块是 thinking 而不是文本"
         );
+    }
+
+    // ---- run_turn 整圈的行为：用脚本化的 provider 驱动 ----
+
+    use crate::provider::EventStream;
+    use crate::tools::Tool;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// 每次请求按顺序吐一段脚本，并记下收到的请求。脚本用完就报错 —— 多发一次请求就会露馅。
+    struct Scripted {
+        scripts: Mutex<Vec<Vec<StreamChunk>>>,
+        requests: Mutex<Vec<WireRequest>>,
+    }
+    impl Scripted {
+        fn new(scripts: Vec<Vec<StreamChunk>>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+    #[async_trait]
+    impl LlmProvider for Scripted {
+        async fn stream(&self, req: ChatRequest) -> crate::Result<EventStream> {
+            self.requests.lock().unwrap().push(req.wire);
+            let mut s = self.scripts.lock().unwrap();
+            assert!(!s.is_empty(), "脚本用完了：多发了一次请求");
+            let chunks = s.remove(0);
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> Vec<StreamChunk> {
+        vec![
+            StreamChunk::ToolCallDelta {
+                index: 0,
+                id: id.into(),
+                name_delta: Some(name.into()),
+                arguments_delta: Some("{}".into()),
+            },
+            StreamChunk::Finish {
+                reason: FinishReason::ToolCall,
+            },
+        ]
+    }
+
+    fn say(text: &str) -> Vec<StreamChunk> {
+        vec![
+            StreamChunk::text(text),
+            StreamChunk::Finish {
+                reason: FinishReason::Stop,
+            },
+        ]
+    }
+
+    fn model(window: u32) -> ModelInfo {
+        ModelInfo {
+            key: "k".into(),
+            provider: "p".into(),
+            api_name: "m".into(),
+            context_window: window,
+            max_output_tokens: 1000,
+            tokenizer: "cl100k".into(),
+            capabilities: vec![Capability::Tools],
+            pricing: crate::registry::Pricing {
+                input: 0.0,
+                output: 0.0,
+                cache_write: None,
+                cache_read: None,
+            },
+            default_reasoning: None,
+        }
+    }
+
+    fn opts() -> RunOptions {
+        RunOptions {
+            show_thinking: true,
+            system: Vec::new(),
+            compact_model: None,
+            hooks: Arc::new(HookRegistry::default()),
+            purpose: RequestPurpose::MainTurn,
+        }
+    }
+
+    /// 记下执行时看到的调用编号；可选地在执行时按下取消。
+    struct Probe {
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+        cancel_on_run: Option<CancelToken>,
+        name: &'static str,
+    }
+    #[async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _args: Value) -> ToolResult {
+            self.seen.lock().unwrap().push(current_call_id());
+            if let Some(c) = &self.cancel_on_run {
+                c.set();
+            }
+            ToolResult::ok("done")
+        }
+    }
+
+    fn registry(tools: Vec<Probe>) -> ToolRegistry {
+        let mut r = ToolRegistry::empty();
+        for t in tools {
+            r.push(Arc::new(t));
+        }
+        r
+    }
+
+    /// 工具拿得到模型给的调用编号，串行与并发两条路都是；出了工具就没有了。
+    #[tokio::test]
+    async fn tools_can_read_the_model_call_id() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tools = registry(vec![
+            Probe {
+                seen: seen.clone(),
+                cancel_on_run: None,
+                name: "grep",
+            },
+            Probe {
+                seen: seen.clone(),
+                cancel_on_run: None,
+                name: "glob",
+            },
+            Probe {
+                seen: seen.clone(),
+                cancel_on_run: None,
+                name: "bash",
+            },
+        ]);
+        let calls = vec![
+            call("a", "grep", json!({})),
+            call("b", "glob", json!({})),
+            call("c", "bash", json!({})),
+        ];
+        let mut thread = crate::agent::Thread::new("x");
+        let mut sink = VecSink::default();
+        execute_tool_calls(
+            &calls,
+            &tools,
+            &mut thread,
+            &mut sink,
+            &HookRegistry::default(),
+            &CancelToken::new(),
+        )
+        .await;
+        let mut got: Vec<_> = seen.lock().unwrap().iter().flatten().cloned().collect();
+        got.sort();
+        assert_eq!(got, vec!["a", "b", "c"]);
+        assert_eq!(current_call_id(), None);
+    }
+
+    /// 工具执行中被取消：后面的工具不跑但要有结果，也不再发下一次请求。
+    #[tokio::test]
+    async fn cancelling_during_a_tool_stops_without_another_request() {
+        let cancel = CancelToken::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tools = registry(vec![
+            Probe {
+                seen: seen.clone(),
+                cancel_on_run: Some(cancel.clone()),
+                name: "bash",
+            },
+            Probe {
+                seen: seen.clone(),
+                cancel_on_run: None,
+                name: "write_file",
+            },
+        ]);
+        let provider = Scripted::new(vec![vec![
+            StreamChunk::ToolCallDelta {
+                index: 0,
+                id: "a".into(),
+                name_delta: Some("bash".into()),
+                arguments_delta: Some("{}".into()),
+            },
+            StreamChunk::ToolCallDelta {
+                index: 1,
+                id: "b".into(),
+                name_delta: Some("write_file".into()),
+                arguments_delta: Some("{}".into()),
+            },
+        ]]);
+        let mut thread = crate::agent::Thread::new("x");
+        let mut sink = VecSink::default();
+        let (outcome, _) = run_turn(
+            &mut thread,
+            &provider,
+            &model(100_000),
+            &AgentConfig::default(),
+            &opts(),
+            &tools,
+            &mut sink,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Cancelled));
+        assert_eq!(provider.request_count(), 1, "取消之后不该再发请求");
+        assert_eq!(seen.lock().unwrap().len(), 1, "第二个工具不该执行");
+        assert!(!cancel.is_cancelled(), "令牌要复位，否则下一轮一进去就停");
+        let results = thread
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| matches!(b, Block::ToolResult { .. }))
+            .count();
+        assert_eq!(results, 2, "每个 tool_use 都要有 tool_result");
+    }
+
+    /// 上游迟迟不给响应头时，取消也要立刻生效。
+    #[tokio::test]
+    async fn cancelling_while_waiting_for_headers_returns_at_once() {
+        struct Hang;
+        #[async_trait]
+        impl LlmProvider for Hang {
+            async fn stream(&self, _req: ChatRequest) -> crate::Result<EventStream> {
+                std::future::pending().await
+            }
+        }
+        let cancel = CancelToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            c.set();
+        });
+        let mut thread = crate::agent::Thread::new("x");
+        let mut sink = VecSink::default();
+        let (m, cfg, o, tools) = (
+            model(100_000),
+            AgentConfig::default(),
+            opts(),
+            ToolRegistry::empty(),
+        );
+        let run = run_turn(&mut thread, &Hang, &m, &cfg, &o, &tools, &mut sink, &cancel);
+        let (outcome, _) = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("取消没有打断等待")
+            .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Cancelled));
+    }
+
+    /// 一次请求拆成几帧报用量（后一帧把输入又报一遍）时，不能重复累加。
+    #[tokio::test]
+    async fn usage_split_across_frames_is_counted_once() {
+        let frame = |input, output| StreamChunk::Usage {
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+                ..Default::default()
+            },
+        };
+        let provider = Scripted::new(vec![vec![
+            frame(100, 1),
+            StreamChunk::text("hi"),
+            frame(100, 50),
+            StreamChunk::Finish {
+                reason: FinishReason::Stop,
+            },
+        ]]);
+        let mut thread = crate::agent::Thread::new("x");
+        let mut sink = VecSink::default();
+        let (_, usage) = run_turn(
+            &mut thread,
+            &provider,
+            &model(100_000),
+            &AgentConfig::default(),
+            &opts(),
+            &ToolRegistry::empty(),
+            &mut sink,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+    }
+
+    /// 命中缓存的部分也算进规模：未命中只有一点点时同样要触发压缩。
+    #[tokio::test]
+    async fn cached_input_counts_towards_compaction() {
+        let mut usage = Usage {
+            input_tokens: 10,
+            ..Default::default()
+        };
+        usage.cache.read_tokens = 90_000;
+        let mut first = vec![StreamChunk::Usage { usage }];
+        first.extend(tool_call("a", "bash"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tools = registry(vec![Probe {
+            seen,
+            cancel_on_run: None,
+            name: "bash",
+        }]);
+        let provider = Scripted::new(vec![first, say("done")]);
+        let mut thread = crate::agent::Thread::new("x");
+        let mut sink = VecSink::default();
+        run_turn(
+            &mut thread,
+            &provider,
+            &model(100_000),
+            &AgentConfig::default(),
+            &opts(),
+            &tools,
+            &mut sink,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        let compacted = sink
+            .0
+            .iter()
+            .any(|e| matches!(e, UiEvent::Notice(m) if m.starts_with("[compact]")));
+        assert!(compacted, "规模超线却没有压缩");
+    }
+
+    /// 「正文 → 思考 → 正文」各成一段：每段结束都要封口。
+    #[tokio::test]
+    async fn every_text_block_is_closed_on_its_own() {
+        let provider = Scripted::new(vec![vec![
+            StreamChunk::TextDelta {
+                index: 0,
+                text: "a".into(),
+            },
+            StreamChunk::BlockStop { index: 0 },
+            StreamChunk::TextDelta {
+                index: 1,
+                text: "b".into(),
+            },
+            StreamChunk::BlockStop { index: 1 },
+            StreamChunk::Finish {
+                reason: FinishReason::Stop,
+            },
+        ]]);
+        let mut thread = crate::agent::Thread::new("x");
+        let mut sink = VecSink::default();
+        run_turn(
+            &mut thread,
+            &provider,
+            &model(100_000),
+            &AgentConfig::default(),
+            &opts(),
+            &ToolRegistry::empty(),
+            &mut sink,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        let ends = sink
+            .0
+            .iter()
+            .filter(|e| matches!(e, UiEvent::AssistantTextEnd))
+            .count();
+        assert_eq!(ends, 2);
     }
 }

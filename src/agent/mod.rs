@@ -15,7 +15,9 @@ pub use context::generate_title;
 pub use subagent::{TaskTool, ToolFactory};
 pub use thread::Thread;
 #[allow(unused_imports)]
-pub use turn::{CompactModel, RunOptions, TurnOutcome, TurnState, current_session_id, run_turn};
+pub use turn::{
+    CompactModel, RunOptions, TurnOutcome, TurnState, current_call_id, current_session_id, run_turn,
+};
 #[allow(unused_imports)]
 pub use ui::{
     CancelToken, ReplayMsg, ReplayRole, StdoutSink, UiEvent, UiSink, replay_from_messages,
