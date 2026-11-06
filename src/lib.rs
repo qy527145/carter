@@ -38,6 +38,8 @@ pub mod mcp;
 pub mod media;
 pub mod memory;
 pub mod ndjson;
+/// 平台相关的进程启动细节（Windows 下隐藏子进程控制台窗口）。
+mod platform;
 pub mod prompt;
 pub mod provider;
 pub mod registry;

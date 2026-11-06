@@ -55,6 +55,9 @@ impl Tool for Bash {
         let warning = sniff_dangerous(&command);
 
         let mut cmd = tokio::process::Command::new("sh");
+        // 输出走管道，不需要窗口；GUI 宿主里别让它闪黑框。
+        #[cfg(windows)]
+        crate::platform::hide_console_async(&mut cmd);
         cmd.arg("-c")
             .arg(&command)
             .stdout(Stdio::piped())

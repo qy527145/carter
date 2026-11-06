@@ -40,6 +40,10 @@ async fn connect_stdio(cfg: &McpServerConfig) -> Result<Service, String> {
         for (k, v) in &env {
             c.env(k, v);
         }
+        // MCP server（`npx` / `node` / `uvx` …）都是控制台程序：GUI 宿主没有控制台，
+        // 不带这个标志的话每开一条会话都会闪一串黑框。
+        #[cfg(windows)]
+        crate::platform::hide_console_async(c);
     }))
     .map_err(|e| format!("spawn failed: {e}"))?;
 

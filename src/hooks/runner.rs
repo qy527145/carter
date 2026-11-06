@@ -84,14 +84,16 @@ pub async fn run_hook(cfg: &HookConfig, payload: &HookPayload) -> HookOutcome {
 
     // 2. spawn shell 子进程。
     let (program, flag) = *hook_shell();
-    let mut child = match tokio::process::Command::new(program)
-        .arg(flag)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.arg(flag)
         .arg(&cfg.command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // hooks 每轮都可能跑；GUI 宿主没有控制台，不带这个标志就是每轮闪一次黑框。
+    #[cfg(windows)]
+    crate::platform::hide_console_async(&mut cmd);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("hooks: failed to spawn `{}`: {e}", cfg.command);

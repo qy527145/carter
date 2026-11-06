@@ -56,13 +56,16 @@ pub fn project_dir(cwd: &Path) -> PathBuf {
 }
 
 /// 读 git 快照（best-effort，非 git 仓库返回 None）。
+///
+/// 这条探针跑在**新建会话**那一瞬，也就是 GUI 宿主里最容易被看见的地方：不带
+/// `CREATE_NO_WINDOW` 的话，宿主每开一条新对话都会闪两个黑框（见 `platform`）。
 fn read_git(cwd: &Path) -> Option<GitInfo> {
     let run = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .ok()?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args).current_dir(cwd);
+        #[cfg(windows)]
+        crate::platform::hide_console(&mut cmd);
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }

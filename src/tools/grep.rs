@@ -42,6 +42,9 @@ impl Tool for Grep {
         };
 
         let mut cmd = tokio::process::Command::new("rg");
+        // 输出走管道；GUI 宿主里 `rg` 是控制台程序，不要让系统给它开窗口。
+        #[cfg(windows)]
+        crate::platform::hide_console_async(&mut cmd);
         cmd.arg("--line-number")
             .arg("--no-heading")
             .arg("--color=never");

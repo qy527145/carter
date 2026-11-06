@@ -73,6 +73,8 @@ fn run_shell(cmd: &str, cwd: &Path) -> String {
     let mut command = {
         let mut c = std::process::Command::new("cmd");
         c.arg("/C").arg(cmd);
+        // 输出已经被 `output()` 接走，不需要窗口；GUI 宿主里不要它闪黑框。
+        crate::platform::hide_console(&mut c);
         c
     };
     #[cfg(not(windows))]
