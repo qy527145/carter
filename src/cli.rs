@@ -185,14 +185,16 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
         .model
         .clone()
         .unwrap_or_else(|| config.agent.model.clone());
-    let resolved = crate::provider::resolve_provider(&config, &cache_json, &model_name, Vec::new())?;
+    let resolved =
+        crate::provider::resolve_provider(&config, &cache_json, &model_name, Vec::new())?;
     let (model, provider) = (resolved.model, resolved.provider);
 
     // Fast 模型（压缩 / 标题）：配了 agent.fast_model 则解析，否则回落主模型/主 provider。
     let (fast_model, fast_provider): (crate::registry::ModelInfo, Arc<dyn LlmProvider>) =
         match &config.agent.fast_model {
             Some(reference) => {
-                let r = crate::provider::resolve_provider(&config, &cache_json, reference, Vec::new())?;
+                let r =
+                    crate::provider::resolve_provider(&config, &cache_json, reference, Vec::new())?;
                 (r.model, r.provider)
             }
             None => (model.clone(), provider.clone()),
@@ -468,8 +470,9 @@ async fn run_oneshot(
             model: fast_model,
         }),
         hooks: hooks.clone(),
-                purpose: crate::provider::RequestPurpose::MainTurn,
-};
+        purpose: crate::provider::RequestPurpose::MainTurn,
+        steer: None,
+    };
     let cancel = CancelToken::new();
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
     let tools = crate::agent::build_tools(
@@ -649,8 +652,9 @@ async fn run_tui(
                 model: fast_model.clone(),
             }),
             hooks: agent_hooks.clone(),
-                    purpose: crate::provider::RequestPurpose::MainTurn,
-};
+            purpose: crate::provider::RequestPurpose::MainTurn,
+            steer: None,
+        };
         let tools = crate::agent::build_tools(
             config.skills.enabled,
             provider.clone(),
@@ -751,14 +755,13 @@ async fn run_tui(
                 if needs_title {
                     needs_title = false;
                     // fast 模型短输出；失败静默忽略（错误即数据，不阻断会话）。
-                    if let Ok(title) =
-                        crate::agent::generate_title(
-                            &prompt,
-                            thread.session_id.as_deref(),
-                            &*fast_provider,
-                            &fast_model,
-                        )
-                        .await
+                    if let Ok(title) = crate::agent::generate_title(
+                        &prompt,
+                        thread.session_id.as_deref(),
+                        &*fast_provider,
+                        &fast_model,
+                    )
+                    .await
                     {
                         if !title.is_empty() {
                             if let Some(rec) = thread.recorder() {

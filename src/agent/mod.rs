@@ -16,7 +16,8 @@ pub use subagent::{TaskTool, ToolFactory};
 pub use thread::Thread;
 #[allow(unused_imports)]
 pub use turn::{
-    CompactModel, RunOptions, TurnOutcome, TurnState, current_call_id, current_session_id, run_turn,
+    CompactModel, RunOptions, Steer, TurnOutcome, TurnState, current_call_id, current_session_id,
+    run_turn,
 };
 #[allow(unused_imports)]
 pub use ui::{

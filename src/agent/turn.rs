@@ -94,6 +94,22 @@ pub struct RunOptions {
     /// 这次调用是干什么的。抓包面板靠它把主对话、压缩、子 agent 的请求分开 ——
     /// 混在一起时排障的人分不清「这条报文为什么长这样」。
     pub purpose: RequestPurpose,
+    /// 一轮进行中用户补充的话（插话）。`None` = 不接收。
+    pub steer: Option<std::sync::Arc<dyn Steer>>,
+}
+
+/// 插话来源：一轮**进行中**用户又说了话，不等这一轮结束，在**下一次请求**里就带给模型。
+///
+/// [`run_turn`] 每次发请求前取一次，取到的每一段作为一条 user 消息追加进历史（并落盘），
+/// 位置在上一批工具结果之后。取走即消费：没被取走的（这一轮后面不再发请求了）留在
+/// 宿主手里，由宿主决定怎么处理（通常是作为下一轮的输入）。
+///
+/// 每段单独成一条 user 消息、不并进工具结果那一条：OpenAI Chat 要求 `role:"tool"`
+/// 紧跟在带 `tool_calls` 的 assistant 后面，user 文本混进那一条会被编到 tool 消息前面。
+/// 连续两条 user 消息三种协议都接受（待办复诵也是这么附上去的）。
+pub trait Steer: Send + Sync {
+    /// 取走此刻排着的插话。没有就返回空。
+    fn take(&self) -> Vec<String>;
 }
 
 /// 压缩专用模型句柄：owned + Clone 友好，避免给 run_turn 加 `&dyn` 参数。
@@ -207,6 +223,14 @@ pub async fn run_turn(
                 }
             }
             needs_compaction = false;
+        }
+
+        // 插话：发请求前的最后一刻取，进历史（会话文件里也有），模型这一次就能看到。
+        // 放在压缩之后：刚到的话不该被摘要吞掉。
+        if let Some(steer) = &run_opts.steer {
+            for text in steer.take() {
+                thread.append_user(text);
+            }
         }
 
         // 构建请求：clone 历史 + 注入 todo 复诵（推到最近注意力区，不进 append-only 历史）。
@@ -1032,7 +1056,73 @@ mod tests {
             compact_model: None,
             hooks: Arc::new(HookRegistry::default()),
             purpose: RequestPurpose::MainTurn,
+            steer: None,
         }
+    }
+
+    /// 插话源：工具执行时放进去一句，模拟「这一轮进行中用户又说了话」。
+    #[derive(Default)]
+    struct Inbox(Mutex<Vec<String>>);
+    impl Steer for Inbox {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    /// 执行时往插话源里塞一句话的工具。
+    struct Says(Arc<Inbox>, &'static str);
+    #[async_trait]
+    impl Tool for Says {
+        fn name(&self) -> &str {
+            "bash"
+        }
+        fn description(&self) -> &str {
+            "says"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _args: Value) -> ToolResult {
+            self.0.0.lock().unwrap().push(self.1.to_string());
+            ToolResult::ok("done")
+        }
+    }
+
+    /// 一轮进行中到的插话，紧跟工具结果、在下一次请求里就发出去 —— 不等这一轮结束。
+    #[tokio::test]
+    async fn steer_rides_along_with_the_next_request() {
+        let inbox = Arc::new(Inbox::default());
+        let mut tools = ToolRegistry::empty();
+        tools.push(Arc::new(Says(inbox.clone(), "顺便把测试也跑一下")));
+        let provider = Scripted::new(vec![tool_call("a", "bash"), say("好")]);
+        let mut o = opts();
+        o.steer = Some(inbox.clone());
+        let mut thread = crate::agent::Thread::new("改一下");
+        let mut sink = VecSink::default();
+        run_turn(
+            &mut thread,
+            &provider,
+            &model(100_000),
+            &AgentConfig::default(),
+            &o,
+            &tools,
+            &mut sink,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = provider.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "插话不该多发请求，也不该少发");
+        let second = &reqs[1].messages;
+        // 改一下 → tool_use → tool_result → 插话
+        assert_eq!(second.len(), 4);
+        assert!(matches!(second[2].content[0], Block::ToolResult { .. }));
+        assert_eq!(second[3].role, Role::User);
+        assert_eq!(second[3].concat_text(), "顺便把测试也跑一下");
+        // 进了历史：落盘、续接都在。
+        assert_eq!(thread.messages[3].concat_text(), "顺便把测试也跑一下");
+        assert!(inbox.take().is_empty(), "取走即消费");
     }
 
     /// 记下执行时看到的调用编号；可选地在执行时按下取消。
