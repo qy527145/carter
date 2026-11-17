@@ -89,9 +89,37 @@ pub enum Event {
         cost: f64,
         model: String,
     },
+    /// `task` 工具里几个子 agent 的进度（整表快照，按 `call_id` 配对那张卡片）。
+    AgentProgress {
+        call_id: String,
+        agents: Vec<WireAgent>,
+    },
     /// 致命错误（一般紧随其后 carter 退出）。
     #[allow(dead_code)] // 暂未在 runner 主动构造；保留供将来 fatal error 透传给 host
     Error { message: String },
+}
+
+/// 一个子 agent 的进度（NDJSON 形态）。
+#[derive(Debug, Clone, Serialize)]
+pub struct WireAgent {
+    pub description: String,
+    /// `running` | `done` | `failed` | `cancelled`。
+    pub status: String,
+    pub steps: u32,
+    pub tool: Option<String>,
+    pub text: String,
+}
+
+impl From<&crate::agent::ui::AgentRun> for WireAgent {
+    fn from(a: &crate::agent::ui::AgentRun) -> Self {
+        Self {
+            description: a.description.clone(),
+            status: a.status.clone(),
+            steps: a.steps,
+            tool: a.tool.clone(),
+            text: a.text.clone(),
+        }
+    }
 }
 
 /// 序列化用的 todo（用 lowercase enum 字段名，便于 host 直接 match）。

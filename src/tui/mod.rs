@@ -405,6 +405,27 @@ impl App {
                 self.accumulate(&usage, cost);
                 self.streaming = false;
             }
+            // 子 agent 进度：TUI 里画成一行摘要（每个子 agent 一行，带状态与当前工具）。
+            UiEvent::AgentProgress { agents, .. } => {
+                self.flush_pending();
+                for a in &agents {
+                    let mark = match a.status.as_str() {
+                        "running" => "◐",
+                        "done" => "✓",
+                        "cancelled" => "⊘",
+                        _ => "✗",
+                    };
+                    let tail = a
+                        .tool
+                        .as_deref()
+                        .map(|t| format!(" · {t}"))
+                        .unwrap_or_default();
+                    self.outbox.push(Block_::Notice(format!(
+                        "{mark} {}{tail}（{} 步）",
+                        a.description, a.steps
+                    )));
+                }
+            }
         }
     }
 

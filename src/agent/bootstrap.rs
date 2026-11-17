@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use crate::agent::{CancelToken, TaskTool, ToolFactory, UiEvent};
 use crate::config::AgentConfig;
+use crate::goal::GoalSignal;
 use crate::provider::LlmProvider;
 use crate::registry::ModelInfo;
 use crate::tools::{
-    BackgroundShells, BashOutputTool, KillShellTool, PlatformBash, ShellCwd, Tool, ToolRegistry,
+    BackgroundShells, BashOutputTool, GoalUpdateTool, KillShellTool, PlatformBash, ShellCwd, Tool,
+    ToolRegistry,
 };
 
 /// 组装工具注册表：内置工具 + （启用时）Skills 的 `skill` 工具 + 子 agent 的 `task` 工具
@@ -36,11 +38,13 @@ pub fn build_tools(
     ui_tx: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
     shells: Option<Arc<BackgroundShells>>,
     cwd: Option<std::path::PathBuf>,
+    goal_signal: Option<Arc<GoalSignal>>,
 ) -> ToolRegistry {
     // 工具开关（`[agent].disabled_tools`）。在装配期就筛掉，而不是执行时回一句
     // 「这个工具被关掉了」—— 后者模型会反复试，因为它的工具表里还看得见它。
     // MCP 工具同样按名筛：宿主能关的名字就该一致地生效。
-    let disabled = &agent_cfg.disabled_tools;
+    // 拷一份出来再进闭包：`agent_cfg` 后面要整个移进 `TaskTool`，借着一半不行。
+    let disabled = agent_cfg.disabled_tools.clone();
     let on = |name: &str| !disabled.iter().any(|d| d == name);
 
     let cwd = cwd.unwrap_or_else(|| {
@@ -102,7 +106,7 @@ pub fn build_tools(
     let snapshot: Vec<Arc<dyn Tool>> = tools.tools().to_vec();
     let factory: ToolFactory = Arc::new(move || snapshot.clone());
 
-    tools.push(Arc::new(TaskTool::new(
+    let mut task_tool = TaskTool::new(
         provider,
         model,
         agent_cfg,
@@ -110,6 +114,19 @@ pub fn build_tools(
         cancel,
         factory,
         0, // 主 agent depth = 0
-    )));
+    );
+    // 有 UI 才接进度事件：没有宿主的 oneshot 模式没人看，也就没必要攒。
+    if let Some(tx) = &ui_tx {
+        task_tool = task_tool.with_progress(tx.clone());
+    }
+    tools.push(Arc::new(task_tool));
+
+    // `goal_update` 挂在**快照之后**：子 agent 一次 `completed` 就能把父会话的目标
+    // 标完成，而这种错不报错，只会让长任务悄悄停下。
+    if let Some(signal) = goal_signal
+        && on("goal_update")
+    {
+        tools.push(Arc::new(GoalUpdateTool::new(signal)));
+    }
     tools
 }

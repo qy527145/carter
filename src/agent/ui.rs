@@ -107,6 +107,28 @@ pub enum UiEvent {
         cost: f64,
         model: String,
     },
+    /// `task` 工具里几个子 agent 的进度（整表快照，按 `call_id` 配对那张卡片）。
+    ///
+    /// 发整表而不是增量：并发写时增量很容易次序错乱，而这张表本来就只有几行。
+    AgentProgress {
+        call_id: String,
+        agents: Vec<AgentRun>,
+    },
+}
+
+/// 一个子 agent 的进度（`task` 工具那张卡片的一行）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRun {
+    /// 主对话给这一行的短标题。
+    pub description: String,
+    /// `running` | `done` | `failed` | `cancelled`。
+    pub status: String,
+    /// 已经发起了几次工具调用 —— 「一条命令跑了很久」和「根本没动」能看出区别。
+    pub steps: u32,
+    /// 此刻正在跑的工具名。`None` = 在思考或已经结束。
+    pub tool: Option<String>,
+    /// 最近一段输出（尾部截断）。
+    pub text: String,
 }
 
 /// 渲染出口。两实现：`StdoutSink`（裸 ANSI，向后兼容 / 管道）、`ChannelSink`（TUI）。
@@ -238,6 +260,20 @@ impl UiSink for StdoutSink {
             }
             // oneshot 不 resume，无历史可回放。
             UiEvent::ReplayHistory(_) => {}
+            // 子 agent 进度：只在有变化的那一行打一句，别把终端刷满。
+            UiEvent::AgentProgress { agents, .. } => {
+                for a in &agents {
+                    let tail = match a.status.as_str() {
+                        "running" => a
+                            .tool
+                            .as_deref()
+                            .map(|t| format!(" · {t}"))
+                            .unwrap_or_default(),
+                        other => format!(" · {other}"),
+                    };
+                    let _ = writeln!(out, "\x1b[35m  · {}{tail}\x1b[0m", a.description);
+                }
+            }
             // oneshot 无 streaming 态可恢复，忽略。
             UiEvent::Idle => {}
             UiEvent::AskUser {

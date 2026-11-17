@@ -23,5 +23,5 @@ pub use turn::{
 };
 #[allow(unused_imports)]
 pub use ui::{
-    CancelToken, ReplayMsg, ReplayRole, StdoutSink, UiEvent, UiSink, replay_from_messages,
+    AgentRun, CancelToken, ReplayMsg, ReplayRole, StdoutSink, UiEvent, UiSink, replay_from_messages,
 };

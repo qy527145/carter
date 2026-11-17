@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::agent::ui::{UiEvent, UiSink};
 
-use super::protocol::{Event, WireTodo, WireUsage, to_line};
+use super::protocol::{Event, WireAgent, WireTodo, WireUsage, to_line};
 
 /// 等待 host 回复的 AskUser 表：id → 已脱离 UiEvent 的 oneshot Sender。
 /// 回传的是「第 i 个问题 → 选中的若干项」。
@@ -87,6 +87,11 @@ impl UiSink for NdjsonSink {
                 }
                 Event::AskUser { id, questions }
             }
+            // 子 agent 进度：NDJSON host 按 `agent_progress` 画那张卡片。
+            UiEvent::AgentProgress { call_id, agents } => Event::AgentProgress {
+                call_id,
+                agents: agents.iter().map(WireAgent::from).collect(),
+            },
         };
         self.write_event(&event);
     }

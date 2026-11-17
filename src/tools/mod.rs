@@ -6,6 +6,7 @@ mod background;
 mod bash;
 mod edit_file;
 mod glob_tool;
+mod goal_update;
 mod grep;
 mod read_file;
 mod save_memory;
@@ -23,6 +24,7 @@ pub use background::{
     ShellStatus, follow_up, kill_process_tree,
 };
 pub use bash::{CommandControl, ControlLookup, PlatformBash, ShellCwd};
+pub use goal_update::GoalUpdateTool;
 pub use grep::EmbeddedGrep;
 pub use save_memory::SaveMemory;
 pub use todo_write::{TodoItem, TodoStatus, parse_todos};

@@ -486,6 +486,8 @@ async fn run_oneshot(
         None, // oneshot 模式无 TUI，ask_user_question 工具不可用
         None, // 一次性执行没有下一轮来接着做，后台命令表没有意义
         Some(cwd.clone()),
+        // oneshot 没有自动继续：跑完就退出，`goal_update` 留着只会让模型以为有人接着推。
+        None,
     );
     let mut sink = StdoutSink::new();
 
@@ -646,6 +648,18 @@ async fn run_tui(
         )
         .await;
 
+    // 长任务目标（`/goal`）：信号格子给 `goal_update` 工具，目标状态由主循环持有。
+    let goal_signal = std::sync::Arc::new(crate::goal::GoalSignal::default());
+    // 盘上处于 active 的一律降级成 paused：用户关掉终端时目标还在跑，下次打开
+    // 原样恢复就意味着人不在的时候模型自己开工烧 token。
+    let (start_goal, goal_downgraded) = match crate::goal::load(&session_meta.id) {
+        Some(g) => {
+            let (g, downgraded) = crate::goal::on_session_start(g);
+            (Some(g), downgraded)
+        }
+        None => (None, false),
+    };
+
     // agent 任务：连续多轮，每轮一个 prompt → run_turn → emit 事件。
     let agent_cancel = cancel.clone();
     let agent_hooks = hooks.clone();
@@ -655,7 +669,7 @@ async fn run_tui(
         let mut thread = thread;
         // 子 agent 复用人设段（system[0]）作为其 base system。
         let base_system = system.first().cloned().unwrap_or_default();
-        let run_opts = RunOptions {
+        let mut run_opts = RunOptions {
             show_thinking,
             system,
             compact_model: Some(crate::agent::CompactModel {
@@ -666,6 +680,9 @@ async fn run_tui(
             purpose: crate::provider::RequestPurpose::MainTurn,
             steer: Some(agent_steer.clone()),
         };
+        // 目标段是系统提示的**最后一段**，每轮现接（见 `goal::system_segment`）。
+        // 基段留着不动，否则目标一改、下一轮再拼就把上一段也拼进去了。
+        let system_base = run_opts.system.clone();
         let tools = crate::agent::build_tools(
             config.skills.enabled,
             provider.clone(),
@@ -677,6 +694,7 @@ async fn run_tui(
             Some(ui_tx.clone()), // TUI 模式：ask_user_question 工具走这个通道发 UiEvent::AskUser
             Some(agent_shells.clone()),
             Some(agent_cwd),
+            Some(goal_signal.clone()),
         );
         // 主模型 / provider 设为可变：会话内 `/model` 热切换会重绑它们（run_turn 每轮取最新）。
         // 注：子 agent 的 `task` 工具仍持旧 model（重建 MCP 工具代价高，列为已知限制）。
@@ -704,6 +722,21 @@ async fn run_tui(
 
         // 仅当会话还没有标题时，于首条 prompt 后生成一次并落盘。
         let mut needs_title = session_meta.title.is_none();
+        // 目标状态：每轮现算系统提示段、每轮结束后决定要不要再推一轮。
+        let mut goal: Option<crate::goal::Goal> = start_goal;
+        let mut idle_streak = 0u32;
+        if goal_downgraded {
+            sink.emit(crate::agent::UiEvent::Notice(
+                "上次退出时这个目标还在进行中，已改为暂停。用 /goal resume 可以接着推进。".into(),
+            ));
+        }
+        if let Some(g) = &goal {
+            sink.emit(crate::agent::UiEvent::Notice(format!(
+                "目标（{}）：{}",
+                g.status.label(),
+                g.objective
+            )));
+        }
         // 本会话累计用量（供 /cost）。
         let mut session_usage = crate::provider::Usage::default();
         // 后台命令自己结束时的通知：拿到 shell_id 后取正文，作为一条 user 消息
@@ -749,6 +782,52 @@ async fn run_tui(
             crate::session::history::append(&session_meta.id, &prompt);
             // 斜杠命令解析：自定义命令展开为 prompt；内置命令就地分发（无需跑 turn）。
             // `/quit`·`/exit` 已由 TUI 层在提交前拦截。
+            // `/btw <问题>`：侧边问一句。带着主对话的转录跑**一轮**，不写进这条对话。
+            // 放在这里而不是 `dispatch_builtin`：它要用工具表与 provider，而那些在
+            // 闭包里、那个函数看不到。
+            let btw = prompt
+                .trim_start()
+                .strip_prefix("/btw")
+                .or_else(|| prompt.trim_start().strip_prefix("/side"))
+                .map(|rest| rest.trim().to_string());
+            if let Some(question) = btw {
+                if question.is_empty() {
+                    sink.emit(crate::agent::UiEvent::Notice(
+                        "用法：/btw <问题>（带着主对话的上下文问一句，不影响这条对话）".into(),
+                    ));
+                } else {
+                    let mut side_thread = Thread::new_empty();
+                    side_thread.append_user(question.clone());
+                    let mut side_system = system_base.clone();
+                    side_system.push(crate::side::INSTRUCTIONS.to_string());
+                    side_system.push(crate::side::transcript(&thread.messages, &[]));
+                    let side_opts = RunOptions {
+                        show_thinking: run_opts.show_thinking,
+                        system: side_system,
+                        compact_model: None,
+                        hooks: run_opts.hooks.clone(),
+                        purpose: crate::provider::RequestPurpose::MainTurn,
+                        // 侧边会话只听这一问；主对话的插话队列不归它。
+                        steer: None,
+                    };
+                    sink.emit(crate::agent::UiEvent::Divider("侧边聊天".into()));
+                    let _ = run_turn(
+                        &mut side_thread,
+                        &*provider,
+                        &model,
+                        &config.agent,
+                        &side_opts,
+                        &tools,
+                        &mut sink,
+                        &agent_cancel,
+                    )
+                    .await;
+                    sink.emit(crate::agent::UiEvent::Divider("回到主对话".into()));
+                }
+                sink.emit(crate::agent::UiEvent::Idle);
+                continue;
+            }
+
             let to_run: Option<String> = {
                 let trimmed = prompt.trim_start();
                 if let Some(rest) = trimmed.strip_prefix('/') {
@@ -774,6 +853,9 @@ async fn run_tui(
                             mcp_tool_count,
                             &session_usage,
                             &mut needs_title,
+                            &mut goal,
+                            &session_meta.id,
+                            &mut idle_streak,
                         )
                         .await;
                         None
@@ -802,6 +884,8 @@ async fn run_tui(
                         continue;
                     }
                 };
+                // 循环里还要用这段正文（第一轮用它，后续几轮是 CONTINUE_PROMPT）。
+                let prompt_text = text.clone();
                 thread.append_user(text);
                 if needs_title {
                     needs_title = false;
@@ -824,31 +908,117 @@ async fn run_tui(
                         }
                     }
                 }
-                // 这一轮进行中，回车进来的话走插话；跑完立刻关门，空闲时照旧排队。
-                agent_steer.set_open(true);
-                let usage = run_turn(
-                    &mut thread,
-                    &*provider,
-                    &model,
-                    &config.agent,
-                    &run_opts,
-                    &tools,
-                    &mut sink,
-                    &agent_cancel,
-                )
-                .await;
-                agent_steer.set_open(false);
-                if let Ok((_, usage)) = usage {
-                    session_usage.add(&usage);
-                }
-                // 这一轮后面没再发请求，插话没被取走：退回队列，按下一轮正常跑。
-                for text in agent_steer.drain() {
-                    let raw = text
-                        .strip_prefix(crate::agent::STEER_HEAD)
-                        .map(|s| s.trim_start_matches('\n').to_string())
-                        .unwrap_or(text);
-                    if input_tx_for_retry.send(raw).is_err() {
-                        break;
+                // 一轮，加上 `/goal` 推起来的自动继续。退出条件全在
+                // `goal::decide_after_turn`（纯函数、逐条测过），这里只负责照做。
+                let mut next: Option<String> = None;
+                loop {
+                    let user_text = match next.take() {
+                        Some(t) => {
+                            thread.append_user(t.clone());
+                            t
+                        }
+                        None => prompt_text.clone(),
+                    };
+                    let _ = &user_text;
+
+                    // 只有 active 时模型才该调 `goal_update`；目标段每轮现接。
+                    goal_signal.set_armed(
+                        goal.as_ref()
+                            .is_some_and(|g| g.status == crate::goal::GoalStatus::Active),
+                    );
+                    run_opts.system = system_base.clone();
+                    if let Some(seg) = goal.as_ref().and_then(crate::goal::system_segment) {
+                        run_opts.system.push(seg);
+                    }
+
+                    let before = thread.messages.len();
+                    // 这一轮进行中，回车进来的话走插话；跑完立刻关门，空闲时照旧排队。
+                    agent_steer.set_open(true);
+                    let outcome = run_turn(
+                        &mut thread,
+                        &*provider,
+                        &model,
+                        &config.agent,
+                        &run_opts,
+                        &tools,
+                        &mut sink,
+                        &agent_cancel,
+                    )
+                    .await;
+                    agent_steer.set_open(false);
+                    if let Ok((_, usage)) = &outcome {
+                        session_usage.add(usage);
+                    }
+                    // 这一轮后面没再发请求，插话没被取走：退回队列，按下一轮正常跑。
+                    for t in agent_steer.drain() {
+                        let raw = t
+                            .strip_prefix(crate::agent::STEER_HEAD)
+                            .map(|s| s.trim_start_matches('\n').to_string())
+                            .unwrap_or(t);
+                        if input_tx_for_retry.send(raw).is_err() {
+                            break;
+                        }
+                    }
+
+                    // 这一轮到底动了没有：历史里新出现的工具调用就是「在干活」。
+                    let used_tools = thread.messages[before..].iter().any(|m| {
+                        m.content
+                            .iter()
+                            .any(|b| matches!(b, crate::provider::Block::ToolUse { .. }))
+                    });
+                    let user_cancelled = matches!(outcome, Ok((TurnOutcome::Cancelled, _)));
+                    let failed = match &outcome {
+                        Err(_) => true,
+                        Ok((TurnOutcome::Cancelled | TurnOutcome::Assistant, _)) => false,
+                        Ok((TurnOutcome::Limit | TurnOutcome::Error(_), _)) => true,
+                    };
+                    let Some(mut g) = goal.clone() else { break };
+                    idle_streak = if used_tools {
+                        0
+                    } else {
+                        idle_streak.saturating_add(1)
+                    };
+                    g.idle_streak = idle_streak;
+                    let decision = crate::goal::decide_after_turn(
+                        &g,
+                        &crate::goal::GoalOutcome {
+                            user_cancelled,
+                            failed,
+                            used_tools,
+                            idle_streak,
+                            signal: goal_signal.take(),
+                        },
+                    );
+                    match decision {
+                        crate::goal::Decision::None => {
+                            let _ = crate::goal::save(&session_meta.id, &g);
+                            goal = Some(g);
+                            break;
+                        }
+                        crate::goal::Decision::Set {
+                            status,
+                            note,
+                            notice,
+                        } => {
+                            g.status = status;
+                            g.note = note;
+                            g.updated_at = crate::session::now_ms();
+                            let _ = crate::goal::save(&session_meta.id, &g);
+                            goal = Some(g.clone());
+                            sink.emit(crate::agent::UiEvent::Notice(notice));
+                            break;
+                        }
+                        crate::goal::Decision::Continue => {
+                            g.auto_continues = g.auto_continues.saturating_add(1);
+                            let _ = crate::goal::save(&session_meta.id, &g);
+                            goal = Some(g.clone());
+                            // 给「停止」留一点手感窗口，也避免退化成 tight loop。
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            if agent_cancel.is_cancelled() {
+                                break;
+                            }
+                            next = Some(crate::goal::CONTINUE_PROMPT.to_string());
+                        }
                     }
                 }
                 // 错误即数据：run_turn 内部已 emit；这里忽略 Err 让 REPL 继续。
@@ -916,6 +1086,9 @@ async fn dispatch_builtin(
     mcp_tool_count: usize,
     session_usage: &crate::provider::Usage,
     needs_title: &mut bool,
+    goal: &mut Option<crate::goal::Goal>,
+    session_id: &str,
+    idle_streak: &mut u32,
 ) {
     use crate::agent::UiEvent;
     let notice = |s: String| UiEvent::Notice(s);
@@ -1084,6 +1257,79 @@ async fn dispatch_builtin(
                 }
             } else {
                 sink.emit(notice("用法：/rewind 或 /rewind <序号>".into()));
+            }
+        }
+        "goal" => {
+            // 子命令：status / pause / resume / complete / clear；其余一律当成
+            // 「设定目标正文」。与 GUI 的目标条同一套状态机（`goal::apply_action`）。
+            use crate::goal::{self, GoalCommand, GoalStatus};
+            let action = match args {
+                "" | "status" => {
+                    match goal.as_ref() {
+                        Some(g) => {
+                            let mut out = format!(
+                                "目标（{}）：{}\n自动继续 {}/{} 轮",
+                                g.status.label(),
+                                g.objective,
+                                g.auto_continues,
+                                goal::MAX_AUTO_CONTINUES
+                            );
+                            if let Some(note) = &g.note {
+                                out.push_str(&format!("\n说明：{note}"));
+                            }
+                            out.push_str(
+                                "\n\n/goal <目标> 设定 · /goal pause 暂停 · /goal resume 继续 · /goal complete 完成 · /goal clear 清除",
+                            );
+                            sink.emit(notice(out));
+                        }
+                        None => sink.emit(notice(
+                            "还没有设定目标。用 `/goal <目标>` 设一个，模型未完成时会自动接着推。"
+                                .into(),
+                        )),
+                    }
+                    return;
+                }
+                "pause" => GoalCommand::Pause,
+                "resume" => GoalCommand::Resume,
+                "complete" | "done" => GoalCommand::Complete,
+                "clear" | "off" => GoalCommand::Clear,
+                other => GoalCommand::Set {
+                    objective: other.to_string(),
+                },
+            };
+            let was_active = goal
+                .as_ref()
+                .is_some_and(|g| g.status == GoalStatus::Active);
+            match goal::apply_action(goal.clone(), &action) {
+                Some(next) => {
+                    if let Some(g) = &next {
+                        let _ = goal::save(session_id, g);
+                    } else {
+                        let _ = goal::remove(session_id);
+                    }
+                    let now_active = next
+                        .as_ref()
+                        .is_some_and(|g| g.status == GoalStatus::Active);
+                    *goal = next;
+                    // 从「不推进」变成「推进」：清零空转计数，立刻开干。
+                    if now_active && !was_active {
+                        *idle_streak = 0;
+                        sink.emit(UiEvent::Notice(
+                            "目标已设定，开始推进。停下时目标还没完成会自动再推一轮。".into(),
+                        ));
+                    } else {
+                        sink.emit(notice(match action {
+                            GoalCommand::Pause => "目标已暂停：不会再自动继续。".to_string(),
+                            GoalCommand::Resume => "目标已继续。".to_string(),
+                            GoalCommand::Complete => "目标已标记为完成。".to_string(),
+                            GoalCommand::Clear => "目标已清除。".to_string(),
+                            GoalCommand::Set { .. } => "目标已更新。".to_string(),
+                        }));
+                    }
+                }
+                None => sink.emit(notice(
+                    "这个动作在当前状态下没有意义（`/goal` 看现状）。".into(),
+                )),
             }
         }
         "skills" => {

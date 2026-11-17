@@ -12,10 +12,14 @@
 //!   每个子 agent 持 `depth: u32`，超过上限直接拒绝派生。
 //! - **上下文 fork**：可传 `fork_messages: N` 把父 thread 最近 N 条消息复制给子 thread
 //!   作为开局上下文。
-//! - **并行派生**：参数 `prompts: ["t1","t2","t3"]`（数组）一次性并发跑 N 个子 agent，
-//!   按声明顺序返回结果汇总文本。
+//! - **并行派生**：`tasks: [{description, prompt}]` 一次性并发跑最多 8 个子 agent，
+//!   按声明顺序返回结果汇总文本。旧的 `prompt` / `prompts` 形态仍然认。
+//! - **进度事件**：每个子 agent 的「当前工具 / 步数 / 最近输出」写进共享槽位，节流地
+//!   发整表快照（`UiEvent::AgentProgress`）。没有它，界面上就是一个跑二十分钟的转圈卡片。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -26,10 +30,15 @@ use crate::tools::{Tool, ToolRegistry, ToolResult};
 
 use super::thread::Thread;
 use super::turn::{RunOptions, TurnOutcome, run_turn};
-use super::ui::{CancelToken, UiEvent, UiSink};
+use super::ui::{AgentRun, CancelToken, UiEvent, UiSink};
 
-/// 子 agent 的轮数上限（独立于主 agent，防失控）。
-const SUBAGENT_MAX_TURNS: u32 = 20;
+/// 子 agent 的轮数上限。`u32::MAX` = 不设限：与主对话一样，什么时候停下由它自己
+/// 决定（20 在「翻一批文件逐个核对」的子任务里很容易撞上，撞上就半路收尾、结果不全）。
+const SUBAGENT_MAX_TURNS: u32 = u32::MAX;
+/// 进度事件的最小间隔。文本增量一个 token 一条，全转发会把通道打满。
+const PROGRESS_GAP: Duration = Duration::from_millis(120);
+/// 卡片里显示的「最近输出」长度。
+const PROGRESS_TAIL: usize = 600;
 /// 子 agent 链的默认最大深度（agent_cfg.subagent_max_depth 缺省值）。
 pub const DEFAULT_MAX_DEPTH: u32 = 3;
 
@@ -50,6 +59,10 @@ pub struct TaskTool {
     tool_factory: ToolFactory,
     /// 当前 agent 在父子链中的深度（主 = 0；TaskTool 派生时把子 depth = self.depth + 1）。
     depth: u32,
+    /// 进度事件的出口。`None` = 宿主不接（oneshot / 测试），不发事件。
+    progress: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+    /// 没有 `call_id` 时现编编号用。
+    seq: Arc<AtomicU64>,
 }
 
 impl TaskTool {
@@ -70,7 +83,15 @@ impl TaskTool {
             parent_cancel,
             tool_factory,
             depth,
+            progress: None,
+            seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 接上宿主的事件通道：子 agent 的进度会以 `UiEvent::AgentProgress` 发出去。
+    pub fn with_progress(mut self, tx: tokio::sync::mpsc::UnboundedSender<UiEvent>) -> Self {
+        self.progress = Some(tx);
+        self
     }
 }
 
@@ -81,38 +102,47 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &str {
-        "派生隔离子 agent 执行定义明确的子任务。子 agent 有独立上下文、独立工具池，\
-         完成后返回最终结论。\n\n\
-         参数：\n\
-         - prompt：单个任务字符串\n\
-         - prompts：任务字符串数组（并发派生 N 个子 agent，返回各自结果汇总）\n\
-         - tools：子 agent 可用工具白名单（如 [\"read_file\",\"grep\"]）；缺省=全开\n\
-         - fork_messages：复制父上下文最近 N 条消息给子 agent\n\n\
-         适合：大范围搜索/调研、独立可并行的探索性工作、避免污染主上下文的长链路任务。"
+        "派生多个隔离子 agent 并行完成任务。每个子 agent 有独立的上下文与完整的工具池，\
+         自己读文件、跑命令，最后只把结论交回来 —— 主对话不必装下它们翻过的东西。\n\n\
+         什么时候用：\n\
+         - 好几个互不依赖的调研 / 搜索 / 改造可以同时做（一次 tasks 里全给它们）；\n\
+         - 某件事要翻很多文件、试很多次，过程对主对话没用，只要结论。\n\
+         什么时候别用：几件事有先后依赖（那就一件一件做，或者自己直接做）。\n\n\
+         每个子任务的 prompt 要**自包含**：它看不到主对话，不知道你们刚聊过什么。\
+         把需要的路径、约定、输出格式写清楚。"
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "description": { "type": "string", "description": "子任务的简短描述（3-5 词）" },
-                "prompt": { "type": "string", "description": "单个子任务的完整自包含指令（与 prompts 二选一）" },
-                "prompts": {
+                "tasks": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "多个子任务的并发数组形式（与 prompt 二选一）。每个子 agent 独立运行，结果按数组顺序合并返回。"
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "type": "string",
+                                "description": "这一行的短标题（几字，显示在界面上）"
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "完整、自包含的指令：要看哪些文件、做什么、最后输出什么"
+                            }
+                        },
+                        "required": ["description", "prompt"]
+                    },
+                    "description": "要并行跑的子任务。只有一个时也用它。"
                 },
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "子 agent 可用工具白名单。缺省继承全部内置 + MCP 工具（task 自身不会被传入，防递归）。"
-                },
-                "fork_messages": {
-                    "type": "integer",
-                    "description": "复制父上下文最近 N 条消息给子 agent 作为开局上下文（缺省 0=纯净起步）。"
+                    "description": "子 agent 可用的工具白名单（如 [\"read_file\",\"grep\"]）。缺省 = 全部。"
                 }
             },
-            "required": ["description"]
+            "required": ["tasks"]
         })
     }
 
@@ -129,111 +159,169 @@ impl Tool for TaskTool {
             ));
         }
 
-        // 解析 prompt(s)：要么单个 prompt，要么多个 prompts。
-        let prompts: Vec<String> = if let Some(arr) = args.get("prompts").and_then(Value::as_array)
-        {
-            let mut out = Vec::new();
-            for p in arr {
-                match p.as_str() {
-                    Some(s) if !s.is_empty() => out.push(s.to_string()),
-                    _ => {
-                        return ToolResult::err("prompts array contains non-string or empty entry");
-                    }
-                }
-            }
-            if out.is_empty() {
-                return ToolResult::err("prompts array is empty");
-            }
-            out
-        } else {
-            match args.get("prompt").and_then(Value::as_str) {
-                Some(p) if !p.is_empty() => vec![p.to_string()],
-                _ => {
-                    return ToolResult::err(
-                        "missing argument: pass `prompt` (string) or `prompts` (array)",
-                    );
-                }
-            }
+        let tasks = match parse_tasks(&args) {
+            Ok(t) => t,
+            Err(e) => return e,
         };
-
-        // 工具白名单（None = 全开）。
-        let whitelist: Option<Vec<String>> =
-            args.get("tools").and_then(Value::as_array).map(|arr| {
-                arr.iter()
+        // 白名单按名字过滤；空数组视为不限制（模型偶尔会传 [] 表示「默认」）。
+        let whitelist: Option<Vec<String>> = args
+            .get("tools")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                a.iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
                     .collect()
             });
+        let tools: Vec<Arc<dyn Tool>> = match &whitelist {
+            Some(wl) => (self.tool_factory)()
+                .into_iter()
+                .filter(|t| wl.iter().any(|n| n == t.name()))
+                .collect(),
+            None => (self.tool_factory)(),
+        };
+        // 白名单是模型自己写的，写错名字时静默跑一个没工具的子 agent 最难查。
+        // 主工具池本身为空（紧凑模式之类）不算错 —— 纯推理的子任务照样能跑。
+        if whitelist.is_some() && tools.is_empty() {
+            return ToolResult::err("tools 白名单里的工具一个都不存在，子 agent 无事可做");
+        }
 
-        // fork_messages：在 v1 中预留参数但不实现（主 agent 仍可手动复制需要的上下文到 prompt 里）。
-        // 真做需要打通 TaskTool ↔ 父 thread 的引用，会让 ToolRegistry 持有共享可变状态，
-        // 与"工具是无状态的"设计冲突。先标记为 unused、保留接口。
-        let _fork_n = args
-            .get("fork_messages")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        // 界面那张卡片按这个编号配对；不在 `run_turn` 派发里时现编一个。
+        let call_id = crate::agent::current_call_id()
+            .unwrap_or_else(|| format!("task{}", self.seq.fetch_add(1, Ordering::Relaxed)));
 
-        // 跑所有子 agent —— 串行 or 并发。
-        // 因 TaskTool 持 `&self`，每次派生都重建 thread/tools/cancel，无共享可变状态，可安全并发。
+        let runs: Arc<Mutex<Vec<AgentRun>>> = Arc::new(Mutex::new(
+            tasks
+                .iter()
+                .map(|t| AgentRun {
+                    description: t.description.clone(),
+                    status: "running".into(),
+                    steps: 0,
+                    tool: None,
+                    text: String::new(),
+                })
+                .collect(),
+        ));
+        let publish = |runs: &Arc<Mutex<Vec<AgentRun>>>| {
+            if let Some(tx) = &self.progress {
+                let agents = runs.lock().map(|v| v.clone()).unwrap_or_default();
+                let _ = tx.send(UiEvent::AgentProgress {
+                    call_id: call_id.clone(),
+                    agents,
+                });
+            }
+        };
+        publish(&runs);
+
         // 子 agent 的请求挂在父会话下（各自再带一个 agent id 单独成线）。
         // 必须在 spawn 之前取：任务局部变量不会跟进新任务。
         let session_id = crate::agent::current_session_id();
-        let mut handles = Vec::with_capacity(prompts.len());
-        for (i, prompt) in prompts.iter().enumerate() {
-            let prompt = prompt.clone();
+        let count = tasks.len();
+        // `self` 的生命周期不进 spawn：要用的几样先拷出来。
+        let parent_cancel = self.parent_cancel.clone();
+        let child_depth = self.depth + 1;
+        let base_system = self.base_system.clone();
+        let progress = self.progress.clone();
+        let mut handles = Vec::with_capacity(count);
+        for (i, task) in tasks.into_iter().enumerate() {
             let provider = self.provider.clone();
             let model = self.model.clone();
-            let base_system = self.base_system.clone();
-            let parent_cancel = self.parent_cancel.clone();
-            let factory = self.tool_factory.clone();
-            let agent_cfg = self.agent_cfg.clone();
-            let whitelist = whitelist.clone();
-            let child_depth = self.depth + 1;
+            let mut cfg = self.agent_cfg.clone();
+            cfg.max_turns = SUBAGENT_MAX_TURNS;
+            let mut system = base_system.clone();
+            // 子 agent 看不到主对话，得先知道自己是谁、在哪 —— 补一句，也免得它
+            // 以为「刚才说的那几个文件」还在上下文里。
+            system.push_str(
+                "\n\n## 当前身份\n\n\
+                 你是一个被派出来的子 agent。你看不到主对话的历史，只有下面这一段任务。\
+                 做完就停，最后一条消息要能直接当作结论交回去（写清做了什么、看到了什么、\
+                 还差什么），不要问问题 —— 没有人能回答你。",
+            );
+            let tools = tools.clone();
+            let runs = runs.clone();
+            let progress = progress.clone();
+            let parent_cancel = parent_cancel.clone();
+            let call_id = call_id.clone();
             let session_id = session_id.clone();
             handles.push(tokio::spawn(async move {
-                let res = spawn_one(
-                    prompt,
+                let mut sink = ProgressSink {
+                    runs: runs.clone(),
+                    index: i,
+                    progress,
+                    call_id,
+                    steps: 0,
+                    buf: String::new(),
+                    last: String::new(),
+                    last_emit: Instant::now() - PROGRESS_GAP,
+                };
+                let out = spawn_one(
+                    task.prompt.clone(),
                     session_id,
                     Vec::new(),
                     provider,
                     model,
-                    agent_cfg,
-                    base_system,
-                    parent_cancel,
-                    factory,
-                    whitelist,
+                    cfg,
+                    system,
+                    parent_cancel.clone(),
+                    Arc::new(move || tools.clone()),
+                    None,
                     child_depth,
+                    &mut sink,
                 )
                 .await;
-                (i, res)
+                // 收尾状态写回表里 —— 失败与中断的也要能看出来，而不是一直转圈。
+                let (status, text) = match &out {
+                    Ok(t) => ("done", ProgressSink::tail_static(t)),
+                    Err(e) => (
+                        if e.contains("cancelled") || e.contains("中断") {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        },
+                        ProgressSink::tail_static(e),
+                    ),
+                };
+                sink.set(|run| {
+                    run.status = status.into();
+                    run.tool = None;
+                    if !text.is_empty() {
+                        run.text = text;
+                    }
+                });
+                (i, out)
             }));
         }
 
-        // 收集结果，按原顺序排序。
-        let mut results: Vec<(usize, Result<String, String>)> = Vec::with_capacity(prompts.len());
+        let mut results: Vec<(usize, Result<String, String>)> = Vec::with_capacity(count);
         for h in handles {
             match h.await {
-                Ok((i, r)) => results.push((i, r)),
+                Ok(v) => results.push(v),
                 Err(e) => results.push((usize::MAX, Err(format!("subagent join error: {e}")))),
             }
         }
         results.sort_by_key(|(i, _)| *i);
+        publish(&runs);
 
-        // 单子任务：原样回结果（保持向后兼容）。
+        // 单个子任务：原样回结果（保持旧契约 —— 多套一层标题只是噪音）。
         if results.len() == 1 {
-            return match results.pop().unwrap().1 {
+            return match results.pop().expect("len == 1").1 {
                 Ok(text) => ToolResult::ok(text),
                 Err(msg) => ToolResult::err(msg),
             };
         }
 
-        // 多子任务：合并结果，每段加 `--- subagent N ---` 分隔。
         let mut combined = String::new();
         let mut any_err = false;
         for (i, r) in results {
             if !combined.is_empty() {
                 combined.push_str("\n\n");
             }
-            combined.push_str(&format!("--- subagent {} ---\n", i + 1));
+            let label = runs
+                .lock()
+                .ok()
+                .and_then(|v| v.get(i).map(|a| a.description.clone()))
+                .unwrap_or_else(|| format!("子任务 {}", i + 1));
+            combined.push_str(&format!("--- subagent {}：{label} ---\n", i + 1));
             match r {
                 Ok(text) => combined.push_str(&text),
                 Err(msg) => {
@@ -246,6 +334,190 @@ impl Tool for TaskTool {
             ToolResult::err(combined)
         } else {
             ToolResult::ok(combined)
+        }
+    }
+}
+
+/// 一个子任务的入口参数。
+#[derive(Debug)]
+struct Task {
+    description: String,
+    prompt: String,
+}
+
+fn parse_tasks(args: &Value) -> Result<Vec<Task>, ToolResult> {
+    // 新形态：tasks: [{description, prompt}]
+    if let Some(arr) = args.get("tasks").and_then(Value::as_array) {
+        if arr.is_empty() {
+            return Err(ToolResult::err("tasks 是空的，至少要一个子任务"));
+        }
+        if arr.len() > 8 {
+            return Err(ToolResult::err(format!(
+                "一次最多派生 8 个子 agent（收到 {} 个）。拆成几轮，或者把相近的合成一个",
+                arr.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, t) in arr.iter().enumerate() {
+            let prompt = t.get("prompt").and_then(Value::as_str).unwrap_or("");
+            if prompt.trim().is_empty() {
+                return Err(ToolResult::err(format!("第 {} 个子任务没有 prompt", i + 1)));
+            }
+            let description = t
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("子任务 {}", i + 1));
+            out.push(Task {
+                description,
+                prompt: prompt.to_string(),
+            });
+        }
+        return Ok(out);
+    }
+
+    // 旧形态：prompt / prompts（兼容已经这么写的模型与调用方）。
+    let prompts: Vec<String> = if let Some(arr) = args.get("prompts").and_then(Value::as_array) {
+        let mut out = Vec::new();
+        for p in arr {
+            match p.as_str() {
+                Some(s) if !s.is_empty() => out.push(s.to_string()),
+                _ => return Err(ToolResult::err("prompts 里有非字符串或空字符串")),
+            }
+        }
+        if out.is_empty() {
+            return Err(ToolResult::err("prompts 是空的"));
+        }
+        out
+    } else {
+        match args.get("prompt").and_then(Value::as_str) {
+            Some(p) if !p.is_empty() => vec![p.to_string()],
+            _ => {
+                return Err(ToolResult::err(
+                    "缺少 tasks：传 `tasks: [{ \"description\": \"…\", \"prompt\": \"…\" }]`（一个也行）",
+                ));
+            }
+        }
+    };
+    let fallback = args
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok(prompts
+        .into_iter()
+        .enumerate()
+        .map(|(i, prompt)| Task {
+            description: match (&fallback, i) {
+                (Some(d), 0) => d.clone(),
+                _ => format!("子任务 {}", i + 1),
+            },
+            prompt,
+        })
+        .collect())
+}
+
+/// 把子 agent 的动态写进共享槽位，并节流地推事件。
+struct ProgressSink {
+    runs: Arc<Mutex<Vec<AgentRun>>>,
+    index: usize,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+    call_id: String,
+    steps: u32,
+    buf: String,
+    last: String,
+    last_emit: Instant,
+}
+
+impl ProgressSink {
+    /// 推一次整表快照。
+    fn publish(&self) {
+        if let Some(tx) = &self.progress {
+            let agents = self.runs.lock().map(|v| v.clone()).unwrap_or_default();
+            let _ = tx.send(UiEvent::AgentProgress {
+                call_id: self.call_id.clone(),
+                agents,
+            });
+        }
+    }
+
+    /// 改一行，立刻推（工具切换、收尾这类关键节点不值得省）。
+    fn set(&mut self, f: impl FnOnce(&mut AgentRun)) {
+        if let Ok(mut v) = self.runs.lock()
+            && let Some(run) = v.get_mut(self.index)
+        {
+            f(run);
+        }
+        self.publish();
+    }
+
+    /// 改一行，但最多每 [`PROGRESS_GAP`] 推一次（文本增量走这里）。
+    fn maybe(&mut self, f: impl FnOnce(&mut AgentRun)) {
+        if let Ok(mut v) = self.runs.lock()
+            && let Some(run) = v.get_mut(self.index)
+        {
+            f(run);
+        }
+        if self.last_emit.elapsed() >= PROGRESS_GAP {
+            self.last_emit = Instant::now();
+            self.publish();
+        }
+    }
+
+    /// 最终文本：优先已收尾的 last，否则当前 buf（无 End 事件兜底）。
+    fn final_text(&self) -> String {
+        if !self.last.is_empty() {
+            self.last.clone()
+        } else {
+            self.buf.clone()
+        }
+    }
+
+    fn tail_static(text: &str) -> String {
+        if text.len() <= PROGRESS_TAIL {
+            return text.to_string();
+        }
+        let mut start = text.len() - PROGRESS_TAIL;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("…{}", &text[start..])
+    }
+}
+
+impl UiSink for ProgressSink {
+    fn emit(&mut self, ev: UiEvent) {
+        match ev {
+            UiEvent::AssistantTextDelta(t) => {
+                self.buf.push_str(&t);
+                let tail = Self::tail_static(&self.buf);
+                self.maybe(|run| {
+                    run.text = tail;
+                });
+            }
+            UiEvent::AssistantTextEnd if !self.buf.is_empty() => {
+                self.last = std::mem::take(&mut self.buf);
+                let tail = Self::tail_static(&self.last);
+                self.set(|run| run.text = tail);
+            }
+            UiEvent::ToolCallStarted { name, .. } => {
+                self.steps += 1;
+                let steps = self.steps;
+                self.set(|run| {
+                    run.steps = steps;
+                    run.tool = Some(name);
+                });
+            }
+            UiEvent::ToolResult { .. } => {
+                self.set(|run| run.tool = None);
+            }
+            UiEvent::Notice(n) => {
+                let tail = Self::tail_static(&n);
+                self.set(|run| run.text = tail);
+            }
+            _ => {}
         }
     }
 }
@@ -264,6 +536,7 @@ async fn spawn_one(
     factory: ToolFactory,
     whitelist: Option<Vec<String>>,
     child_depth: u32,
+    sink: &mut ProgressSink,
 ) -> Result<String, String> {
     // 子 cancel：独立 token；起一个监视任务把父取消传播到子（单向）。
     let child_cancel = CancelToken::new();
@@ -308,7 +581,6 @@ async fn spawn_one(
         thread.messages.push(m);
     }
     thread.messages.push(WireMessage::user_text(prompt));
-    let mut sink = CollectSink::default();
 
     let result = run_turn(
         &mut thread,
@@ -317,7 +589,7 @@ async fn spawn_one(
         &cfg,
         &run_opts,
         &tools,
-        &mut sink,
+        sink,
         &child_cancel,
     )
     .await;
@@ -338,67 +610,11 @@ async fn spawn_one(
     }
 }
 
-/// 丢弃式 sink：只攒最后一个完整 assistant 文本块，其余事件忽略。
-#[derive(Default)]
-struct CollectSink {
-    buf: String,
-    last: String,
-}
-
-impl CollectSink {
-    /// 最终文本：优先已收尾的 last，否则当前 buf（无 End 事件兜底）。
-    fn final_text(&self) -> String {
-        if !self.last.is_empty() {
-            self.last.clone()
-        } else {
-            self.buf.clone()
-        }
-    }
-}
-
-impl UiSink for CollectSink {
-    fn emit(&mut self, ev: UiEvent) {
-        match ev {
-            UiEvent::AssistantTextDelta(t) => self.buf.push_str(&t),
-            UiEvent::AssistantTextEnd => {
-                if !self.buf.is_empty() {
-                    self.last = std::mem::take(&mut self.buf);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::{ChatRequest, EventStream, FinishReason, StreamChunk};
     use crate::registry::{Pricing, ReasoningEffort};
-
-    #[test]
-    fn collect_sink_keeps_last_block() {
-        let mut s = CollectSink::default();
-        s.emit(UiEvent::AssistantTextDelta("hello ".into()));
-        s.emit(UiEvent::AssistantTextDelta("world".into()));
-        s.emit(UiEvent::AssistantTextEnd);
-        assert_eq!(s.final_text(), "hello world");
-    }
-
-    #[test]
-    fn collect_sink_falls_back_to_buf_without_end() {
-        let mut s = CollectSink::default();
-        s.emit(UiEvent::AssistantTextDelta("partial".into()));
-        assert_eq!(s.final_text(), "partial");
-    }
-
-    #[test]
-    fn collect_sink_ignores_other_events() {
-        let mut s = CollectSink::default();
-        s.emit(UiEvent::ThinkingDelta("hmm".into()));
-        s.emit(UiEvent::Notice("note".into()));
-        assert_eq!(s.final_text(), "");
-    }
 
     /// 假 provider：每次 stream 都直接返回一段固定文本 + EndTurn，无 tool 调用。
     struct FixedProvider(String);
@@ -453,7 +669,6 @@ mod tests {
         }
     }
 
-    /// 并行派出的子 agent：都挂在父会话下，各自的 agent id 不同。
     #[tokio::test]
     async fn parallel_subagents_share_session_but_not_agent_id() {
         let rec = Arc::new(MetaRecorder::default());

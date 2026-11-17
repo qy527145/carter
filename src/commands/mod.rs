@@ -82,6 +82,14 @@ pub const BUILTINS: &[Builtin] = &[
         description: "撤销文件改动（回滚到某检查点之前）",
     },
     Builtin {
+        name: "goal",
+        description: "设定 / 查看长任务目标，未完成时自动接着推",
+    },
+    Builtin {
+        name: "btw",
+        description: "侧边问一句：带着主对话的上下文，但不动它的任务",
+    },
+    Builtin {
         name: "skills",
         description: "列出可用 skills",
     },

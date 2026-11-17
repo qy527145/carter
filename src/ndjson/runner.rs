@@ -112,6 +112,8 @@ pub async fn run_ndjson(
             Some(ui_tx.clone()),
             Some(agent_shells.clone()),
             Some(cwd.clone()),
+            // NDJSON 由 host 驱动；自动继续是交互式 REPL 的行为，这里不挂 `goal_update`。
+            None,
         );
 
         // SessionStart hook。
@@ -244,8 +246,13 @@ pub async fn run_ndjson(
             let _ = agent_task.await;
         }
         _ = async {
-            // 把 ui_rx 中残留事件吃干（防 channel 关闭前丢事件）。
-            while ui_rx.recv().await.is_some() {}
+            // `ui_tx` 这条通道走的是工具自己发的事件：`ask_user_question` 的表单、
+            // `task` 的子 agent 进度。它们不经过 agent 任务里的 sink，这里转发给 host。
+            let mut relay = NdjsonSink::new(asks.clone());
+            while let Some(ev) = ui_rx.recv().await {
+                use crate::agent::UiSink as _;
+                relay.emit(ev);
+            }
         } => {}
     }
     reader_task.abort();
