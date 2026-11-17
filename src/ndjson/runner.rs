@@ -41,7 +41,12 @@ pub async fn run_ndjson(
     // 通道 & 共享状态。
     let (ui_tx, mut ui_rx) = unbounded_channel::<crate::agent::UiEvent>();
     let (input_tx, mut input_rx) = unbounded_channel::<String>();
+    // 插话队列：host 在一轮进行中发来的 user_prompt，交给那一轮的下一次请求。
+    let steer = crate::agent::SteerInbox::new();
+    let agent_steer = steer.clone();
     let cancel = CancelToken::new();
+    // 后台命令表：一个 NDJSON 会话一份。
+    let shells = crate::tools::BackgroundShells::new();
     let asks: super::sink::PendingAsks = Arc::new(Mutex::new(HashMap::new()));
 
     // 1. 提前 Ready 事件 —— 让 host 知道 carter 已就绪。
@@ -64,11 +69,22 @@ pub async fn run_ndjson(
     let reader_input_tx = input_tx.clone();
     let reader_cancel = cancel.clone();
     let reader_asks = asks.clone();
+    let reader_steer = steer.clone();
     let reader_task = tokio::spawn(async move {
-        super::reader::run_stdin_reader(reader_input_tx, reader_cancel, reader_asks, stop_tx).await;
+        super::reader::run_stdin_reader(
+            reader_input_tx,
+            reader_steer,
+            reader_cancel,
+            reader_asks,
+            stop_tx,
+        )
+        .await;
     });
 
     // 4. 启动 agent 任务（与 TUI 同款的 while-let 循环）。
+    let agent_shells = shells.clone();
+    // 插话没被取走时退回输入队列；那份 sender 归任务，外层留一个用于退出。
+    let agent_input_tx = input_tx.clone();
     let agent_cancel = cancel.clone();
     let agent_asks = asks.clone();
     let agent_task = tokio::spawn(async move {
@@ -82,7 +98,7 @@ pub async fn run_ndjson(
             }),
             hooks: agent_hooks.clone(),
             purpose: crate::provider::RequestPurpose::MainTurn,
-            steer: None,
+            steer: Some(agent_steer.clone()),
         };
 
         let tools = crate::agent::build_tools(
@@ -94,6 +110,8 @@ pub async fn run_ndjson(
             agent_cancel.clone(),
             mcp_tools,
             Some(ui_tx.clone()),
+            Some(agent_shells.clone()),
+            Some(cwd.clone()),
         );
 
         // SessionStart hook。
@@ -120,6 +138,8 @@ pub async fn run_ndjson(
         }
 
         let mut session_usage = crate::provider::Usage::default();
+        // 后台命令结束时的通知：取正文追进历史，再跑一轮。
+        let mut shell_done = agent_shells.subscribe();
         while let Some(prompt) = input_rx.recv().await {
             // 跨会话输入历史也记录（让 carter sessions ↑↓ 列表可用）。
             crate::session::history::append(&session_meta.id, &prompt);
@@ -138,7 +158,9 @@ pub async fn run_ndjson(
             };
             thread.append_user(prompt);
 
-            if let Ok((_, usage)) = run_turn(
+            // 这一轮进行中 host 发来的 user_prompt 走插话；跑完关门。
+            agent_steer.set_open(true);
+            let result = run_turn(
                 &mut thread,
                 &*provider,
                 &model,
@@ -148,9 +170,42 @@ pub async fn run_ndjson(
                 &mut sink,
                 &agent_cancel,
             )
-            .await
-            {
+            .await;
+            agent_steer.set_open(false);
+            if let Ok((_, usage)) = result {
                 session_usage.add(&usage);
+            }
+            // 没被取走的插话退回输入队列，按下一轮正常跑。
+            for text in agent_steer.drain() {
+                let raw = text
+                    .strip_prefix(crate::agent::STEER_HEAD)
+                    .map(|s| s.trim_start_matches('\n').to_string())
+                    .unwrap_or(text);
+                if agent_input_tx.send(raw).is_err() {
+                    break;
+                }
+            }
+            // 这一轮启动的后台命令跑完了：完成通知作为一条 user 消息追进历史再跑一轮。
+            while let Ok(id) = shell_done.try_recv() {
+                if let Some(text) = agent_shells.completion(&id) {
+                    thread.append_user(text);
+                    agent_steer.set_open(true);
+                    let result = run_turn(
+                        &mut thread,
+                        &*provider,
+                        &model,
+                        &config.agent,
+                        &run_opts,
+                        &tools,
+                        &mut sink,
+                        &agent_cancel,
+                    )
+                    .await;
+                    agent_steer.set_open(false);
+                    if let Ok((_, usage)) = result {
+                        session_usage.add(&usage);
+                    }
+                }
             }
             sink.emit(crate::agent::UiEvent::Idle);
         }

@@ -2,6 +2,7 @@
 //! 纪律：本模块**不得** import `genai::*`，只依赖 std/tokio/serde_json。
 //! 工具规格经 `provider::ToolSpec` 下发给模型，结果以 `ToolResult` 结构化回灌。
 
+mod background;
 mod bash;
 mod edit_file;
 mod glob_tool;
@@ -17,6 +18,12 @@ use serde_json::Value;
 
 use crate::provider::ToolSpec;
 
+pub use background::{
+    AdoptedShell, BackgroundShells, BashOutputTool, DONE_MARK, KillShellTool, RunningShell,
+    ShellStatus, follow_up, kill_process_tree,
+};
+pub use bash::{CommandControl, ControlLookup, PlatformBash, ShellCwd};
+pub use grep::EmbeddedGrep;
 pub use save_memory::SaveMemory;
 pub use todo_write::{TodoItem, TodoStatus, parse_todos};
 
@@ -84,9 +91,22 @@ impl ToolRegistry {
                 Arc::new(read_file::ReadFile),
                 Arc::new(write_file::WriteFile),
                 Arc::new(edit_file::EditFile),
-                Arc::new(bash::Bash),
+                // 跨平台 shell 探测 + `cd` 跟随 + 后台执行。真正的实例由宿主的
+                // `build_tools` 换掉（它需要取消令牌与后台命令表）；这里是「裸」的一份，
+                // 只用于子 agent 快照与展示。
+                Arc::new(bash::PlatformBash::new(
+                    bash::ShellCwd::new(
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    ),
+                    crate::agent::CancelToken::new(),
+                    None,
+                    "",
+                )),
                 Arc::new(glob_tool::Glob),
-                Arc::new(grep::Grep),
+                // 内置 ripgrep 引擎：不要求用户机器上装了 `rg`。
+                Arc::new(grep::EmbeddedGrep::new(
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                )),
                 Arc::new(todo_write::TodoWrite),
                 Arc::new(save_memory::SaveMemory::in_process_cwd()),
             ],

@@ -59,6 +59,12 @@ pub struct AgentConfig {
     pub compact_threshold_ratio: f64,
     /// 子代理链最大深度（主 agent = 0，每层 +1）。缺省 3。
     pub subagent_max_depth: Option<u32>,
+    /// 不注册给模型的本地工具名（如 `["bash", "write_file"]`）。缺省空 = 全部启用。
+    ///
+    /// 放在这里而不是各宿主自己的设置里：CLI 与 GUI 宿主是同一套工具池，
+    /// 开关的语义也就该是同一份 —— 宿主再各自过滤一遍，两边迟早对不上。
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -311,6 +317,7 @@ impl Default for AgentConfig {
             compact_enabled: true,
             compact_threshold_ratio: 0.75,
             subagent_max_depth: None,
+            disabled_tools: Vec::new(),
         }
     }
 }

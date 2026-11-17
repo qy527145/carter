@@ -147,12 +147,26 @@ struct CompletionState {
     selected: usize,
 }
 
-/// 当前等待用户回答的 AskUser 问题（None = 无）。
+/// 当前等待用户回答的问题表单（None = 无）。
+///
+/// 逐题作答：数字键选当前题的选项（多选可反复切换）、Enter 进入下一题、Esc 跳过当前题。
+/// 题目本身是模型一次提交的一组，答案也一次性交回。
 struct PendingAsk {
     #[allow(dead_code)] // id 仅用于将来 dedup / 日志
     id: u64,
-    options: Vec<String>,
-    response_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    questions: Vec<crate::agent::AskQuestion>,
+    /// 与 `questions` 同长，逐题累积。
+    answers: Vec<Vec<String>>,
+    /// 正在作答第几题。
+    cursor: usize,
+    response_tx:
+        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<Vec<String>>>>>>,
+}
+
+impl PendingAsk {
+    fn current(&self) -> Option<&crate::agent::AskQuestion> {
+        self.questions.get(self.cursor)
+    }
 }
 
 /// 状态栏累计数据。
@@ -337,25 +351,49 @@ impl App {
             }
             UiEvent::AskUser {
                 id,
-                question,
-                options,
+                questions,
                 response_tx,
             } => {
-                // 把问题作为提示进 outbox 让用户看到；同时进入 ask 模式：键盘 1-9 选项 / Esc 取消。
+                // 整组问题一次列出来让用户看到；键盘逐题作答（见 `PendingAsk`）。
                 self.flush_pending();
-                self.outbox.push(Block_::Notice(format!("❓ {question}")));
-                for (i, opt) in options.iter().enumerate() {
-                    self.outbox
-                        .push(Block_::Notice(format!("  {}. {opt}", i + 1)));
+                let count = questions.len();
+                self.outbox.push(Block_::Notice(if count == 1 {
+                    "❓ 模型有一个问题".into()
+                } else {
+                    format!("❓ 模型有 {count} 个问题")
+                }));
+                for (qi, q) in questions.iter().enumerate() {
+                    let head = q.header.as_deref().unwrap_or("");
+                    self.outbox.push(Block_::Notice(if head.is_empty() {
+                        format!("{}. {}", qi + 1, q.question)
+                    } else {
+                        format!("{}. [{}] {}", qi + 1, head, q.question)
+                    }));
+                    for (i, opt) in q.options.iter().enumerate() {
+                        let note = opt
+                            .description
+                            .as_deref()
+                            .map(|d| format!(" — {d}"))
+                            .unwrap_or_default();
+                        self.outbox.push(Block_::Notice(format!(
+                            "     {}. {}{note}",
+                            i + 1,
+                            opt.label
+                        )));
+                    }
                 }
                 self.outbox.push(Block_::Notice(
-                    "(按数字键选择，或直接输入答案后回车提交，Esc 跳过 = 选第一项)".into(),
+                    "(数字↑↓选当前题 · 多选可反复按 · Enter 下一题 · Esc 跳过 · 直接输入文字后回车作答)"
+                        .into(),
                 ));
                 self.pending_ask = Some(PendingAsk {
                     id,
-                    options,
+                    answers: vec![Vec::new(); count],
+                    questions,
+                    cursor: 0,
                     response_tx,
                 });
+                self.ask_prompt_current();
             }
             UiEvent::TurnUsage {
                 usage,
@@ -425,6 +463,94 @@ impl App {
     fn push_user(&mut self, text: String) {
         self.flush_pending();
         self.outbox.push(Block_::User(text));
+    }
+
+    // ---- 问题表单的逐题作答 ----
+
+    /// 把「正在作答第几题」提示出来。
+    fn ask_prompt_current(&mut self) {
+        let Some(ask) = &self.pending_ask else {
+            return;
+        };
+        let n = ask.questions.len();
+        let i = ask.cursor;
+        let multi = ask.current().is_some_and(|q| q.multi_select);
+        let picked = ask.answers.get(i).map(|a| a.len()).unwrap_or(0);
+        let tail = if multi {
+            format!("（多选，已选 {picked} 项，回车确认）")
+        } else {
+            String::new()
+        };
+        let msg = if n == 1 {
+            format!("→ 请作答{tail}")
+        } else {
+            format!("→ 第 {}/{} 题{tail}", i + 1, n)
+        };
+        self.outbox.push(Block_::Notice(msg));
+    }
+
+    /// 选当前题的第 `idx` 个选项。单选直接记下并进下一题；多选切换选中状态。
+    fn ask_select(&mut self, idx: usize) {
+        let Some(ask) = &mut self.pending_ask else {
+            return;
+        };
+        let Some(q) = ask.current() else { return };
+        let Some(opt) = q.options.get(idx).cloned() else {
+            return;
+        };
+        let multi = q.multi_select;
+        let slot = &mut ask.answers[ask.cursor];
+        if multi {
+            let label = opt.label.clone();
+            if let Some(pos) = slot.iter().position(|l| *l == label) {
+                slot.remove(pos);
+            } else {
+                slot.push(label);
+            }
+        } else {
+            *slot = vec![opt.label.clone()];
+        }
+        self.outbox
+            .push(Block_::Notice(format!("   已选：{}", opt.label)));
+        if !multi {
+            self.ask_advance();
+        }
+    }
+
+    /// 用一段自由文字回答当前题，然后进下一题。
+    fn ask_answer_text(&mut self, text: String) {
+        let Some(ask) = &mut self.pending_ask else {
+            return;
+        };
+        if !text.trim().is_empty() {
+            ask.answers[ask.cursor] = vec![text];
+        }
+        self.ask_advance();
+    }
+
+    /// 当前题结束：还有下一题就继续问，否则整组交回。
+    fn ask_advance(&mut self) {
+        let Some(ask) = &mut self.pending_ask else {
+            return;
+        };
+        if ask.cursor + 1 < ask.questions.len() {
+            ask.cursor += 1;
+            self.ask_prompt_current();
+        } else {
+            self.ask_finish();
+        }
+    }
+
+    /// 整组作答结束（或被中途跳过）：把答案一次交回，退出表单态。
+    fn ask_finish(&mut self) {
+        let Some(ask) = self.pending_ask.take() else {
+            return;
+        };
+        if let Ok(mut guard) = ask.response_tx.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(ask.answers);
+            }
+        }
     }
 
     // ---- 输入行编辑（cursor 为 char 边界的字节偏移）----
@@ -873,6 +999,8 @@ enum Action {
     None,
     /// 提交 prompt 给 agent。
     Submit(String),
+    /// 一轮进行中又提交了一句：不进队列，直接作为插话交给正在跑的那一轮。
+    Steer(String),
     /// 取消当前流式请求。
     Cancel,
     /// 优雅退出 REPL（等 agent 任务收尾）。
@@ -894,41 +1022,30 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
         app.armed_quit = false;
     }
 
-    // 待回答 AskUser 拦截：数字键直接选项 / Esc 取消（选第一项 = 缺省） / Enter 用当前输入内容作答。
+    // 待回答 AskUser 拦截：数字键选当前题的选项 / Enter 进下一题 / Esc 跳过当前题。
+    // 直接打字仍走正常输入，回车时用那段文字作答当前题。
     if app.pending_ask.is_some() {
         match key.code {
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let idx = (c as u8 - b'1') as usize;
-                let ask = app.pending_ask.take().unwrap();
-                let answer = ask.options.get(idx).cloned().unwrap_or_default();
-                if let Ok(mut guard) = ask.response_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(answer);
-                    }
-                }
+                app.ask_select((c as u8 - b'1') as usize);
                 return Action::None;
             }
             KeyCode::Esc => {
-                let ask = app.pending_ask.take().unwrap();
-                let answer = ask.options.first().cloned().unwrap_or_default();
-                if let Ok(mut guard) = ask.response_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(answer);
-                    }
-                }
+                // 跳过当前题（不是整组作废）：多问题表单里，放弃一道不该把别的答案也丢掉。
+                app.ask_advance();
                 return Action::None;
             }
             KeyCode::Enter
                 if !key.modifiers.contains(KeyModifiers::SHIFT) && !app.input.is_empty() =>
             {
-                let ask = app.pending_ask.take().unwrap();
-                let answer = std::mem::take(&mut app.input);
+                let text = std::mem::take(&mut app.input);
                 app.cursor = 0;
-                if let Ok(mut guard) = ask.response_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(answer);
-                    }
-                }
+                app.ask_answer_text(text);
+                return Action::None;
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // 空输入回车 = 接受已选项（多选即确认）并进下一题。
+                app.ask_advance();
                 return Action::None;
             }
             // 其他键正常输入（让用户能编辑自由答案）。
@@ -995,7 +1112,16 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
                 return Action::None;
             }
             if app.streaming {
-                return Action::None;
+                // 正在跑一轮：提交的内容作为**插话**交给它，下一次请求就带上。
+                // 不是排到轮末 —— 那往往等到模型已经把活干偏了。
+                let text = app.input.trim().to_string();
+                if text.is_empty() {
+                    return Action::None;
+                }
+                app.input_clear();
+                app.completion = None;
+                app.push_sent(text.clone());
+                return Action::Steer(text);
             }
             // 补全激活：Enter 先接受选中项（除非输入已精确等于该命令则直接提交）。
             if app.completion.is_some() && app.completion_accept() {
@@ -1546,6 +1672,7 @@ pub async fn run(
     cwd: std::path::PathBuf,
     mut ui_rx: UnboundedReceiver<UiEvent>,
     input_tx: UnboundedSender<String>,
+    steer: std::sync::Arc<crate::agent::SteerInbox>,
     cancel: CancelToken,
 ) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
@@ -1619,6 +1746,11 @@ pub async fn run(
                                 if input_tx.send(text).is_err() {
                                     app.should_quit = true;
                                 }
+                            }
+                            Action::Steer(text) => {
+                                // 这一轮还在跑：显示成用户气泡，正文加抬头交给那轮的下一次请求。
+                                app.push_user(text.clone());
+                                steer.push(crate::agent::wrap(&text));
                             }
                             Action::Cancel => {
                                 cancel.set();
@@ -2248,10 +2380,22 @@ mod tests {
         assert!(matches!(action, Action::Quit));
     }
 
+    /// 一轮还在跑时回车：不再被吞掉，而是变成插话交给正在跑的那一轮。
     #[test]
-    fn enter_ignored_while_streaming() {
+    fn enter_while_streaming_becomes_steer() {
         let mut app = App::new("m".into());
-        app.input = "hi".into();
+        app.input = "顺便跑一下测试".into();
+        app.streaming = true;
+        let a = handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+        assert!(matches!(a, Action::Steer(t) if t == "顺便跑一下测试"));
+        assert!(app.input.is_empty(), "提交后输入框清空");
+    }
+
+    /// 空输入不产生插话，也不清空已有状态。
+    #[test]
+    fn empty_enter_while_streaming_is_still_ignored() {
+        let mut app = App::new("m".into());
+        app.input = "   ".into();
         app.streaming = true;
         let a = handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
         assert!(matches!(a, Action::None));

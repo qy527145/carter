@@ -73,15 +73,19 @@ pub enum UiEvent {
     ToolCallStarted { name: String, args_preview: String },
     /// 工具结果（执行后）。
     ToolResult { ok: bool, summary: String },
-    /// 子 agent / 主 agent 通过 `ask_user_question` 工具向 TUI 弹出选择题。
-    /// `response_tx` 为 oneshot channel：TUI 选完把答案文本（option label 或自由输入）发回。
+    /// 子 agent / 主 agent 通过 `ask_user_question` 工具向 TUI 弹出问题表单。
+    ///
+    /// 一次可以问**一组**问题（见 [`crate::agent::ask_user`]）：一次问完比分几轮
+    /// 问好 —— 每多一轮就多一次完整的模型请求。`response_tx` 回传的是
+    /// 「第 i 个问题 → 用户选中的若干项」，与 `questions` 一一对应。
     AskUser {
         id: u64,
-        question: String,
-        options: Vec<String>,
+        questions: Vec<crate::agent::AskQuestion>,
         /// 用 Mutex<Option<...>> 包裹 oneshot Sender，因为 UiEvent 必须 Clone（多个 sink），
         /// 但 oneshot Sender 不是 Clone —— 实际只有一个 sink 应该消费 Sender。
-        response_tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        response_tx: std::sync::Arc<
+            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<Vec<String>>>>>,
+        >,
     },
     /// todo 列表更新。
     TodoUpdated(Vec<TodoItem>),
@@ -237,21 +241,40 @@ impl UiSink for StdoutSink {
             // oneshot 无 streaming 态可恢复，忽略。
             UiEvent::Idle => {}
             UiEvent::AskUser {
-                question,
-                options,
+                questions,
                 response_tx,
                 ..
             } => {
-                // oneshot 模式（无 TUI）：打印问题，并把第一个 option（缺省）发回作为答案。
-                // 让 LLM 在 oneshot 流程里不会卡死。
-                let _ = writeln!(out, "\x1b[33m[ask] {question}\x1b[0m");
-                if !options.is_empty() {
-                    let _ = writeln!(out, "\x1b[33m  options: {}\x1b[0m", options.join(" | "));
+                // oneshot 模式（无 TUI）：打印问题，每题把第一个选项（缺省）发回作为答案。
+                // 让 LLM 在 oneshot 流程里不会卡死。没有选项的题回空（= 跳过）。
+                let mut answers: Vec<Vec<String>> = Vec::with_capacity(questions.len());
+                for q in &questions {
+                    let head = q.header.as_deref().unwrap_or("");
+                    let _ = writeln!(
+                        out,
+                        "\x1b[33m[ask]{} {}\x1b[0m",
+                        if head.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {head}")
+                        },
+                        q.question
+                    );
+                    if !q.options.is_empty() {
+                        let labels: Vec<&str> =
+                            q.options.iter().map(|o| o.label.as_str()).collect();
+                        let _ = writeln!(out, "\x1b[33m  options: {}\x1b[0m", labels.join(" | "));
+                    }
+                    answers.push(
+                        q.options
+                            .first()
+                            .map(|o| vec![o.label.clone()])
+                            .unwrap_or_default(),
+                    );
                 }
-                let auto = options.first().cloned().unwrap_or_default();
                 if let Ok(mut guard) = response_tx.lock() {
                     if let Some(tx) = guard.take() {
-                        let _ = tx.send(auto);
+                        let _ = tx.send(answers);
                     }
                 }
             }

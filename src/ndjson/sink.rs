@@ -18,7 +18,8 @@ use crate::agent::ui::{UiEvent, UiSink};
 use super::protocol::{Event, WireTodo, WireUsage, to_line};
 
 /// 等待 host 回复的 AskUser 表：id → 已脱离 UiEvent 的 oneshot Sender。
-pub type PendingAsks = Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>;
+/// 回传的是「第 i 个问题 → 选中的若干项」。
+pub type PendingAsks = Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<Vec<String>>>>>>;
 
 /// 写入 stdout 的 NDJSON sink。
 pub struct NdjsonSink {
@@ -72,8 +73,7 @@ impl UiSink for NdjsonSink {
             // AskUser：抢下 oneshot Sender 存入 pending 表，发 ask_user event 给 host。
             UiEvent::AskUser {
                 id,
-                question,
-                options,
+                questions,
                 response_tx,
             } => {
                 // 提取 Sender —— UiEvent::AskUser.response_tx 是 Arc<Mutex<Option<Sender>>>，
@@ -85,11 +85,7 @@ impl UiSink for NdjsonSink {
                         }
                     }
                 }
-                Event::AskUser {
-                    id,
-                    question,
-                    options,
-                }
+                Event::AskUser { id, questions }
             }
         };
         self.write_event(&event);
@@ -135,12 +131,19 @@ mod tests {
         let asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
         let mut sink = NdjsonSink::new(asks.clone());
 
-        let (tx, _rx) = oneshot::channel::<String>();
+        let (tx, _rx) = oneshot::channel::<Vec<Vec<String>>>();
         let response_tx = Arc::new(Mutex::new(Some(tx)));
         sink.emit(UiEvent::AskUser {
             id: 99,
-            question: "ok?".into(),
-            options: vec!["yes".into()],
+            questions: vec![crate::agent::AskQuestion {
+                question: "ok?".into(),
+                header: None,
+                multi_select: false,
+                options: vec![crate::agent::AskOption {
+                    label: "yes".into(),
+                    description: None,
+                }],
+            }],
             response_tx,
         });
 
@@ -160,11 +163,24 @@ mod tests {
         let mut sink = NdjsonSink::new(asks.clone());
 
         // 模拟 AskUserQuestionTool 内部建的 oneshot：tool 端持 rx，sink 端拿 tx。
-        let (tool_tx, tool_rx) = oneshot::channel::<String>();
+        let (tool_tx, tool_rx) = oneshot::channel::<Vec<Vec<String>>>();
         sink.emit(UiEvent::AskUser {
             id: 42,
-            question: "do?".into(),
-            options: vec!["yes".into(), "no".into()],
+            questions: vec![crate::agent::AskQuestion {
+                question: "do?".into(),
+                header: None,
+                multi_select: false,
+                options: vec![
+                    crate::agent::AskOption {
+                        label: "yes".into(),
+                        description: None,
+                    },
+                    crate::agent::AskOption {
+                        label: "no".into(),
+                        description: None,
+                    },
+                ],
+            }],
             response_tx: Arc::new(Mutex::new(Some(tool_tx))),
         });
 
@@ -174,9 +190,11 @@ mod tests {
         crate::ndjson::reader::dispatch_for_test(
             Command::AskResponse {
                 id: 42,
-                answer: "yes".into(),
+                answers: Some(vec![vec!["yes".to_string()]]),
+                answer: None,
             },
             &input_tx,
+            &crate::agent::SteerInbox::new(),
             &cancel,
             &asks,
         )
@@ -184,7 +202,7 @@ mod tests {
 
         // 工具端应收到答案。
         let answer = tool_rx.await.unwrap();
-        assert_eq!(answer, "yes");
+        assert_eq!(answer, vec![vec!["yes".to_string()]]);
         // pending 表已清空。
         assert!(asks.lock().unwrap().is_empty());
     }

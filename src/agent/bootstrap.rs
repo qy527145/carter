@@ -11,7 +11,9 @@ use crate::agent::{CancelToken, TaskTool, ToolFactory, UiEvent};
 use crate::config::AgentConfig;
 use crate::provider::LlmProvider;
 use crate::registry::ModelInfo;
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::{
+    BackgroundShells, BashOutputTool, KillShellTool, PlatformBash, ShellCwd, Tool, ToolRegistry,
+};
 
 /// 组装工具注册表：内置工具 + （启用时）Skills 的 `skill` 工具 + 子 agent 的 `task` 工具
 /// + MCP server 透明并入的工具。
@@ -32,19 +34,66 @@ pub fn build_tools(
     cancel: CancelToken,
     mcp_tools: Vec<Arc<dyn Tool>>,
     ui_tx: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+    shells: Option<Arc<BackgroundShells>>,
+    cwd: Option<std::path::PathBuf>,
 ) -> ToolRegistry {
-    let mut tools = ToolRegistry::builtin();
-    if skills_enabled {
+    // 工具开关（`[agent].disabled_tools`）。在装配期就筛掉，而不是执行时回一句
+    // 「这个工具被关掉了」—— 后者模型会反复试，因为它的工具表里还看得见它。
+    // MCP 工具同样按名筛：宿主能关的名字就该一致地生效。
+    let disabled = &agent_cfg.disabled_tools;
+    let on = |name: &str| !disabled.iter().any(|d| d == name);
+
+    let cwd = cwd.unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+    // `cd` 跨调用保留：这份 `ShellCwd` 活着，同一个工具实例就能接上一条命令的目录。
+    let shell_cwd = ShellCwd::new(cwd);
+    let session_id = String::new();
+
+    let mut tools = ToolRegistry::empty();
+    for t in ToolRegistry::builtin().tools() {
+        if !on(t.name()) {
+            continue;
+        }
+        // `bash` 换成本 crate 的跨平台实现：探测 shell、跟 `cd`、能转后台。
+        // carter 里那份 `Bash` 只是占位（`builtin()` 给子 agent 快照与展示用）。
+        if t.name() == "bash" {
+            tools.push(Arc::new(PlatformBash::new(
+                shell_cwd.clone(),
+                cancel.clone(),
+                shells.clone(),
+                session_id.clone(),
+            )));
+            continue;
+        }
+        tools.push(t.clone());
+    }
+    if skills_enabled && on("skill") {
         tools.push(Arc::new(crate::skills::SkillTool::new(
             crate::config::paths::skills_dir(),
         )));
     }
-    if let Some(tx) = &ui_tx {
+    if let Some(tx) = &ui_tx
+        && on("ask_user_question")
+    {
         tools.push(Arc::new(crate::agent::AskUserQuestionTool::new(tx.clone())));
     }
+    // 后台命令的读取与结束。只有配了后台命令表才挂 —— 没有它的话，`bash` 的
+    // `run_in_background` 也无从谈起。
+    if let Some(shells) = &shells {
+        if on("bash_output") {
+            tools.push(Arc::new(BashOutputTool::new(shells.clone())));
+        }
+        if on("kill_shell") {
+            tools.push(Arc::new(KillShellTool::new(shells.clone())));
+        }
+    }
+
     // MCP 工具放进主 registry，与内置工具共用一个命名空间。
     for t in &mcp_tools {
-        tools.push(t.clone());
+        if on(t.name()) {
+            tools.push(t.clone());
+        }
     }
 
     // 子 agent 工厂：产出「主 registry 中的所有工具（去掉 task）」。

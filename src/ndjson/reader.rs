@@ -8,12 +8,10 @@
 //! 注意：`set_model` 切换模型逻辑复杂（要拿配置 + cache_json + 提供给 agent loop），
 //! 当前简化为发 Notice 提示用户改用 `--model` 启动；未来可扩展接入主循环。
 
-use std::sync::Arc;
-
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::agent::CancelToken;
+use crate::agent::{CancelToken, SteerInbox};
 
 use super::protocol::{Command, parse_line};
 use super::sink::PendingAsks;
@@ -22,6 +20,7 @@ use super::sink::PendingAsks;
 /// 返回时（EOF / 致命 IO 错误）调用 stop 句柄让上层退出。
 pub async fn run_stdin_reader(
     input_tx: UnboundedSender<String>,
+    steer: std::sync::Arc<SteerInbox>,
     cancel: CancelToken,
     asks: PendingAsks,
     stop: tokio::sync::oneshot::Sender<()>,
@@ -48,7 +47,7 @@ pub async fn run_stdin_reader(
         }
         match parse_line(&line) {
             Ok(cmd) => {
-                if let Some(should_stop) = dispatch(cmd, &input_tx, &cancel, &asks).await {
+                if let Some(should_stop) = dispatch(cmd, &input_tx, &steer, &cancel, &asks).await {
                     if should_stop {
                         let _ = stop.send(());
                         return;
@@ -73,22 +72,27 @@ pub async fn run_stdin_reader(
 pub(crate) async fn dispatch_for_test(
     cmd: Command,
     input_tx: &UnboundedSender<String>,
+    steer: &std::sync::Arc<SteerInbox>,
     cancel: &CancelToken,
     asks: &super::sink::PendingAsks,
 ) -> Option<bool> {
-    dispatch(cmd, input_tx, cancel, asks).await
+    dispatch(cmd, input_tx, steer, cancel, asks).await
 }
 
 async fn dispatch(
     cmd: Command,
     input_tx: &UnboundedSender<String>,
+    steer: &std::sync::Arc<SteerInbox>,
     cancel: &CancelToken,
-    asks: &Arc<
-        std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<String>>>,
-    >,
+    asks: &super::sink::PendingAsks,
 ) -> Option<bool> {
     match cmd {
         Command::UserPrompt { text } => {
+            // 一轮正在跑：作为插话交给它的下一次请求，不排到轮末。
+            if steer.is_open() {
+                steer.push(crate::agent::wrap(&text));
+                return Some(false);
+            }
             if input_tx.send(text).is_err() {
                 tracing::warn!("ndjson: input channel closed; stopping");
                 return Some(true);
@@ -110,14 +114,22 @@ async fn dispatch(
             });
             Some(false)
         }
-        Command::AskResponse { id, answer } => {
+        Command::AskResponse {
+            id,
+            answers,
+            answer,
+        } => {
+            // 新形态给 `answers`（与 questions 一一对应）；旧形态只有 `answer`，
+            // 整体算作第一题的回答 —— host 的老实现不用跟着改。
+            let answers =
+                answers.unwrap_or_else(|| answer.map(|a| vec![vec![a]]).unwrap_or_default());
             let mut pending = match asks.lock() {
                 Ok(p) => p,
                 Err(p) => p.into_inner(),
             };
             match pending.remove(&id) {
                 Some(tx) => {
-                    if tx.send(answer).is_err() {
+                    if tx.send(answers).is_err() {
                         tracing::warn!("ndjson: ask_response receiver dropped (id={id})");
                     }
                 }
@@ -133,6 +145,8 @@ async fn dispatch(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -142,11 +156,13 @@ mod tests {
     #[tokio::test]
     async fn user_prompt_forwards_to_input_channel() {
         let (tx, mut rx) = unbounded_channel::<String>();
+        let steer = SteerInbox::new();
         let cancel = CancelToken::new();
         let asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
         let stop = dispatch(
             Command::UserPrompt { text: "hi".into() },
             &tx,
+            &steer,
             &cancel,
             &asks,
         )
@@ -156,38 +172,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_sets_token() {
-        let (tx, _rx) = unbounded_channel::<String>();
+    async fn user_prompt_while_a_turn_runs_becomes_steer() {
+        let (tx, mut rx) = unbounded_channel::<String>();
+        let steer = SteerInbox::new();
+        steer.set_open(true);
         let cancel = CancelToken::new();
         let asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
-        dispatch(Command::Cancel, &tx, &cancel, &asks).await;
+        dispatch(
+            Command::UserPrompt {
+                text: "顺便跑测试".into(),
+            },
+            &tx,
+            &steer,
+            &cancel,
+            &asks,
+        )
+        .await;
+        // 没有进输入队列，而是排进插话（带抬头）。
+        assert!(rx.try_recv().is_err());
+        assert_eq!(steer.drain(), vec![crate::agent::wrap("顺便跑测试")]);
+    }
+
+    #[tokio::test]
+    async fn cancel_sets_token() {
+        let (tx, _rx) = unbounded_channel::<String>();
+        let steer = SteerInbox::new();
+        let cancel = CancelToken::new();
+        let asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
+        dispatch(Command::Cancel, &tx, &steer, &cancel, &asks).await;
         assert!(cancel.is_cancelled());
     }
 
     #[tokio::test]
     async fn stop_returns_true() {
         let (tx, _rx) = unbounded_channel::<String>();
+        let steer = SteerInbox::new();
         let cancel = CancelToken::new();
         let asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
-        let r = dispatch(Command::Stop, &tx, &cancel, &asks).await;
+        let r = dispatch(Command::Stop, &tx, &steer, &cancel, &asks).await;
         assert_eq!(r, Some(true));
     }
 
     #[tokio::test]
     async fn ask_response_fulfills_pending_oneshot() {
         let (tx, _rx) = unbounded_channel::<String>();
+        let steer = SteerInbox::new();
         let cancel = CancelToken::new();
         let asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
 
-        let (otx, orx) = oneshot::channel::<String>();
+        let (otx, orx) = oneshot::channel::<Vec<Vec<String>>>();
         asks.lock().unwrap().insert(7, otx);
 
         dispatch(
             Command::AskResponse {
                 id: 7,
-                answer: "yes".into(),
+                answers: Some(vec![vec!["yes".to_string()]]),
+                answer: None,
             },
             &tx,
+            &steer,
             &cancel,
             &asks,
         )
@@ -196,20 +239,23 @@ mod tests {
         // pending 表里该 id 已被消费。
         assert!(asks.lock().unwrap().is_empty());
         // oneshot 收到回复。
-        assert_eq!(orx.await.unwrap(), "yes");
+        assert_eq!(orx.await.unwrap(), vec![vec!["yes".to_string()]]);
     }
 
     #[tokio::test]
     async fn ask_response_unknown_id_is_silently_ignored() {
         let (tx, _rx) = unbounded_channel::<String>();
+        let steer = SteerInbox::new();
         let cancel = CancelToken::new();
         let asks: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
         let r = dispatch(
             Command::AskResponse {
                 id: 999,
-                answer: "y".into(),
+                answers: Some(vec![vec!["y".to_string()]]),
+                answer: None,
             },
             &tx,
+            &steer,
             &cancel,
             &asks,
         )

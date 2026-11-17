@@ -28,7 +28,17 @@ pub enum Command {
     /// 热切换模型（与 TUI `/model <ref>` 等价）。
     SetModel { model: String },
     /// 回答之前发出的 AskUser（id 必须对应）。
-    AskResponse { id: u64, answer: String },
+    ///
+    /// `answers` 与 `ask_user` 里的 `questions` 一一对应；每一项是该题选中的若干答案
+    /// （空数组 = 这道题跳过了）。`answer` 是旧的单问题形态，兼容 host 的老实现：
+    /// 只给了它时，答案整体算作第一题的回答。
+    AskResponse {
+        id: u64,
+        #[serde(default)]
+        answers: Option<Vec<Vec<String>>>,
+        #[serde(default)]
+        answer: Option<String>,
+    },
     /// 优雅退出（agent 任务收尾后 carter 进程退出）。
     Stop,
 }
@@ -66,11 +76,12 @@ pub enum Event {
     Divider { label: String },
     /// 一轮 / 斜杠命令处理结束 —— host 据此判断何时显示"输入空闲"。
     Idle,
-    /// 反向 RPC：carter 弹出选择题，host 必须用 `ask_response` 回复。
+    /// 反向 RPC：carter 弹出问题表单，host 必须用 `ask_response` 回复。
+    ///
+    /// 一次可以带多个问题（见 `agent::AskQuestion`）；host 回传同长度的 `answers`。
     AskUser {
         id: u64,
-        question: String,
-        options: Vec<String>,
+        questions: Vec<crate::agent::AskQuestion>,
     },
     /// 一轮结束的用量 + 成本。
     TurnUsage {
@@ -182,13 +193,42 @@ mod tests {
         }
     }
 
+    /// 旧的单问题形态仍然认：`answer` 整体算作第一题的回答。
     #[test]
-    fn parses_ask_response_with_id() {
+    fn parses_the_legacy_single_answer_ask_response() {
         let cmd = parse_line(r#"{"type":"ask_response","id":42,"answer":"yes"}"#).unwrap();
         match cmd {
-            Command::AskResponse { id, answer } => {
+            Command::AskResponse {
+                id,
+                answers,
+                answer,
+                ..
+            } => {
                 assert_eq!(id, 42);
-                assert_eq!(answer, "yes");
+                assert_eq!(answer.as_deref(), Some("yes"));
+                assert!(answers.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 新形态：`answers` 与 questions 一一对应。
+    #[test]
+    fn parses_multi_question_ask_response() {
+        let cmd = parse_line(
+            r#"{"type":"ask_response","id":7,"answers":[["Postgres"],["登录","导出"]]}"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::AskResponse { id, answers, .. } => {
+                assert_eq!(id, 7);
+                assert_eq!(
+                    answers.unwrap(),
+                    vec![
+                        vec!["Postgres".to_string()],
+                        vec!["登录".to_string(), "导出".to_string()]
+                    ]
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -228,8 +268,21 @@ mod tests {
     fn ask_user_carries_question_and_options() {
         let ev = Event::AskUser {
             id: 7,
-            question: "ok?".into(),
-            options: vec!["yes".into(), "no".into()],
+            questions: vec![crate::agent::AskQuestion {
+                question: "ok?".into(),
+                header: None,
+                multi_select: false,
+                options: vec![
+                    crate::agent::AskOption {
+                        label: "yes".into(),
+                        description: None,
+                    },
+                    crate::agent::AskOption {
+                        label: "no".into(),
+                        description: None,
+                    },
+                ],
+            }],
         };
         let line = to_line(&ev);
         assert!(line.contains("\"id\":7"));

@@ -484,6 +484,8 @@ async fn run_oneshot(
         cancel.clone(),
         mcp_tools,
         None, // oneshot 模式无 TUI，ask_user_question 工具不可用
+        None, // 一次性执行没有下一轮来接着做，后台命令表没有意义
+        Some(cwd.clone()),
     );
     let mut sink = StdoutSink::new();
 
@@ -549,7 +551,14 @@ async fn run_tui(
 
     let (ui_tx, ui_rx) = unbounded_channel::<crate::agent::UiEvent>();
     let (input_tx, mut input_rx) = unbounded_channel::<String>();
+    // 插话没被取走时退回队列要用：agent 任务持一份，TUI 持另一份。
+    let input_tx_for_retry = input_tx.clone();
+    // 插话队列：一轮进行中回车进来的话，交给正在跑的那一轮的下一次请求。
+    let steer = crate::agent::SteerInbox::new();
+    let agent_steer = steer.clone();
     let cancel = CancelToken::new();
+    // 后台命令表：进程级一份，活过整个 REPL。关会话 / 退出时 `kill_all` 收掉。
+    let shells = crate::tools::BackgroundShells::new();
 
     // MCP：会话级 manager 留在外层 scope（活过整个 agent 任务）；工具（持克隆 peer）移入任务。
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
@@ -640,6 +649,8 @@ async fn run_tui(
     // agent 任务：连续多轮，每轮一个 prompt → run_turn → emit 事件。
     let agent_cancel = cancel.clone();
     let agent_hooks = hooks.clone();
+    let agent_shells = shells.clone();
+    let agent_cwd = cwd.clone();
     let agent_task = tokio::spawn(async move {
         let mut thread = thread;
         // 子 agent 复用人设段（system[0]）作为其 base system。
@@ -653,7 +664,7 @@ async fn run_tui(
             }),
             hooks: agent_hooks.clone(),
             purpose: crate::provider::RequestPurpose::MainTurn,
-            steer: None,
+            steer: Some(agent_steer.clone()),
         };
         let tools = crate::agent::build_tools(
             config.skills.enabled,
@@ -664,6 +675,8 @@ async fn run_tui(
             agent_cancel.clone(),
             mcp_tools,
             Some(ui_tx.clone()), // TUI 模式：ask_user_question 工具走这个通道发 UiEvent::AskUser
+            Some(agent_shells.clone()),
+            Some(agent_cwd),
         );
         // 主模型 / provider 设为可变：会话内 `/model` 热切换会重绑它们（run_turn 每轮取最新）。
         // 注：子 agent 的 `task` 工具仍持旧 model（重建 MCP 工具代价高，列为已知限制）。
@@ -693,6 +706,9 @@ async fn run_tui(
         let mut needs_title = session_meta.title.is_none();
         // 本会话累计用量（供 /cost）。
         let mut session_usage = crate::provider::Usage::default();
+        // 后台命令自己结束时的通知：拿到 shell_id 后取正文，作为一条 user 消息
+        // 追进历史再跑一轮 —— 否则模型启动完后台命令就结束了一轮，之后没人推进。
+        let mut shell_done = agent_shells.subscribe();
         while let Some(prompt) = input_rx.recv().await {
             // 记录到跨会话输入历史（原始输入，含斜杠命令）。
             crate::session::history::append(&session_meta.id, &prompt);
@@ -773,7 +789,9 @@ async fn run_tui(
                         }
                     }
                 }
-                if let Ok((_, usage)) = run_turn(
+                // 这一轮进行中，回车进来的话走插话；跑完立刻关门，空闲时照旧排队。
+                agent_steer.set_open(true);
+                let usage = run_turn(
                     &mut thread,
                     &*provider,
                     &model,
@@ -783,9 +801,44 @@ async fn run_tui(
                     &mut sink,
                     &agent_cancel,
                 )
-                .await
-                {
+                .await;
+                agent_steer.set_open(false);
+                if let Ok((_, usage)) = usage {
                     session_usage.add(&usage);
+                }
+                // 这一轮后面没再发请求，插话没被取走：退回队列，按下一轮正常跑。
+                for text in agent_steer.drain() {
+                    let raw = text
+                        .strip_prefix(crate::agent::STEER_HEAD)
+                        .map(|s| s.trim_start_matches('\n').to_string())
+                        .unwrap_or(text);
+                    if input_tx_for_retry.send(raw).is_err() {
+                        break;
+                    }
+                }
+                // 这一轮里启动的后台命令已经跑完了：把完成通知作为一条 user 消息
+                // 追进历史，再跑一轮。只认「这一轮结束之后仍排着的」—— 更早的已经
+                // 在上一轮的收尾里处理过。
+                while let Ok(id) = shell_done.try_recv() {
+                    if let Some(text) = agent_shells.completion(&id) {
+                        thread.append_user(text);
+                        agent_steer.set_open(true);
+                        let usage = run_turn(
+                            &mut thread,
+                            &*provider,
+                            &model,
+                            &config.agent,
+                            &run_opts,
+                            &tools,
+                            &mut sink,
+                            &agent_cancel,
+                        )
+                        .await;
+                        agent_steer.set_open(false);
+                        if let Ok((_, usage)) = usage {
+                            session_usage.add(&usage);
+                        }
+                    }
                 }
                 // 错误即数据：run_turn 内部已 emit；这里忽略 Err 让 REPL 继续。
             }
@@ -806,6 +859,7 @@ async fn run_tui(
         tui_cwd,
         ui_rx,
         input_tx,
+        steer,
         cancel.clone(),
     )
     .await;

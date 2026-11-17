@@ -4,14 +4,16 @@ pub mod ask_user;
 pub mod bootstrap;
 pub mod checkpoint;
 pub mod context;
+pub mod steer;
 pub mod subagent;
 pub mod thread;
 pub mod turn;
 pub mod ui;
 
-pub use ask_user::AskUserQuestionTool;
+pub use ask_user::{AskOption, AskQuestion, AskUserQuestionTool};
 pub use bootstrap::build_tools;
 pub use context::generate_title;
+pub use steer::{STEER_HEAD, SteerInbox, is_steer, wrap};
 pub use subagent::{TaskTool, ToolFactory};
 pub use thread::Thread;
 #[allow(unused_imports)]
