@@ -24,14 +24,14 @@ carter --ndjson [--model provider/name] [--resume <id>] [--continue]
 | `user_prompt` | `text: string` | 提交一条 user prompt 给 agent loop（== TUI 回车） |
 | `cancel` | — | 取消当前流式请求（== TUI Esc） |
 | `set_model` | `model: string` | **暂不支持热切换**，会发 Notice 提示用 `--model` 重启 |
-| `ask_response` | `id: u64`, `answer: string` | 回答之前 `ask_user` 事件，id 必须对应 |
+| `ask_response` | `id: u64`, `answers: string[][]`（或旧的 `answer: string`） | 回答之前 `ask_user` 事件，id 必须对应。`answers` 与 `questions` 一一对应，每项是该题选中的若干答案（空数组 = 跳过）；只给 `answer` 时整体算作第一题的回答 |
 | `stop` | — | 优雅退出 |
 
 示例：
 ```json
 {"type":"user_prompt","text":"列出 src 下所有 Rust 文件"}
 {"type":"cancel"}
-{"type":"ask_response","id":1,"answer":"yes"}
+{"type":"ask_response","id":1,"answers":[["yes"]]}
 {"type":"stop"}
 ```
 
@@ -53,7 +53,8 @@ carter --ndjson [--model provider/name] [--resume <id>] [--continue]
 | `model_changed` | `model` | 当前模型变更 |
 | `divider` | `label` | 上下文边界（"已恢复会话"等） |
 | `idle` | — | 一轮处理结束 — host 据此显示"可输入" |
-| `ask_user` | `id`, `question`, `options: string[]` | 反向 RPC，host **必须**回 `ask_response` |
+| `ask_user` | `id`, `questions: [{question, header?, multi_select, options: [{label, description?}]}]` | 反向 RPC，host **必须**回 `ask_response`。一次可带 1-4 题 |
+| `agent_progress` | `call_id`, `agents: [{description, status, steps, tool?, text}]` | `task` 工具里几个子 agent 的进度（整表快照，按 `call_id` 配对那次调用） |
 | `turn_usage` | `usage: {input,output,cache_read,cache_write,reasoning}`, `cost`, `model` | 用量 + 成本 |
 | `error` | `message` | 致命错误（之后 carter 退出） |
 
@@ -61,19 +62,24 @@ carter --ndjson [--model provider/name] [--resume <id>] [--continue]
 
 ## 反向 RPC：AskUser
 
-模型主动调用 `ask_user_question` 工具时，carter 发 `ask_user` 事件给 host：
+模型主动调用 `ask_user_question` 工具时，carter 发 `ask_user` 事件给 host。一次可以带多个问题：
 
 ```json
-{"type":"ask_user","id":1,"question":"覆盖 README.md 吗？","options":["yes","no","只看 diff"]}
+{"type":"ask_user","id":1,"questions":[
+  {"question":"覆盖 README.md 吗？","header":"覆盖","multi_select":false,
+   "options":[{"label":"yes"},{"label":"no"},{"label":"只看 diff","description":"先不动文件"}]}
+]}
 ```
 
-host **必须**回复，否则工具会一直 await：
+host **必须**回复，否则工具会一直 await。`answers` 与 `questions` 一一对应，每项是该题
+选中的若干答案（多选可以多个，空数组 = 这题跳过）：
 
 ```json
-{"type":"ask_response","id":1,"answer":"yes"}
+{"type":"ask_response","id":1,"answers":[["yes"]]}
 ```
 
-`answer` 可以是 options 中的一项，也可以是任意自由文本（如用户在你的 UI 里手输的）。
+旧形态 `{"type":"ask_response","id":1,"answer":"yes"}` 仍然认，整体算作第一题的回答。
+答案可以是 options 中的 label，也可以是任意自由文本（如用户在你的 UI 里手输的）。
 
 ---
 
@@ -105,7 +111,7 @@ reader.on('line', line => {
     case 'ask_user':
       // 在你的 UI 里弹窗，拿到 answer 后：
       carter.stdin.write(JSON.stringify({
-        type: 'ask_response', id: ev.id, answer: 'yes'
+        type: 'ask_response', id: ev.id, answers: [['yes']]
       }) + '\n');
       break;
     case 'idle':
