@@ -140,7 +140,40 @@ pub async fn run_ndjson(
         let mut session_usage = crate::provider::Usage::default();
         // 后台命令结束时的通知：取正文追进历史，再跑一轮。
         let mut shell_done = agent_shells.subscribe();
-        while let Some(prompt) = input_rx.recv().await {
+        loop {
+            let prompt = tokio::select! {
+                p = input_rx.recv() => match p {
+                    Some(p) => p,
+                    None => break,
+                },
+                // 后台命令结束：完成通知作为一条 user 消息追进历史再跑一轮。
+                id = shell_done.recv() => {
+                    let Some(id) = id else { continue };
+                    let Some(text) = agent_shells.completion(&id) else { continue };
+                    sink.emit(crate::agent::UiEvent::Notice(format!(
+                        "后台命令 {id} 已结束，接着处理"
+                    )));
+                    thread.append_user(text);
+                    agent_steer.set_open(true);
+                    let result = run_turn(
+                        &mut thread,
+                        &*provider,
+                        &model,
+                        &config.agent,
+                        &run_opts,
+                        &tools,
+                        &mut sink,
+                        &agent_cancel,
+                    )
+                    .await;
+                    agent_steer.set_open(false);
+                    if let Ok((_, usage)) = result {
+                        session_usage.add(&usage);
+                    }
+                    sink.emit(crate::agent::UiEvent::Idle);
+                    continue;
+                }
+            };
             // 跨会话输入历史也记录（让 carter sessions ↑↓ 列表可用）。
             crate::session::history::append(&session_meta.id, &prompt);
             // 内联 @图片附件转 token（与 TUI 一致）。
@@ -183,28 +216,6 @@ pub async fn run_ndjson(
                     .unwrap_or(text);
                 if agent_input_tx.send(raw).is_err() {
                     break;
-                }
-            }
-            // 这一轮启动的后台命令跑完了：完成通知作为一条 user 消息追进历史再跑一轮。
-            while let Ok(id) = shell_done.try_recv() {
-                if let Some(text) = agent_shells.completion(&id) {
-                    thread.append_user(text);
-                    agent_steer.set_open(true);
-                    let result = run_turn(
-                        &mut thread,
-                        &*provider,
-                        &model,
-                        &config.agent,
-                        &run_opts,
-                        &tools,
-                        &mut sink,
-                        &agent_cancel,
-                    )
-                    .await;
-                    agent_steer.set_open(false);
-                    if let Ok((_, usage)) = result {
-                        session_usage.add(&usage);
-                    }
                 }
             }
             sink.emit(crate::agent::UiEvent::Idle);

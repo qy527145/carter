@@ -709,7 +709,42 @@ async fn run_tui(
         // 后台命令自己结束时的通知：拿到 shell_id 后取正文，作为一条 user 消息
         // 追进历史再跑一轮 —— 否则模型启动完后台命令就结束了一轮，之后没人推进。
         let mut shell_done = agent_shells.subscribe();
-        while let Some(prompt) = input_rx.recv().await {
+        loop {
+            let prompt = tokio::select! {
+                p = input_rx.recv() => match p {
+                    Some(p) => p,
+                    None => break,
+                },
+                // 后台命令自己结束了：完成通知作为一条 user 消息追进历史，再跑一轮。
+                // 与用户输入放在同一个 select 里 —— 命令往往在上一轮结束之后才跑完，
+                // 轮末检查一次是接不到的。
+                id = shell_done.recv() => {
+                    let Some(id) = id else { continue };
+                    let Some(text) = agent_shells.completion(&id) else { continue };
+                    sink.emit(crate::agent::UiEvent::Notice(format!(
+                        "后台命令 {id} 已结束，接着处理"
+                    )));
+                    thread.append_user(text);
+                    agent_steer.set_open(true);
+                    let usage = run_turn(
+                        &mut thread,
+                        &*provider,
+                        &model,
+                        &config.agent,
+                        &run_opts,
+                        &tools,
+                        &mut sink,
+                        &agent_cancel,
+                    )
+                    .await;
+                    agent_steer.set_open(false);
+                    if let Ok((_, usage)) = usage {
+                        session_usage.add(&usage);
+                    }
+                    sink.emit(crate::agent::UiEvent::Idle);
+                    continue;
+                }
+            };
             // 记录到跨会话输入历史（原始输入，含斜杠命令）。
             crate::session::history::append(&session_meta.id, &prompt);
             // 斜杠命令解析：自定义命令展开为 prompt；内置命令就地分发（无需跑 turn）。
@@ -814,30 +849,6 @@ async fn run_tui(
                         .unwrap_or(text);
                     if input_tx_for_retry.send(raw).is_err() {
                         break;
-                    }
-                }
-                // 这一轮里启动的后台命令已经跑完了：把完成通知作为一条 user 消息
-                // 追进历史，再跑一轮。只认「这一轮结束之后仍排着的」—— 更早的已经
-                // 在上一轮的收尾里处理过。
-                while let Ok(id) = shell_done.try_recv() {
-                    if let Some(text) = agent_shells.completion(&id) {
-                        thread.append_user(text);
-                        agent_steer.set_open(true);
-                        let usage = run_turn(
-                            &mut thread,
-                            &*provider,
-                            &model,
-                            &config.agent,
-                            &run_opts,
-                            &tools,
-                            &mut sink,
-                            &agent_cancel,
-                        )
-                        .await;
-                        agent_steer.set_open(false);
-                        if let Ok((_, usage)) = usage {
-                            session_usage.add(&usage);
-                        }
                     }
                 }
                 // 错误即数据：run_turn 内部已 emit；这里忽略 Err 让 REPL 继续。
