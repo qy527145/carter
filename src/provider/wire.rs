@@ -55,11 +55,9 @@ impl WireProvider {
     ) -> Result<Self> {
         // 服务端工具按渠道声明的协议解析。自定义协议没有内置表，只能靠原样下发。
         let (mut specs, mut dropped) = match default_protocol.protocol() {
-            Some(proto) => llm_adapt_core::resolve_specs(
-                proto,
-                &server_tools.names,
-                server_tools.max_uses,
-            ),
+            Some(proto) => {
+                llm_adapt_core::resolve_specs(proto, &server_tools.names, server_tools.max_uses)
+            }
             None => (Vec::new(), server_tools.names.clone()),
         };
         for raw in &server_tools.raw_specs {
@@ -195,8 +193,7 @@ mod tests {
 
     #[test]
     fn image_refs_expand_into_blocks_in_place() {
-        let rf = crate::media::put_bytes(b"\x89PNG\r\n\x1a\nfake", Some("png"))
-            .expect("写媒体库");
+        let rf = crate::media::put_bytes(b"\x89PNG\r\n\x1a\nfake", Some("png")).expect("写媒体库");
         let mut wire = WireRequest::new("m");
         wire.messages = vec![crate::provider::WireMessage::new(
             Role::User,
@@ -205,11 +202,18 @@ mod tests {
 
         expand_image_refs(&mut wire);
         let content = &wire.messages[0].content;
-        assert_eq!(content.len(), 3, "应裂成 文本/图片/文本，顺序不变：{content:?}");
+        assert_eq!(
+            content.len(),
+            3,
+            "应裂成 文本/图片/文本，顺序不变：{content:?}"
+        );
         assert!(matches!(&content[0], Block::Text { text, .. } if text == "看图 "));
         match &content[1] {
             Block::Image { source, .. } => {
-                assert!(matches!(source, crate::provider::ImageSource::Base64 { .. }));
+                assert!(matches!(
+                    source,
+                    crate::provider::ImageSource::Base64 { .. }
+                ));
             }
             other => panic!("中间应是图片块，得到 {other:?}"),
         }

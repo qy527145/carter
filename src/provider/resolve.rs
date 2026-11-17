@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::provider::wire::{ServerToolConfig, WireProvider};
 use crate::provider::LlmProvider;
+use crate::provider::wire::{ServerToolConfig, WireProvider};
 
 /// 解析结果。带上「哪些服务端工具没能声明出去」，供界面提示 ——
 /// 静默丢弃会让用户以为开了联网搜索而实际没有。

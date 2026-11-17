@@ -213,7 +213,10 @@ pub fn fork(entry: &SessionEntry) -> crate::Result<(Thread, SessionMeta)> {
     if !todos.is_empty() {
         recorder.record(RecordKind::Todo(todos.clone()));
     }
-    Ok((Thread::from_parts(meta.id.clone(), messages, todos, recorder), meta))
+    Ok((
+        Thread::from_parts(meta.id.clone(), messages, todos, recorder),
+        meta,
+    ))
 }
 
 /// 列举会话。`all=false` 仅当前 cwd；`all=true` 跨所有项目。按创建时间倒序。
