@@ -8,10 +8,11 @@
 //! 底座可换，上层不动 —— 这条从第一天就有，现在换掉 genai 也没有例外。
 
 pub mod llm_log;
+pub mod models_api;
 pub mod resolve;
 pub mod wire;
 
-pub use resolve::resolve_provider;
+pub use resolve::{resolve_provider, resolve_provider_lenient};
 
 use std::pin::Pin;
 

@@ -265,6 +265,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
+ "flate2",
  "futures",
  "glob",
  "grep-regex",

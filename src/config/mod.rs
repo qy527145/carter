@@ -1,7 +1,7 @@
 //! 配置加载。根目录 `~/.carter`（见 paths.rs）。
 //! 加载顺序：内置默认 → `~/.carter/config.toml`（存在才读）→ env 插值。
 
-mod interpolate;
+pub mod interpolate;
 pub mod paths;
 
 pub use interpolate::interpolate;

@@ -217,6 +217,9 @@ pub struct App {
     arg_completions: Vec<(String, Vec<CompletionItem>)>,
     /// 会话候选动态来源（resume/fork 用）：每次打开弹窗重新拉取，保证新建会话即时可见。
     session_candidates: Option<Box<dyn Fn() -> Vec<CompletionItem> + Send>>,
+    /// `/model` 的动态候选：配置里的模型 + 启动后后台从各端点拉到的列表。
+    /// 每次打开弹窗现取，后台拉完就能看到。
+    model_candidates: Option<Box<dyn Fn() -> Vec<CompletionItem> + Send>>,
     /// 当前参数补全的候选缓存（命令名 → 候选），打开弹窗时取一次，过滤期间复用。
     arg_cache: Option<(String, Vec<CompletionItem>)>,
     /// 当前等待用户回答的 AskUser 问题；None = 无。
@@ -248,6 +251,7 @@ impl App {
             file_cache: None,
             arg_completions: Vec::new(),
             session_candidates: None,
+            model_candidates: None,
             arg_cache: None,
             pending_ask: None,
         }
@@ -268,6 +272,11 @@ impl App {
     /// 注入会话候选动态来源（/resume·/fork）。
     fn with_session_candidates(mut self, f: Box<dyn Fn() -> Vec<CompletionItem> + Send>) -> Self {
         self.session_candidates = Some(f);
+        self
+    }
+
+    fn with_model_candidates(mut self, f: Box<dyn Fn() -> Vec<CompletionItem> + Send>) -> Self {
+        self.model_candidates = Some(f);
         self
     }
 
@@ -725,6 +734,29 @@ impl App {
 
     // ---- 斜杠命令 / @文件 补全 ----
 
+    /// 输入恰好是 `/<cmd>`（无参数）且该命令有参数候选 → 补上空格并弹出整个候选列表。
+    /// 返回 true = 已弹出（调用方不要提交）。
+    fn open_arg_picker(&mut self) -> bool {
+        let trimmed = self.input.trim();
+        let Some(cmd) = trimmed.strip_prefix('/') else {
+            return false;
+        };
+        if cmd.is_empty() || cmd.contains(char::is_whitespace) {
+            return false;
+        }
+        let cmd = cmd.to_string();
+        let Some(cands) = self.arg_candidates_cached(&cmd) else {
+            return false;
+        };
+        if cands.is_empty() {
+            return false;
+        }
+        self.set_input(format!("/{cmd} "));
+        let start = self.cursor;
+        self.build_arg_completion(start, String::new(), cands);
+        self.completion.is_some()
+    }
+
     /// 依当前输入与光标重算补全候选。
     /// 优先 `/` 命令（行首未结束）→ `/cmd <arg>` 参数补全 → `@` 文件补全。
     fn update_completion(&mut self) {
@@ -780,13 +812,18 @@ impl App {
                 return Some(v.clone());
             }
         }
-        let fresh = if (cmd == "resume" || cmd == "fork") && self.session_candidates.is_some() {
-            Some((self.session_candidates.as_ref().unwrap())())
-        } else {
-            self.arg_completions
+        let dynamic = match cmd {
+            "resume" | "fork" => self.session_candidates.as_ref(),
+            "model" => self.model_candidates.as_ref(),
+            _ => None,
+        };
+        let fresh = match dynamic {
+            Some(f) => Some(f()),
+            None => self
+                .arg_completions
                 .iter()
                 .find(|(c, _)| c == cmd)
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| v.clone()),
         }?;
         self.arg_cache = Some((cmd.to_string(), fresh.clone()));
         Some(fresh)
@@ -1146,6 +1183,11 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Action {
             }
             // 补全激活：Enter 先接受选中项（除非输入已精确等于该命令则直接提交）。
             if app.completion.is_some() && app.completion_accept() {
+                return Action::None;
+            }
+            // 带参数候选的命令只敲了命令名就回车 → 弹出列表让用户选，而不是提交一个
+            // 空参数让后端回一句「用法：…」。模型 / 会话都是选出来比打出来省事。
+            if app.open_arg_picker() {
                 return Action::None;
             }
             let text = app.input.trim().to_string();
@@ -1689,6 +1731,7 @@ pub async fn run(
     commands: Vec<CompletionItem>,
     arg_completions: Vec<(String, Vec<CompletionItem>)>,
     session_candidates: Box<dyn Fn() -> Vec<CompletionItem> + Send>,
+    model_candidates: Box<dyn Fn() -> Vec<CompletionItem> + Send>,
     history: Vec<String>,
     cwd: std::path::PathBuf,
     mut ui_rx: UnboundedReceiver<UiEvent>,
@@ -1725,6 +1768,7 @@ pub async fn run(
         .with_cwd(cwd)
         .with_arg_completions(arg_completions)
         .with_session_candidates(session_candidates)
+        .with_model_candidates(model_candidates)
         .with_history(history);
     let mut term_events = EventStream::new();
 
@@ -2162,6 +2206,55 @@ mod tests {
         assert!(matches!(a, Action::None));
         assert_eq!(app.input, "/model ws/gpt ");
         assert!(app.completion.is_none());
+    }
+
+    /// 只敲 `/model` 回车：不提交，弹出全部候选让用户选；再回车才把选中项填进去。
+    #[test]
+    fn bare_model_command_enter_opens_picker_instead_of_submitting() {
+        let mut app = App::new("m".into()).with_arg_completions(vec![(
+            "model".into(),
+            vec![
+                CompletionItem {
+                    name: "ws/a".into(),
+                    description: "[anthropic] 200k".into(),
+                    hint: None,
+                },
+                CompletionItem {
+                    name: "ws/b".into(),
+                    description: String::new(),
+                    hint: None,
+                },
+            ],
+        )]);
+        for ch in "/model".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        // 此时弹的是命令补全（精确匹配 model），Enter 本该直接提交。
+        let a = press(&mut app, KeyCode::Enter);
+        assert!(matches!(a, Action::None), "不该提交空参数的 /model");
+        assert_eq!(app.input, "/model ");
+        let comp = app.completion.as_ref().expect("参数列表应弹出");
+        assert_eq!(comp.kind, CompletionKind::Arg);
+        assert_eq!(comp.entries.len(), 2);
+        // 下移一项再回车 → 填入第二项。
+        press(&mut app, KeyCode::Down);
+        let a = press(&mut app, KeyCode::Enter);
+        assert!(matches!(a, Action::None));
+        assert_eq!(app.input, "/model ws/b ");
+        // 再回车才真正提交。
+        let a = press(&mut app, KeyCode::Enter);
+        assert!(matches!(a, Action::Submit(t) if t == "/model ws/b"));
+    }
+
+    /// 没有参数候选的命令（/clear）回车照常提交。
+    #[test]
+    fn bare_command_without_candidates_still_submits() {
+        let mut app = App::new("m".into());
+        for ch in "/clear".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        let a = press(&mut app, KeyCode::Enter);
+        assert!(matches!(a, Action::Submit(t) if t == "/clear"));
     }
 
     #[test]

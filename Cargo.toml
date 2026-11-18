@@ -69,6 +69,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "1.8.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 # MCP http transport 自定义 header 类型（HeaderName/HeaderValue）；仅 src/mcp/ 使用。
 http = "1"
+# 解压内置的 models.dev 快照（assets/models.json.gz）。image 已经间接依赖它，不额外增重。
+flate2 = "1"
 # 多模态：图片内容寻址（sha256） + base64 编码给 provider 发 wire。
 sha2 = "0.10"
 base64 = "0.22"

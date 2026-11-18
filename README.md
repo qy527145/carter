@@ -28,8 +28,10 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/qy527145/carter/re
 cargo install carter
 ```
 
-首次运行 `carter` 没有配置时会进入向导，引导你填一个 provider、一个模型和 API key，
-写到 `~/.carter/config.toml`。也可以直接照 [config.example.toml](config.example.toml) 手写。
+首次运行 `carter` 没有配置时会进入向导：选协议、填端点和 API key 之后，carter 会向端点
+拉取模型列表让你从里面选（可多选，拉不到再手填），每个模型的元数据（上下文窗口、价格、
+能力）先按名字自动匹配，匹配不上再从 provider → 模型两级列表里挑。写到
+`~/.carter/config.toml`。也可以直接照 [config.example.toml](config.example.toml) 手写。
 非交互环境（管道、CI）不会进向导，只打印指引后退出。
 
 最小配置：
@@ -48,8 +50,8 @@ api_key = "${ANTHROPIC_API_KEY}"         # 支持 ${ENV} 展开
   api_name = "claude-sonnet-4-5"         # 实际发给 API 的名字（缺省同 meta 的后半段）
 ```
 
-然后 `carter update` 拉一次 [models.dev](https://models.dev) 的模型元数据到
-`~/.carter/models.json`，成本统计和上下文压缩阈值靠它。
+模型元数据来自 [models.dev](https://models.dev)。二进制里内置了一份发版时的快照，
+离线也能跑；`carter update` 会把最新的拉到 `~/.carter/models.json`，有缓存就优先用缓存。
 
 ## TUI 用法
 
@@ -71,7 +73,7 @@ api_key = "${ANTHROPIC_API_KEY}"         # 支持 ${ENV} 展开
 
 | 命令 | 说明 |
 |---|---|
-| `/model <provider/model>` | 热切换模型 |
+| `/model` | 弹出模型列表选择：配置里的模型（带上下文窗口 / 能力摘要）+ 各端点实时返回的模型；也可直接 `/model <provider/model>` |
 | `/goal <目标>` | 设定长任务目标：模型停下而目标未完成时自动追加「继续」再跑一轮 |
 | `/goal` · `/goal pause` · `/goal resume` · `/goal clear` | 查看 / 暂停 / 恢复 / 清除目标 |
 | `/btw <问题>` | 侧边问一句：带着主对话的上下文，但不污染主对话 |

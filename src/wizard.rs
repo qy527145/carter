@@ -12,10 +12,16 @@ struct Answers {
     kind: String,
     base_url: Option<String>,
     api_key: Option<String>,
-    model_name: String,
-    meta: String,
+    /// 选中的模型：(端点模型名, models.dev 的 `provider/model`)。第一个是默认模型。
+    models: Vec<(String, String)>,
     proxy: Option<String>,
     show_thinking: bool,
+}
+
+impl Answers {
+    fn model_name(&self) -> &str {
+        self.models.first().map(|(m, _)| m.as_str()).unwrap_or("")
+    }
 }
 
 /// 预置协议：(kind, 展示名, 默认 provider 名, meta 的 provider 段, 默认模型名)。
@@ -76,7 +82,7 @@ pub async fn ensure_config() -> crate::Result<bool> {
     println!("\n欢迎使用 Carter —— 未检测到配置，进入首次配置向导。");
     println!("（直接回车采用方括号内的默认值；Ctrl+C 取消。）\n");
 
-    let answers = match collect() {
+    let answers = match collect().await {
         Some(a) => a,
         None => {
             // 输入提前结束（EOF）→ 不写文件，交回主流程（后续会给出缺配置的友好报错）。
@@ -92,18 +98,15 @@ pub async fn ensure_config() -> crate::Result<bool> {
     std::fs::write(&path, &toml)?;
     println!("\n已写入配置：{}", path.display());
 
-    // 代理：写进了 config，但本进程后续（含下面的拉取）也需要立即生效。
-    if let Some(proxy) = &answers.proxy {
-        set_proxy_env(proxy);
-    }
-
-    ensure_models_cache(&answers).await;
-
     Ok(true)
 }
 
 /// 逐项收集答案。任一必填项遇 EOF → None（中止）。
-fn collect() -> Option<Answers> {
+///
+/// 顺序：协议 → 端点 / key → 代理（要在联网前问）→ 元数据（没缓存就试着拉，拉不到用
+/// 内置快照）→ 向端点要模型列表让用户**选**（拉不到再手填）→ 给每个模型配元数据
+/// （先自动猜，猜不中让用户从 provider → 模型两级列表里挑）。
+async fn collect() -> Option<Answers> {
     let idx = choose(
         "选择模型服务商协议",
         PRESETS.iter().map(|p| p.1).collect::<Vec<_>>().as_slice(),
@@ -115,13 +118,80 @@ fn collect() -> Option<Answers> {
     let base_url = prompt_optional("base_url（自定义端点；回车=用官方默认端点）")?;
     let api_key =
         prompt_optional("api_key（直接粘贴；也可填 ${ENV_NAME} 走环境变量；回车=暂不填）")?;
-    let model_name = prompt_default("模型名（端点实际模型名，同时作为引用块名）", def_model)?;
-    let default_meta = format!("{meta_provider}/{model_name}");
-    let meta = prompt_default(
-        "models.dev 元数据 id（provider_id/model_id，用于查上下文窗口/价格）",
-        &default_meta,
-    )?;
     let proxy = prompt_optional("HTTP 代理（如 http://127.0.0.1:7890；回车=不走代理）")?;
+    // 代理：写进 config 之前本进程就要用（拉 models.dev、拉模型列表）。
+    if let Some(p) = &proxy {
+        set_proxy_env(p);
+    }
+
+    // 元数据：有缓存用缓存；没有就试着拉一次，拉不到用内置快照（不阻塞向导）。
+    let cache_json = ensure_models_cache().await;
+
+    // 向端点要模型列表。key 是 ${ENV} 形式时先展开，否则带着字面量去请求必然 401。
+    let pcfg = crate::config::ProviderConfig {
+        kind: kind.to_string(),
+        base_url: base_url.clone(),
+        api_key: api_key
+            .as_deref()
+            .map(crate::config::interpolate::interpolate),
+        ..Default::default()
+    };
+    print!("正在向端点拉取模型列表…");
+    let _ = io::stdout().flush();
+    let remote = match crate::provider::models_api::list_models(&pcfg).await {
+        Ok(list) if !list.is_empty() => {
+            println!(" 共 {} 个。", list.len());
+            list
+        }
+        Ok(_) => {
+            println!(" 列表为空。");
+            Vec::new()
+        }
+        Err(e) => {
+            println!(" 失败（{e}）。");
+            Vec::new()
+        }
+    };
+
+    // 选模型（可多选；第一个是默认模型）。
+    let picked: Vec<String> = if remote.is_empty() {
+        let m = prompt_default("模型名（端点实际模型名，同时作为引用块名）", def_model)?;
+        vec![m]
+    } else {
+        let labels: Vec<String> = remote
+            .iter()
+            .map(|m| {
+                if m.name == m.id {
+                    m.id.clone()
+                } else {
+                    format!("{}  ({})", m.id, m.name)
+                }
+            })
+            .collect();
+        let default_idx = remote
+            .iter()
+            .position(|m| m.id == def_model || m.id.starts_with(def_model))
+            .unwrap_or(0);
+        let idxs = pick_many(
+            "选择要使用的模型（可输入多个序号，逗号分隔；第一个是默认模型；也可直接输入模型名）",
+            &labels,
+            default_idx,
+        )?;
+        idxs.into_iter()
+            .map(|sel| match sel {
+                Pick::Index(i) => remote[i].id.clone(),
+                Pick::Custom(name) => name,
+            })
+            .collect()
+    };
+
+    // 给每个模型配元数据：自动猜 → 让用户确认 / 从列表里挑。
+    let mut models: Vec<(String, String)> = Vec::with_capacity(picked.len());
+    for name in picked {
+        let meta = pick_meta(&cache_json, meta_provider, &name)?;
+        models.push((name, meta));
+    }
+
     let show_thinking = yes_no("显示模型思考内容？", true)?;
 
     Some(Answers {
@@ -129,45 +199,96 @@ fn collect() -> Option<Answers> {
         kind: kind.to_string(),
         base_url,
         api_key,
-        model_name,
-        meta,
+        models,
         proxy,
         show_thinking,
     })
 }
 
-/// 模型元数据缓存：缺失则提议联网拉取；已存在则校验 meta 是否命中（仅告警）。
-async fn ensure_models_cache(a: &Answers) {
-    let cache_path = paths::models_cache_path();
-    if !cache_path.exists() {
-        if yes_no(
-            "尚无模型元数据缓存，现在从 models.dev 拉取？（需联网，约数 MB）",
+/// 模型元数据：本地缓存 → 提议拉取 → 内置快照。返回最终可用的 JSON。
+async fn ensure_models_cache() -> String {
+    use crate::registry::fetch;
+    if !fetch::cache_exists()
+        && yes_no(
+            "尚无模型元数据缓存，现在从 models.dev 拉取？（需联网，约数 MB；拉不到会用内置快照）",
             true,
         )
         .unwrap_or(false)
-        {
-            match crate::registry::fetch::fetch_models_dev().await {
-                Ok(json) => match crate::registry::fetch::write_cache(&json) {
-                    Ok(()) => println!("已缓存模型元数据到 {}", cache_path.display()),
-                    Err(e) => eprintln!("写入缓存失败：{e}（稍后可重试 `carter update`）"),
-                },
-                Err(e) => eprintln!("拉取失败：{e}\n稍后请手动运行 `carter update`。"),
-            }
-        } else {
-            println!("已跳过。首次对话前请运行 `carter update` 拉取模型元数据。");
+    {
+        match fetch::fetch_models_dev().await {
+            Ok(json) => match fetch::write_cache(&json) {
+                Ok(()) => println!("已缓存到 {}", paths::models_cache_path().display()),
+                Err(e) => eprintln!("写入缓存失败：{e}（先用内置快照，稍后可 `carter update`）"),
+            },
+            Err(e) => eprintln!("拉取失败：{e}\n先用内置快照，稍后可 `carter update` 刷新。"),
         }
     }
-    // 校验 meta（缓存可读时）：未命中只提醒，不阻断。
-    if let Ok(json) = crate::registry::fetch::read_cache() {
-        if let Some((p, m)) = a.meta.split_once('/') {
-            if crate::registry::models_dev::lookup(&json, p, m).is_none() {
-                eprintln!(
-                    "提醒：meta `{}` 未在 models.dev 缓存中找到，模型解析可能失败。\n请核对 id，或编辑 {} 后重试。",
-                    a.meta,
-                    paths::config_path().display()
-                );
+    fetch::read_cache().unwrap_or_else(|_| "{}".to_string())
+}
+
+/// 给一个端点模型名定 models.dev 元数据 id。
+///
+/// 先按协议对应的 provider 猜（`claude-sonnet-4-5-20250929` → `anthropic/claude-sonnet-4-5`），
+/// 猜中了让用户回车确认；猜不中、或用户不认，就走 provider → 模型两级列表。
+fn pick_meta(cache_json: &str, meta_provider: &str, model_name: &str) -> Option<String> {
+    use crate::registry::catalog;
+    println!("\n为模型 `{model_name}` 选择元数据（查上下文窗口 / 价格 / 能力）：");
+    if let Some((p, m)) = catalog::guess_meta(cache_json, Some(meta_provider), model_name) {
+        let guess = format!("{p}/{m}");
+        if yes_no(&format!("  匹配到 `{guess}`，用它？"), true)? {
+            return Some(guess);
+        }
+    } else {
+        println!("  未能自动匹配。");
+    }
+
+    // 一级：provider。协议对应的那个放最前。
+    let mut provs = catalog::providers(cache_json);
+    if let Some(pos) = provs.iter().position(|p| p.id == meta_provider) {
+        let p = provs.remove(pos);
+        provs.insert(0, p);
+    }
+    if provs.is_empty() {
+        // 元数据整个不可用（快照损坏）：退回手填。
+        return prompt_default(
+            "  models.dev 元数据 id（provider_id/model_id）",
+            &format!("{meta_provider}/{model_name}"),
+        );
+    }
+    let labels: Vec<String> = provs
+        .iter()
+        .map(|p| format!("{}  ({}，{} 个模型)", p.id, p.name, p.model_count))
+        .collect();
+    let pi = match pick_one("  选择元数据 provider（可输入序号或名字过滤）", &labels, 0)?
+    {
+        Pick::Index(i) => i,
+        Pick::Custom(name) => {
+            // 用户直接敲了个 id：按它查；没有就当作手填的完整 id。
+            match provs.iter().position(|p| p.id == name) {
+                Some(i) => i,
+                None if name.contains('/') => return Some(name),
+                None => {
+                    println!("  没有叫 `{name}` 的 provider，按手填处理。");
+                    return Some(format!("{meta_provider}/{model_name}"));
+                }
             }
         }
+    };
+    let pid = provs[pi].id.clone();
+
+    // 二级：模型。
+    let models = catalog::models(cache_json, &pid);
+    let labels: Vec<String> = models
+        .iter()
+        .map(|m| format!("{}  [{}]", m.id, m.summary()))
+        .collect();
+    // 默认项：和端点模型名最像的那个。
+    let default_idx = catalog::guess_meta(cache_json, Some(&pid), model_name)
+        .and_then(|(_, mid)| models.iter().position(|m| m.id == mid))
+        .unwrap_or(0);
+    match pick_one("  选择模型（可输入序号或名字过滤）", &labels, default_idx)? {
+        Pick::Index(i) => Some(format!("{pid}/{}", models[i].id)),
+        Pick::Custom(name) => Some(format!("{pid}/{name}")),
     }
 }
 
@@ -180,7 +301,8 @@ fn render_config(a: &Answers) -> String {
     s.push_str("# 默认模型，引用格式 provider/model。可被 CLI --model 覆盖。\n");
     s.push_str(&format!(
         "model = \"{}/{}\"\n",
-        a.provider_name, a.model_name
+        a.provider_name,
+        a.model_name()
     ));
     s.push_str("max_output_tokens = 16000\n");
     s.push_str("# fast_model = \"<provider>/<model>\"   # 压缩/标题用的快模型，省略则用主模型。\n");
@@ -222,13 +344,29 @@ fn render_config(a: &Answers) -> String {
     s.push('\n');
 
     s.push_str("# 块名即引用里的 model；省略 api_name 时默认取块名做端点模型名。\n");
-    s.push_str(&format!(
-        "  [providers.{}.models.{}]\n",
-        a.provider_name, a.model_name
-    ));
-    s.push_str("  # meta = models.dev 的 provider_id/model_id，用于查上下文窗口/价格。\n");
-    s.push_str(&format!("  meta = \"{}\"\n", toml_escape(&a.meta)));
+    s.push_str("# meta = models.dev 的 provider_id/model_id，用于查上下文窗口/价格。\n");
+    for (name, meta) in &a.models {
+        s.push_str(&format!(
+            "  [providers.{}.models.{}]\n",
+            a.provider_name,
+            toml_key(name)
+        ));
+        s.push_str(&format!("  meta = \"{}\"\n\n", toml_escape(meta)));
+    }
     s
+}
+
+/// TOML 表头里的键：裸键只允许 `A-Za-z0-9_-`，端点模型名里常有 `.` `/` `:`
+/// （`gpt-4.1`、`anthropic/claude-sonnet-4-5`、`qwen:7b`），得加引号。
+fn toml_key(k: &str) -> String {
+    if !k.is_empty()
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        k.to_string()
+    } else {
+        format!("\"{}\"", toml_escape(k))
+    }
 }
 
 // ---- 终端交互辅助 ----
@@ -289,6 +427,123 @@ fn choose(label: &str, options: &[&str], default_idx: usize) -> Option<usize> {
     }
 }
 
+/// 列表选择的结果：选中某一项，或用户直接敲了个不在列表里的名字。
+enum Pick {
+    Index(usize),
+    Custom(String),
+}
+
+/// 一页最多打印多少行；超过就让用户输入关键字过滤。
+const PAGE: usize = 30;
+
+/// 打印候选（过多时只打前 `PAGE` 条并提示过滤）。
+fn print_candidates(items: &[String], default_idx: usize, filtered_from: Option<usize>) {
+    let shown = items.len().min(PAGE);
+    for (i, it) in items.iter().take(shown).enumerate() {
+        let mark = if i == default_idx { "*" } else { " " };
+        println!("  {mark} {:>3}. {it}", i + 1);
+    }
+    if items.len() > shown {
+        println!(
+            "    …… 还有 {} 项未显示，输入关键字过滤。",
+            items.len() - shown
+        );
+    }
+    if let Some(total) = filtered_from {
+        println!(
+            "    （已过滤：{} / {total}；输入空行回到全部）",
+            items.len()
+        );
+    }
+}
+
+/// 单选，支持输入关键字过滤。回车 = 默认项；输入序号 = 选中；输入文本 =
+/// 先当作过滤词（有命中就重新列出），没有任何命中则当作自定义值。EOF → None。
+fn pick_one(label: &str, items: &[String], default_idx: usize) -> Option<Pick> {
+    pick_many(label, items, default_idx).map(|mut v| v.remove(0))
+}
+
+/// 多选版：允许 `1,3,5` 这种序号列表；其余规则同 [`pick_one`]。
+/// 返回非空（至少一个）。
+fn pick_many(label: &str, items: &[String], default_idx: usize) -> Option<Vec<Pick>> {
+    let all: Vec<(usize, String)> = items.iter().cloned().enumerate().collect();
+    let mut view: Vec<(usize, String)> = all.clone();
+    let mut default_in_view = default_idx.min(items.len().saturating_sub(1));
+    println!("{label}：");
+    loop {
+        let labels: Vec<String> = view.iter().map(|(_, s)| s.clone()).collect();
+        print_candidates(
+            &labels,
+            default_in_view,
+            (view.len() != all.len()).then_some(all.len()),
+        );
+        print!("输入 [{}]: ", default_in_view + 1);
+        let _ = io::stdout().flush();
+        let line = read_line()?;
+        let line = line.trim();
+
+        if line.is_empty() {
+            if view.len() != all.len() {
+                // 过滤态下回车：回到全部。
+                view = all.clone();
+                default_in_view = default_idx.min(items.len().saturating_sub(1));
+                continue;
+            }
+            return view
+                .get(default_in_view)
+                .map(|(orig, _)| vec![Pick::Index(*orig)]);
+        }
+
+        // 序号（可多个）。
+        let nums: Vec<Option<usize>> = line
+            .split([',', ' ', '，'])
+            .filter(|t| !t.is_empty())
+            .map(|t| t.parse::<usize>().ok())
+            .collect();
+        if !nums.is_empty() && nums.iter().all(Option::is_some) {
+            let mut out: Vec<Pick> = Vec::new();
+            for n in nums.into_iter().flatten() {
+                match view.get(n.wrapping_sub(1)) {
+                    Some((orig, _)) if n >= 1 => out.push(Pick::Index(*orig)),
+                    _ => println!("（序号 {n} 超出范围，忽略）"),
+                }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+            continue;
+        }
+
+        // 文本：过滤；只命中一个就直接选它；一个都没有就当自定义值。
+        let q = line.to_lowercase();
+        let hits: Vec<(usize, String)> = all
+            .iter()
+            .filter(|(_, s)| s.to_lowercase().contains(&q))
+            .cloned()
+            .collect();
+        match hits.len() {
+            0 => {
+                println!("（列表里没有匹配项，按自定义值 `{line}` 处理）");
+                return Some(vec![Pick::Custom(line.to_string())]);
+            }
+            1 => return Some(vec![Pick::Index(hits[0].0)]),
+            _ => {
+                // 精确等于某项 id 开头（如用户直接敲了完整模型名）→ 直接选。
+                if let Some((orig, _)) = hits.iter().find(|(_, s)| {
+                    s.to_lowercase()
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|head| head == q)
+                }) {
+                    return Some(vec![Pick::Index(*orig)]);
+                }
+                view = hits;
+                default_in_view = 0;
+            }
+        }
+    }
+}
+
 /// 是/否。空→默认。EOF→None。
 fn yes_no(label: &str, default_yes: bool) -> Option<bool> {
     let hint = if default_yes { "Y/n" } else { "y/N" };
@@ -328,11 +583,34 @@ mod tests {
             kind: "anthropic".into(),
             base_url: base.map(str::to_string),
             api_key: key.map(str::to_string),
-            model_name: "claude-sonnet-4-6".into(),
-            meta: "anthropic/claude-sonnet-4-5".into(),
+            models: vec![(
+                "claude-sonnet-4-6".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+            )],
             proxy: proxy.map(str::to_string),
             show_thinking: true,
         }
+    }
+
+    #[test]
+    fn render_multiple_models_and_quotes_odd_keys() {
+        let mut a = sample(None, None, None);
+        a.models.push(("gpt-4.1".into(), "openai/gpt-4.1".into()));
+        a.models.push((
+            "anthropic/claude-haiku-4-5".into(),
+            "anthropic/claude-haiku-4-5".into(),
+        ));
+        let toml = render_config(&a);
+        let cfg: crate::config::Config = toml::from_str(&toml).expect("带点/斜杠的块名应加引号");
+        let p = cfg.providers.get("mycorp").unwrap();
+        assert_eq!(p.models.len(), 3);
+        assert_eq!(p.models["gpt-4.1"].meta, "openai/gpt-4.1");
+        assert_eq!(
+            p.models["anthropic/claude-haiku-4-5"].meta,
+            "anthropic/claude-haiku-4-5"
+        );
+        // 第一个是默认模型。
+        assert_eq!(cfg.agent.model, "mycorp/claude-sonnet-4-6");
     }
 
     #[test]

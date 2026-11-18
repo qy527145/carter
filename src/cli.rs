@@ -864,6 +864,42 @@ async fn run_oneshot(
     ))
 }
 
+/// `/model` 弹窗的候选：配置里每个 `provider/model`，描述栏放协议种类 + 元数据摘要。
+/// 元数据查不到的只标协议，不让一个坏 meta 把整个列表拖垮。
+fn model_completion_items(config: &Config, cache_json: &str) -> Vec<crate::tui::CompletionItem> {
+    let mut items = Vec::new();
+    let mut provs: Vec<&String> = config.providers.keys().collect();
+    provs.sort();
+    for p in provs {
+        let pcfg = &config.providers[p];
+        let mut ms: Vec<&String> = pcfg.models.keys().collect();
+        ms.sort();
+        for m in ms {
+            let summary = pcfg.models[m]
+                .meta
+                .split_once('/')
+                .and_then(|(pid, mid)| {
+                    crate::registry::catalog::models(cache_json, pid)
+                        .into_iter()
+                        .find(|e| e.id == mid)
+                })
+                .map(|e| e.summary())
+                .unwrap_or_default();
+            let description = if summary.is_empty() {
+                format!("[{}]", pcfg.kind)
+            } else {
+                format!("[{}] {summary}", pcfg.kind)
+            };
+            items.push(crate::tui::CompletionItem {
+                name: format!("{p}/{m}"),
+                description,
+                hint: None,
+            });
+        }
+    }
+    items
+}
+
 /// 交互式 TUI REPL 模式。agent loop 跑在独立任务里，经通道与 TUI 通信。
 async fn run_tui(
     thread: Thread,
@@ -926,26 +962,42 @@ async fn run_tui(
     // agent 任务按 move 捕获 cwd；TUI 也要用它做 `@` 文件补全，故先克隆一份。
     let tui_cwd = cwd.clone();
 
-    // 参数补全候选：/model → 各 provider 的模型引用（静态，config 不变）。
-    let mut model_items: Vec<crate::tui::CompletionItem> = Vec::new();
+    // `/model` 候选 = 配置里写了块的模型（带元数据摘要）+ 启动后后台向各端点拉到的
+    // 模型列表（配置里没写块的那些也能选）。弹窗每次打开现取，所以拉完即可见。
+    let model_items = std::sync::Arc::new(std::sync::Mutex::new(model_completion_items(
+        &config,
+        &cache_json,
+    )));
     {
-        let mut provs: Vec<&String> = config.providers.keys().collect();
-        provs.sort();
-        for p in provs {
-            let kind = config.providers[p].kind.clone();
-            let mut ms: Vec<&String> = config.providers[p].models.keys().collect();
-            ms.sort();
-            for m in ms {
-                model_items.push(crate::tui::CompletionItem {
-                    name: format!("{p}/{m}"),
-                    description: format!("[{kind}]"),
-                    hint: None,
-                });
+        let items = model_items.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            let remote = crate::provider::models_api::list_for_config(&cfg).await;
+            let mut extra: Vec<crate::tui::CompletionItem> = Vec::new();
+            for (pname, list) in remote {
+                let kind = cfg.providers[&pname].kind.clone();
+                for m in list {
+                    // 配置里已经有块的跳过：那条已带元数据摘要，别重复一条没摘要的。
+                    if cfg.providers[&pname].models.contains_key(&m.id) {
+                        continue;
+                    }
+                    extra.push(crate::tui::CompletionItem {
+                        name: format!("{pname}/{}", m.id),
+                        description: format!("[{kind}] 端点列表"),
+                        hint: None,
+                    });
+                }
             }
-        }
+            if let Ok(mut guard) = items.lock() {
+                guard.extend(extra);
+            }
+        });
     }
-    let arg_completions: Vec<(String, Vec<crate::tui::CompletionItem>)> =
-        vec![("model".to_string(), model_items)];
+    let model_candidates: Box<dyn Fn() -> Vec<crate::tui::CompletionItem> + Send> = {
+        let items = model_items.clone();
+        Box::new(move || items.lock().map(|g| g.clone()).unwrap_or_default())
+    };
+    let arg_completions: Vec<(String, Vec<crate::tui::CompletionItem>)> = Vec::new();
 
     // /resume·/fork → 会话候选动态来源：每次打开弹窗重新列会话（新建即时可见）。
     let sess_cwd = cwd.clone();
@@ -1366,6 +1418,7 @@ async fn run_tui(
         completion_items,
         arg_completions,
         session_candidates,
+        model_candidates,
         input_history,
         tui_cwd,
         ui_rx,
@@ -1503,7 +1556,7 @@ async fn dispatch_builtin(
             if args.is_empty() {
                 // 列出当前模型 + 各 provider 下可选模型，方便用户知道能切到什么。
                 let mut out = format!(
-                    "当前模型：{}\n用法：/model <provider/model>\n可用：",
+                    "当前模型：{}\n用法：/model <provider/model>（TUI 里输入 /model 回车可弹列表选择）\n可用：",
                     model.key
                 );
                 let mut provs: Vec<&String> = config.providers.keys().collect();
@@ -1520,8 +1573,14 @@ async fn dispatch_builtin(
                 }
                 sink.emit(notice(out));
             } else {
-                match crate::provider::resolve_provider(config, cache_json, args, Vec::new())
-                    .map(|r| (r.model, r.provider))
+                // 宽松解析：端点列表里选出来、配置里没写块的模型也能切。
+                match crate::provider::resolve_provider_lenient(
+                    config,
+                    cache_json,
+                    args,
+                    Vec::new(),
+                )
+                .map(|r| (r.model, r.provider))
                 {
                     Ok((m, p)) => {
                         let key = m.key.clone();

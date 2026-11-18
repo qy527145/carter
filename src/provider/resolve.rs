@@ -27,6 +27,26 @@ pub fn resolve_provider(
     extra_hooks: Vec<Arc<dyn llm_adapt_core::RequestHook>>,
 ) -> Result<ResolvedProvider> {
     let model = crate::registry::resolve_model(config, cache_json, model_ref)?;
+    resolve_with_model(config, model, extra_hooks)
+}
+
+/// 同 [`resolve_provider`]，但模型没在配置里写块也行（端点列表里选出来的那种）。
+/// 会话内 `/model` 用；启动默认模型仍走严格版本。
+pub fn resolve_provider_lenient(
+    config: &Config,
+    cache_json: &str,
+    model_ref: &str,
+    extra_hooks: Vec<Arc<dyn llm_adapt_core::RequestHook>>,
+) -> Result<ResolvedProvider> {
+    let model = crate::registry::resolve_model_lenient(config, cache_json, model_ref)?;
+    resolve_with_model(config, model, extra_hooks)
+}
+
+fn resolve_with_model(
+    config: &Config,
+    model: crate::registry::ModelInfo,
+    extra_hooks: Vec<Arc<dyn llm_adapt_core::RequestHook>>,
+) -> Result<ResolvedProvider> {
     let pcfg = config.provider_for(&model.provider);
     let protocol = pcfg.protocol();
     let client_config = pcfg.to_client_config()?;
