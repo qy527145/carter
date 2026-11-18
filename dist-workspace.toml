@@ -15,3 +15,9 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = true
+
+# GitHub 已下线 `macos-14` runner（CI 报 "The configuration 'macos-14-arm64-us-default'
+# is not supported"），而 dist 0.32 给 arm64 mac 默认还是选它。显式钉到 macos-15。
+# 改完要 `dist generate` 重出 .github/workflows/release.yml。
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
