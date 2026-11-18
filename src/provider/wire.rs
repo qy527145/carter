@@ -122,67 +122,133 @@ impl LlmProvider for WireProvider {
     }
 }
 
-/// 把请求里文本块中的 `[img:<hash>.<ext>]` 引用展开成真正的图片块。
+/// 把请求里的 `[img:<hash>.<ext>]` 引用展开成真正的图片块。
 ///
 /// 历史里存的是**引用 token**，不是图片字节 —— 否则一张图会在会话 JSONL 里以
 /// base64 形态躺几百 KB，跑几轮就把文件撑到几十 MB。只有真要发出去时才去媒体库取字节。
 ///
-/// 展开放在这一层，是因为媒体库属于 carter，底座不该认识它。展开后一个文本块会裂成
-/// 「文本 / 图片 / 文本」这样的交替序列，**顺序不变** —— 图片在原文里的位置是有意义的。
+/// 展开放在这一层，是因为媒体库属于 carter，底座不该认识它。两条规则：
+///
+/// 1. **只展开 user 轮。** assistant 的正文里出现 `[img:…]`，是模型在**提到**那个
+///    引用（「工具只回给我一个 `[img:…]` 标记」），不是它要发图 —— 而且 Anthropic
+///    明确拒绝 assistant 轮里的 image 块（400 `'image' blocks are not permitted
+///    within assistant turns`），一旦那句话落进历史，整个会话从此每次请求都炸。
+///    所以 assistant 轮的引用原样留作文本。
+/// 2. **工具结果也要展开。** `read_file` 读图片回的就是一条带引用的文本结果，
+///    不展开模型永远只能看到一串字面量。展开后 `ToolResultContent::Text` 变成
+///    `Blocks`，图片以 data URL 放进去：Anthropic 原生收，OpenAI 一类协议由底座
+///    降级成文本并告警 —— 至少不比现在差。
+///
+/// 展开后一个文本块会裂成「文本 / 图片 / 文本」这样的交替序列，**顺序不变** ——
+/// 图片在原文里的位置是有意义的。
 fn expand_image_refs(wire: &mut WireRequest) {
     for msg in &mut wire.messages {
-        if !msg
-            .content
-            .iter()
-            .any(|b| matches!(b, Block::Text { text, .. } if text.contains("[img:")))
-        {
+        if msg.role != super::Role::User {
+            continue;
+        }
+        let has_ref = msg.content.iter().any(|b| match b {
+            Block::Text { text, .. } => text.contains("[img:"),
+            Block::ToolResult {
+                content: super::ToolResultContent::Text { text },
+                ..
+            } => text.contains("[img:"),
+            _ => false,
+        });
+        if !has_ref {
             continue;
         }
         let mut rebuilt: Vec<Block> = Vec::with_capacity(msg.content.len());
         for block in std::mem::take(&mut msg.content) {
-            let Block::Text { text, cache } = block else {
-                rebuilt.push(block);
-                continue;
-            };
-            let segs = crate::media::parse_segments(&text);
-            let mut first_text = true;
-            for seg in segs {
-                match seg {
-                    crate::media::Segment::Text(t) => {
-                        if !t.is_empty() {
-                            rebuilt.push(Block::Text {
-                                text: t,
-                                // 缓存断点跟着原来那个文本块走，只落在第一段上。
-                                cache: if first_text { cache } else { None },
-                            });
-                            first_text = false;
-                        }
-                    }
-                    crate::media::Segment::Image(rf) => match crate::media::read(&rf) {
-                        Ok(bytes) => {
-                            use base64::Engine;
-                            rebuilt.push(Block::Image {
-                                source: crate::provider::ImageSource::Base64 {
-                                    media_type: rf.mime().to_string(),
-                                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
-                                },
-                                detail: None,
-                                cache: None,
-                            });
-                            first_text = false;
-                        }
-                        Err(e) => {
-                            // 读不到就把引用原样留成文本：让模型至少知道这里本该有张图，
-                            // 也比静默少一段上下文强。
-                            tracing::warn!("展开图片引用 {} 失败（{e}），保留文本引用", rf.token());
-                            rebuilt.push(Block::text(rf.token()));
-                            first_text = false;
-                        }
-                    },
-                }
+            match block {
+                Block::Text { text, cache } => expand_text_block(&text, cache, &mut rebuilt),
+                Block::ToolResult {
+                    tool_use_id,
+                    content: super::ToolResultContent::Text { text },
+                    is_error,
+                    cache,
+                } if text.contains("[img:") => rebuilt.push(Block::ToolResult {
+                    tool_use_id,
+                    content: expand_tool_result_text(&text),
+                    is_error,
+                    cache,
+                }),
+                other => rebuilt.push(other),
             }
         }
         msg.content = rebuilt;
+    }
+}
+
+/// 一个 user 文本块 → 「文本 / 图片 / 文本」序列，追加进 `out`。
+fn expand_text_block(text: &str, cache: Option<super::CacheMarker>, out: &mut Vec<Block>) {
+    let mut first_text = true;
+    for seg in crate::media::parse_segments(text) {
+        match seg {
+            crate::media::Segment::Text(t) => {
+                if !t.is_empty() {
+                    out.push(Block::Text {
+                        text: t,
+                        // 缓存断点跟着原来那个文本块走，只落在第一段上。
+                        cache: if first_text { cache } else { None },
+                    });
+                    first_text = false;
+                }
+            }
+            crate::media::Segment::Image(rf) => match load_image_base64(&rf) {
+                Some(data) => {
+                    out.push(Block::Image {
+                        source: crate::provider::ImageSource::Base64 {
+                            media_type: rf.mime().to_string(),
+                            data,
+                        },
+                        detail: None,
+                        cache: None,
+                    });
+                    first_text = false;
+                }
+                None => {
+                    // 读不到就把引用原样留成文本：让模型至少知道这里本该有张图，
+                    // 也比静默少一段上下文强。
+                    out.push(Block::text(rf.token()));
+                    first_text = false;
+                }
+            },
+        }
+    }
+}
+
+/// 工具结果的文本 → 多模态块列表。读不到的图同样退回文本引用。
+fn expand_tool_result_text(text: &str) -> super::ToolResultContent {
+    use super::ToolResultBlock;
+    let mut blocks = Vec::new();
+    for seg in crate::media::parse_segments(text) {
+        match seg {
+            crate::media::Segment::Text(t) => {
+                if !t.is_empty() {
+                    blocks.push(ToolResultBlock::Text { text: t });
+                }
+            }
+            crate::media::Segment::Image(rf) => match load_image_base64(&rf) {
+                Some(data) => blocks.push(ToolResultBlock::Image {
+                    url: format!("data:{};base64,{data}", rf.mime()),
+                    detail: None,
+                }),
+                None => blocks.push(ToolResultBlock::Text { text: rf.token() }),
+            },
+        }
+    }
+    super::ToolResultContent::Blocks { blocks }
+}
+
+/// 从媒体库取字节并 base64。失败只记一条告警，由调用方决定怎么退化。
+fn load_image_base64(rf: &crate::media::ImageRef) -> Option<String> {
+    use base64::Engine;
+    match crate::media::read(rf) {
+        Ok(bytes) => Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        Err(e) => {
+            tracing::warn!("展开图片引用 {} 失败（{e}），保留文本引用", rf.token());
+            None
+        }
     }
 }
 
@@ -245,5 +311,89 @@ mod tests {
         let content = &wire.messages[0].content;
         assert_eq!(content.len(), 1);
         assert_eq!(content[0].as_text(), Some("[img:deadbeef.png]"));
+    }
+
+    /// assistant 提到 `[img:…]` 只是在说话，不是在发图。展开了就是 Anthropic 的
+    /// 400 `'image' blocks are not permitted within assistant turns`，而且这句话一旦
+    /// 进了历史，之后整个会话都发不出去。
+    #[test]
+    fn assistant_turns_are_never_expanded() {
+        let rf =
+            crate::media::put_bytes(b"\x89PNG\r\n\x1a\nfake-a", Some("png")).expect("写媒体库");
+        let quoted = format!("工具只回给我一个 `{}` 引用", rf.token());
+        let mut wire = WireRequest::new("m");
+        wire.messages = vec![crate::provider::WireMessage::new(
+            Role::Assistant,
+            vec![Block::text(quoted.clone())],
+        )];
+        expand_image_refs(&mut wire);
+        let content = &wire.messages[0].content;
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0].as_text(), Some(quoted.as_str()));
+    }
+
+    /// `read_file` 读图回的是带引用的文本工具结果：得变成多模态块，模型才真看得到。
+    #[test]
+    fn tool_result_text_refs_expand_into_blocks() {
+        use crate::provider::{ToolResultBlock, ToolResultContent};
+        let rf =
+            crate::media::put_bytes(b"\x89PNG\r\n\x1a\nfake-t", Some("png")).expect("写媒体库");
+        let mut wire = WireRequest::new("m");
+        wire.messages = vec![crate::provider::WireMessage::new(
+            Role::User,
+            vec![Block::ToolResult {
+                tool_use_id: "t1".into(),
+                content: ToolResultContent::text(format!(
+                    "{}\n[image stored: 12 bytes, image/png mime]",
+                    rf.token()
+                )),
+                is_error: false,
+                cache: None,
+            }],
+        )];
+        expand_image_refs(&mut wire);
+        let Block::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = &wire.messages[0].content[0]
+        else {
+            panic!("工具结果块应原位保留：{:?}", wire.messages[0].content);
+        };
+        assert_eq!(tool_use_id, "t1");
+        let ToolResultContent::Blocks { blocks } = content else {
+            panic!("应展开成多模态块：{content:?}");
+        };
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        match &blocks[0] {
+            ToolResultBlock::Image { url, .. } => {
+                assert!(url.starts_with("data:image/png;base64,"), "{url}");
+            }
+            other => panic!("第一块应是图片，得到 {other:?}"),
+        }
+        assert!(matches!(
+            &blocks[1],
+            ToolResultBlock::Text { text } if text.contains("[image stored:")
+        ));
+    }
+
+    /// 工具结果没有引用时一个字节都不动 —— `Text` 形态在 wire 上是裸字符串，
+    /// 无故改成块数组会让缓存失效。
+    #[test]
+    fn tool_result_without_refs_is_left_alone() {
+        use crate::provider::ToolResultContent;
+        let mut wire = WireRequest::new("m");
+        let block = Block::ToolResult {
+            tool_use_id: "t2".into(),
+            content: ToolResultContent::text("plain output"),
+            is_error: false,
+            cache: None,
+        };
+        wire.messages = vec![crate::provider::WireMessage::new(
+            Role::User,
+            vec![block.clone()],
+        )];
+        expand_image_refs(&mut wire);
+        assert_eq!(wire.messages[0].content, vec![block]);
     }
 }

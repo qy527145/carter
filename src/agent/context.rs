@@ -171,8 +171,15 @@ fn strip_old_image_refs(messages: &mut [WireMessage], keep_recent: usize) -> usi
     let mut stripped = 0usize;
     for msg in messages.iter_mut().take(cutoff) {
         for block in &mut msg.content {
-            if let Block::Text { text, .. } = block {
-                stripped += strip_in_str(text);
+            match block {
+                Block::Text { text, .. } => stripped += strip_in_str(text),
+                // `read_file` 读图回的是带引用的文本工具结果，provider 边界会把它
+                // 展开成多模态块 —— 旧轮次的也得剔，不然图照样发出去。
+                Block::ToolResult {
+                    content: ToolResultContent::Text { text },
+                    ..
+                } => stripped += strip_in_str(text),
+                _ => {}
             }
         }
     }
@@ -528,6 +535,26 @@ mod tests {
         assert!(first.contains("[image elided]"));
         assert!(!first.contains("[img:abc"));
         assert!(msgs[2].concat_text().contains("[img:def.png]"));
+    }
+
+    /// 工具结果里的引用也要剔：provider 边界会把它们展开成真图。
+    #[test]
+    fn strip_old_image_refs_also_covers_tool_results() {
+        let mut msgs = vec![
+            tool_msg(
+                "a",
+                "[img:abc.png]\n[image stored: 1 bytes, image/png mime]",
+            ),
+            assistant_ir("answer"),
+            tool_msg(
+                "b",
+                "[img:def.png]\n[image stored: 1 bytes, image/png mime]",
+            ),
+        ];
+        let n = super::strip_old_image_refs(&mut msgs, 1);
+        assert_eq!(n, 1);
+        assert!(tool_text(&msgs[0]).contains("[image elided]"));
+        assert!(tool_text(&msgs[2]).contains("[img:def.png]"));
     }
 
     #[test]
