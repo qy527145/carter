@@ -18,6 +18,8 @@ cat task.md | carter -                             # `-` = 从 stdin 读
 | `--output-format text\|json\|stream-json` | 输出形态，见下 |
 | `--max-turns <N>` | 覆盖配置 `agent.max_turns`（单条 prompt 的模型调用轮数上限，默认 50）。长任务记得调高 |
 | `--timeout <SECS>` | 总时长上限；到点取消并以退出码 124 退出 |
+| `--goal` | 目标模式：模型停下而任务未完成时自动推它继续，见下 |
+| `--max-continues <N>` | 目标模式的自动继续次数上限（默认 20） |
 | `--cwd <DIR>` | 工作目录（会话、CARTER.md 记忆、工具相对路径都以它为准） |
 | `--model <provider/model>` | 覆盖配置里的模型 |
 | `--no-memory` | 不注入 CARTER.md / AGENTS.md |
@@ -52,7 +54,41 @@ cat task.md | carter -                             # `-` = 从 stdin 读
 **`stream-json`**：每个事件一行 NDJSON（事件类型与 [ndjson.md](ndjson.md) 的 Event 一致），
 最后一行是上面那个 `result` 对象。适合既要过程又要汇总的评测日志。
 
+## 目标模式（`--goal`）
+
+默认的一次性模式只跑**一轮**：模型给出一条不带工具调用的回复就结束。长任务里模型
+经常做到一半停下来汇报进度、或问「要继续吗」，这一停进程就退出了。
+
+`--goal` 把 prompt 当作长任务目标，和 TUI 里的 `/goal` 走同一套状态机：
+
+- 目标正文挂到系统提示末尾，模型知道自己该持续推进、做完要调 `goal_update`；
+- 模型停下而目标未完成时，carter 追加一条「自动继续」指令再跑一轮；
+- 终止条件（任一满足即停）：模型报 `completed` / `blocked` / `needs_user`；
+  连续 2 轮没调任何工具（空转）；本轮出错或触顶 `--max-turns`；
+  自动继续次数到 `--max-continues`；Ctrl+C 或 `--timeout`。
+
+```bash
+carter --goal --max-turns 200 --timeout 3600 --output-format json --prompt-file task.md
+```
+
+JSON 结果多一个 `goal` 字段：
+
+```json
+"goal":{"status":"completed","reason":"目标已完成","note":"模型写的收尾说明","auto_continues":3}
+```
+
+`status` 取值：`completed`、`blocked`、`paused`（需要用户拍板 / 空转 / 出错 / 触顶，
+看 `reason`）、`active`（被 Ctrl+C 或超时打断）。`stream-json` 里每次自动继续会发一条
+`divider` 事件（`自动继续 N/M`），终止原因以 `notice` 事件发出。
+
+目标状态会落盘到 `~/.carter/goals/<session_id>.json`，之后 `carter -r <id>` 进 TUI
+能看到它停在哪、用 `/goal resume` 接着推。
+
 ## 评测时的注意点
+
+- 要一次性跑完的长任务用 `--goal`，否则模型中途停下来汇报进度就结束了。
+  `--max-turns` 是**整个进程**累计的模型调用轮数上限（自动继续的轮次也计入），
+  长任务要一起调高。
 
 - 一次性模式没有人在那头：模型调 `ask_user_question` 时自动选每题第一个选项；
   没有后台命令表、没有 `/goal` 自动推进。

@@ -86,6 +86,16 @@ struct RunArgs {
     #[arg(long, value_name = "SECS")]
     timeout: Option<u64>,
 
+    /// 目标模式：把 prompt 当作长任务目标。模型停下而目标未完成时自动追加一条
+    /// 「继续」再跑一轮，直到模型通过 `goal_update` 报告完成 / 被卡住 / 需要用户拍板，
+    /// 或连续空转、出错、触顶自动继续次数。无人值守跑长任务用这个。
+    #[arg(long)]
+    goal: bool,
+
+    /// 目标模式的自动继续次数上限（缺省 20）。
+    #[arg(long, value_name = "N", requires = "goal")]
+    max_continues: Option<u32>,
+
     /// 工作目录（缺省当前目录）。会话、记忆文件、工具的相对路径都以它为准。
     #[arg(long, value_name = "DIR")]
     cwd: Option<String>,
@@ -300,6 +310,10 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
             format: args.output_format,
             color: !args.no_color && color_allowed(),
             timeout: args.timeout.map(std::time::Duration::from_secs),
+            goal: args.goal,
+            max_continues: args
+                .max_continues
+                .unwrap_or(crate::goal::MAX_AUTO_CONTINUES),
         };
         run_oneshot(
             thread,
@@ -526,6 +540,9 @@ struct OneshotOpts {
     format: OutputFormat,
     color: bool,
     timeout: Option<std::time::Duration>,
+    /// 目标模式（见 `RunArgs::goal`）。
+    goal: bool,
+    max_continues: u32,
 }
 
 /// 一次性模式的最终汇总（`--output-format json` 整个 stdout 就是它；
@@ -548,6 +565,24 @@ struct OneshotResult {
     cost_usd: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// `--goal` 时才有：目标最终状态与自动继续次数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goal: Option<GoalSummary>,
+}
+
+/// 目标模式的收尾信息。`status` 取值同 [`crate::goal::GoalStatus::as_str`]：
+/// `completed` / `blocked` / `paused`（需要用户拍板、空转、出错、触顶都落在这里，
+/// 看 `reason`）/ `active`（被 Ctrl+C / 超时打断，目标本身没有收束）。
+#[derive(Debug, serde::Serialize)]
+struct GoalSummary {
+    status: &'static str,
+    /// 为什么停下（`decide_after_turn` 给的那句话）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// 模型在 `goal_update` 里写的说明。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    auto_continues: u32,
 }
 
 /// 一次性 stdout 模式（向后兼容 M1–M3）。
@@ -579,10 +614,10 @@ async fn run_oneshot(
         // 被 hook 阻断。
         return Ok(std::process::ExitCode::SUCCESS);
     };
-    thread.append_user(prompt);
+    thread.append_user(prompt.clone());
     // 子 agent 复用人设段（system[0]）作为其 base system。
     let base_system = system.first().cloned().unwrap_or_default();
-    let run_opts = RunOptions {
+    let mut run_opts = RunOptions {
         show_thinking,
         system,
         compact_model: Some(crate::agent::CompactModel {
@@ -594,6 +629,17 @@ async fn run_oneshot(
         steer: None,
     };
     let cancel = CancelToken::new();
+    // 目标模式：目标正文就是这条 prompt；目标段挂到系统提示末尾（见 `goal::system_segment`）。
+    let mut goal: Option<crate::goal::Goal> = opts.goal.then(|| crate::goal::Goal::new(&prompt));
+    let goal_signal: Option<Arc<crate::goal::GoalSignal>> = opts
+        .goal
+        .then(|| Arc::new(crate::goal::GoalSignal::default()));
+    if let Some(seg) = goal.as_ref().and_then(crate::goal::system_segment) {
+        run_opts.system.push(seg);
+    }
+    if let Some(sig) = &goal_signal {
+        sig.set_armed(true);
+    }
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
     let tools = crate::agent::build_tools(
         config.skills.enabled,
@@ -606,8 +652,9 @@ async fn run_oneshot(
         None, // oneshot 模式无 TUI，ask_user_question 工具不可用
         None, // 一次性执行没有下一轮来接着做，后台命令表没有意义
         Some(cwd.clone()),
-        // oneshot 没有自动继续：跑完就退出，`goal_update` 留着只会让模型以为有人接着推。
-        None,
+        // 只有 `--goal` 才挂 `goal_update`：普通一次性执行跑完就退出，
+        // 留着这个工具只会让模型以为有人接着推。
+        goal_signal.clone(),
     );
 
     // 出口按输出形态选：text 裸打印；json 静默只留汇总；stream-json 走 NDJSON 事件行。
@@ -658,27 +705,96 @@ async fn run_oneshot(
         })
     };
 
-    let run_res = run_turn(
-        &mut thread,
-        &*provider,
-        &model,
-        &config.agent,
-        &run_opts,
-        &tools,
-        &mut sink,
-        &cancel,
-    )
-    .await;
+    // 一轮，加上 `--goal` 推起来的自动继续。退出条件全在 `goal::decide_after_turn`
+    // （与 TUI 共用同一个纯函数），这里只负责照做。没开目标模式时循环只跑一次。
+    let mut usage = crate::provider::Usage::default();
+    let mut idle_streak: u32 = 0;
+    let mut goal_reason: Option<String> = None;
+    let outcome = loop {
+        let before = thread.messages.len();
+        let run_res = run_turn(
+            &mut thread,
+            &*provider,
+            &model,
+            &config.agent,
+            &run_opts,
+            &tools,
+            &mut sink,
+            &cancel,
+        )
+        .await;
+        // 致命错误（provider 连不上等）在 json 形态下也要进汇总，而不是只剩 stderr 一行。
+        let (outcome, turn_usage) = match run_res {
+            Ok(v) => v,
+            Err(e) => (TurnOutcome::Error(e.to_string()), Default::default()),
+        };
+        usage.add(&turn_usage);
+
+        let (Some(g), Some(sig)) = (goal.as_mut(), goal_signal.as_ref()) else {
+            break outcome;
+        };
+        // 这一轮到底动了没有：历史里新出现的工具调用就是「在干活」。
+        let used_tools = thread.messages[before..].iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, crate::provider::Block::ToolUse { .. }))
+        });
+        idle_streak = if used_tools { 0 } else { idle_streak + 1 };
+        g.idle_streak = idle_streak;
+        let decision = crate::goal::decide_after_turn(
+            g,
+            &crate::goal::GoalOutcome {
+                user_cancelled: matches!(outcome, TurnOutcome::Cancelled),
+                failed: matches!(outcome, TurnOutcome::Limit | TurnOutcome::Error(_)),
+                used_tools,
+                idle_streak,
+                signal: sig.take(),
+            },
+        );
+        match decision {
+            crate::goal::Decision::None => break outcome,
+            crate::goal::Decision::Set {
+                status,
+                note,
+                notice,
+            } => {
+                g.status = status;
+                g.note = note;
+                g.updated_at = crate::session::now_ms();
+                sink.emit(crate::agent::UiEvent::Notice(notice.clone()));
+                goal_reason = Some(notice);
+                break outcome;
+            }
+            // 上限用 CLI 自己的（`--max-continues`），决策函数里那个常量只是缺省值。
+            crate::goal::Decision::Continue if g.auto_continues >= opts.max_continues => {
+                g.status = crate::goal::GoalStatus::Paused;
+                g.updated_at = crate::session::now_ms();
+                let notice = format!("已连续自动继续 {} 轮，停下。", opts.max_continues);
+                sink.emit(crate::agent::UiEvent::Notice(notice.clone()));
+                goal_reason = Some(notice);
+                break outcome;
+            }
+            crate::goal::Decision::Continue => {
+                g.auto_continues += 1;
+                if cancel.is_cancelled() {
+                    break outcome;
+                }
+                sink.emit(crate::agent::UiEvent::Divider(format!(
+                    "自动继续 {}/{}",
+                    g.auto_continues, opts.max_continues
+                )));
+                thread.append_user(crate::goal::CONTINUE_PROMPT);
+            }
+        }
+    };
     watchdog.abort();
+    // 目标状态落盘：`-r` 续接这个会话进 TUI 时能看到它停在哪。
+    if let Some(g) = &goal {
+        let _ = crate::goal::save(&session_meta.id, g);
+    }
 
     // 回收 MCP 子进程（无论成功失败都先 shutdown，再传播错误）。
     mcp_mgr.shutdown().await;
-
-    // 致命错误（provider 连不上等）在 json 形态下也要进汇总，而不是只剩 stderr 一行。
-    let (outcome, usage) = match run_res {
-        Ok(v) => v,
-        Err(e) => (TurnOutcome::Error(e.to_string()), Default::default()),
-    };
     let outcome = match outcome {
         TurnOutcome::Cancelled if timed_out.load(std::sync::atomic::Ordering::SeqCst) => {
             TurnOutcome::Error(format!(
@@ -722,6 +838,12 @@ async fn run_oneshot(
             // 六位小数：再往后全是浮点噪声（0.048438999999）。
             cost_usd: (crate::cost::compute(&usage, &model.pricing) * 1e6).round() / 1e6,
             error,
+            goal: goal.as_ref().map(|g| GoalSummary {
+                status: g.status.as_str(),
+                reason: goal_reason.clone(),
+                note: g.note.clone(),
+                auto_continues: g.auto_continues,
+            }),
         };
         let line = serde_json::to_string(&summary).unwrap_or_else(|e| {
             format!("{{\"type\":\"result\",\"outcome\":\"error\",\"error\":\"serialize: {e}\"}}")
