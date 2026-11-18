@@ -1,9 +1,10 @@
 [package]
 name = "carter"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Carter — a Rust agent CLI with an interactive TUI, multi-provider LLM support, skills, and MCP integration."
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/qy527145/carter"
 authors = ["wmymz"]
 
