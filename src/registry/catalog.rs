@@ -49,6 +49,18 @@ impl ModelEntry {
     }
 }
 
+/// 目录里有没有这个服务商。
+///
+/// 判断「这条模型查不到」该不该当成错误用得上：服务商在目录里、这条查不到 = meta
+/// 写错了，要报给用户；服务商本来就不在目录里（用户自己起的 `ws`、本地 Ollama）=
+/// 正常情况，合成一份最小元数据让它开起来。
+pub fn has_provider(cache_json: &str, provider_id: &str) -> bool {
+    serde_json::from_str::<Value>(cache_json)
+        .ok()
+        .and_then(|root| root.get(provider_id).map(|_| ()))
+        .is_some()
+}
+
 /// 全部 provider，按模型数量降序（大厂在前），同数量按 id。
 pub fn providers(cache_json: &str) -> Vec<ProviderEntry> {
     let Ok(root) = serde_json::from_str::<Value>(cache_json) else {

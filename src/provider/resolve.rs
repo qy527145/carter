@@ -42,6 +42,22 @@ pub fn resolve_provider_lenient(
     resolve_with_model(config, model, extra_hooks)
 }
 
+/// 同 [`resolve_provider`]，但「服务商不在目录里」的模型（本地 Ollama、用户自建的
+/// 渠道）也放行，合成一份最小元数据。
+///
+/// 宿主给模型列表、开会话走这一版：本地跑什么模型 models.dev 不可能收全，而那些
+/// 模型照样能用。服务商在目录里却查不到这条，仍然按配置错误报回去 —— 那是 meta
+/// 拼错了，静默放行会让用户带着错误的上下文窗口撞墙。
+pub fn resolve_provider_local(
+    config: &Config,
+    cache_json: &str,
+    model_ref: &str,
+    extra_hooks: Vec<Arc<dyn llm_adapt_core::RequestHook>>,
+) -> Result<ResolvedProvider> {
+    let model = crate::registry::resolve_model_local(config, cache_json, model_ref)?;
+    resolve_with_model(config, model, extra_hooks)
+}
+
 fn resolve_with_model(
     config: &Config,
     model: crate::registry::ModelInfo,

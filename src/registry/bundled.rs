@@ -27,6 +27,18 @@ pub fn bundled_json() -> &'static str {
     })
 }
 
+/// 快照是哪天生成的（`YYYY-MM-DD`）。界面用它告诉用户「你用的是哪天的目录」,
+/// 否则没法判断该不该联网刷新一次。
+pub fn bundled_date() -> Option<&'static str> {
+    static DATE: OnceLock<Option<String>> = OnceLock::new();
+    DATE.get_or_init(|| {
+        let root: serde_json::Value = serde_json::from_str(bundled_json()).ok()?;
+        let date = root.get("$generated_at")?.as_str()?;
+        Some(date.to_string())
+    })
+    .as_deref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +51,34 @@ mod tests {
             assert!(root.get(p).is_some(), "内置快照应包含 {p}");
         }
         assert!(super::super::models_dev::lookup(json, "anthropic", "claude-sonnet-4-5").is_some());
+    }
+
+    /// 界面要显示「内置快照（x 月 y 日）」—— 没这个日期，用户不知道手里的目录
+    /// 是刚拉的还是半年前发版带进来的。
+    #[test]
+    fn bundled_snapshot_carries_its_generation_date() {
+        let d = bundled_date().expect("快照里应有 $generated_at");
+        assert_eq!(d.len(), 10, "应形如 YYYY-MM-DD，实际是 {d}");
+        assert_eq!(d.as_bytes()[4], b'-');
+    }
+
+    /// 快照要带上「按 base_url 认服务商」与「转售条目指回原厂」要用的字段 ——
+    /// 宿主靠它们判断该去哪家查元数据、定价该按哪家算。
+    #[test]
+    fn bundled_snapshot_keeps_endpoint_and_canonical_fields() {
+        let root: serde_json::Value = serde_json::from_str(bundled_json()).unwrap();
+        let with_api = root
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, p)| !k.starts_with('$') && p.get("api").is_some())
+            .count();
+        assert!(with_api > 100, "带 api 字段的服务商太少：{with_api}");
+        let with_canonical = root["deepseek"]["models"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|m| m.get("canonical_model_id").is_some() || m.get("status").is_some());
+        assert!(with_canonical, "快照里应保留 canonical_model_id / status");
     }
 }
