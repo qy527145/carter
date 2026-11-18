@@ -11,4 +11,6 @@ mod reader;
 mod runner;
 mod sink;
 
+pub use protocol::WireUsage;
 pub use runner::run_ndjson;
+pub use sink::NdjsonSink;

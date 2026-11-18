@@ -25,11 +25,25 @@ pub type PendingAsks = Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<Vec<String>>>>
 pub struct NdjsonSink {
     /// 共享给 stdin 读取任务的 pending ask 表。
     asks: PendingAsks,
+    /// 没有 host 在 stdin 那头回话（`--output-format stream-json` 的一次性模式）：
+    /// `ask_user` 事件照发，但答案由本 sink 当场按首选项填上，否则工具会一直等。
+    auto_answer: bool,
 }
 
 impl NdjsonSink {
     pub fn new(asks: PendingAsks) -> Self {
-        Self { asks }
+        Self {
+            asks,
+            auto_answer: false,
+        }
+    }
+
+    /// 单向版本：只往 stdout 写事件，不指望 stdin 有人回。
+    pub fn detached() -> Self {
+        Self {
+            asks: Arc::new(Mutex::new(HashMap::new())),
+            auto_answer: true,
+        }
     }
 
     fn write_event(&self, event: &Event) {
@@ -80,7 +94,19 @@ impl UiSink for NdjsonSink {
                 // 设计上"只有一个 sink 应该消费"。这里 take 出来移交 pending 表。
                 if let Ok(mut guard) = response_tx.lock() {
                     if let Some(tx) = guard.take() {
-                        if let Ok(mut pending) = self.asks.lock() {
+                        if self.auto_answer {
+                            // 与 StdoutSink 的 oneshot 策略一致：每题取第一个选项，无选项则跳过。
+                            let answers: Vec<Vec<String>> = questions
+                                .iter()
+                                .map(|q| {
+                                    q.options
+                                        .first()
+                                        .map(|o| vec![o.label.clone()])
+                                        .unwrap_or_default()
+                                })
+                                .collect();
+                            let _ = tx.send(answers);
+                        } else if let Ok(mut pending) = self.asks.lock() {
                             pending.insert(id, tx);
                         }
                     }

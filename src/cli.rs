@@ -11,7 +11,9 @@ use crate::error::Result;
 
 use std::sync::Arc;
 
-use crate::agent::{CancelToken, RunOptions, StdoutSink, Thread, TurnOutcome, run_turn};
+use crate::agent::{
+    CancelToken, Capture, NullSink, RunOptions, StdoutSink, Thread, TurnOutcome, UiSink, run_turn,
+};
 use crate::config::Config;
 use crate::provider::LlmProvider;
 use crate::registry::fetch;
@@ -48,10 +50,49 @@ enum Command {
     },
 }
 
+/// 一次性模式的输出形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    /// 边跑边打印（默认）。
+    Text,
+    /// 过程静默，结束时 stdout 只有一个 JSON 对象。
+    Json,
+    /// 每个事件一行 NDJSON，末尾一行 `result` 事件。
+    StreamJson,
+}
+
 #[derive(Parser, Debug)]
 struct RunArgs {
     /// 一次性提示词（提供则走一次性 stdout 模式；缺省进交互式 TUI REPL）。
+    /// 写 `-` 表示从 stdin 读整段 prompt。
     prompt: Option<String>,
+
+    /// 从文件读 prompt（长任务描述写进文件比塞命令行省心）。与位置参数二选一。
+    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    prompt_file: Option<String>,
+
+    /// 一次性模式的输出形态：
+    /// `text` 边跑边打印（默认）；`json` 过程静默、结束时 stdout 只给一个 JSON 结果对象；
+    /// `stream-json` 过程按 NDJSON 事件逐行输出，最后一行是 `result` 事件。
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    output_format: OutputFormat,
+
+    /// 覆盖配置里的 `agent.max_turns`（单次 prompt 允许的模型调用轮数上限）。
+    /// 跑长任务时把它调高，否则 50 轮一到就被截断。
+    #[arg(long, value_name = "N")]
+    max_turns: Option<u32>,
+
+    /// 一次性模式的总时长上限（秒）。到点取消本轮并以退出码 124 退出。
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<u64>,
+
+    /// 工作目录（缺省当前目录）。会话、记忆文件、工具的相对路径都以它为准。
+    #[arg(long, value_name = "DIR")]
+    cwd: Option<String>,
+
+    /// 文本输出不带 ANSI 颜色（stdout 不是终端或设了 `NO_COLOR` 时自动关闭）。
+    #[arg(long)]
+    no_color: bool,
 
     /// 模型引用 `provider/model`（缺省取配置 agent.model）。
     #[arg(long)]
@@ -167,6 +208,13 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
 
     let args = cli.run;
 
+    // `--cwd`：越早切越好 —— 后面的会话定位、记忆发现、工具相对路径全看进程 cwd。
+    if let Some(dir) = &args.cwd {
+        std::env::set_current_dir(dir).map_err(|e| {
+            crate::error::CarterError::Config(format!("无法切换到工作目录 {dir}: {e}"))
+        })?;
+    }
+
     // 首次运行向导：无 config.toml 且处于交互式终端时，引导生成一份并重载。
     if crate::wizard::ensure_config().await? {
         config = Config::load()?;
@@ -177,6 +225,13 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
     if let Some(path) = &args.system_prompt_file {
         config.agent.system_prompt_file = Some(path.clone());
     }
+    // `--max-turns` 覆盖配置：长任务评测时 50 轮远远不够。
+    if let Some(n) = args.max_turns {
+        config.agent.max_turns = n;
+    }
+
+    // prompt 来源：位置参数 / `-`（stdin）/ `--prompt-file`。先读出来再决定走哪条路。
+    let prompt = read_prompt_source(&args)?;
 
     // 模型元数据：读 ~/.carter/models.json 缓存（缺失给友好提示）。
     let cache_json = fetch::read_cache()?;
@@ -240,11 +295,16 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
             cwd,
         )
         .await
-    } else if args.prompt.is_some() || args.no_tui {
-        let prompt = args.prompt.clone().unwrap_or_default();
+    } else if prompt.is_some() || args.no_tui {
+        let opts = OneshotOpts {
+            format: args.output_format,
+            color: !args.no_color && color_allowed(),
+            timeout: args.timeout.map(std::time::Duration::from_secs),
+        };
         run_oneshot(
             thread,
-            prompt,
+            session_meta,
+            prompt.unwrap_or_default(),
             provider,
             model,
             fast_provider,
@@ -252,6 +312,7 @@ pub async fn run_cli() -> Result<std::process::ExitCode> {
             config,
             show_thinking,
             system,
+            opts,
         )
         .await
     } else {
@@ -434,9 +495,66 @@ fn count_models(json: &str) -> (usize, usize) {
     (providers, models)
 }
 
+/// prompt 来源：位置参数（`-` = stdin）或 `--prompt-file`。都没给返回 None（进 TUI）。
+fn read_prompt_source(args: &RunArgs) -> Result<Option<String>> {
+    if let Some(path) = &args.prompt_file {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            crate::error::CarterError::Config(format!("读取 prompt 文件 {path} 失败: {e}"))
+        })?;
+        return Ok(Some(text.trim_end().to_string()));
+    }
+    match args.prompt.as_deref() {
+        Some("-") => {
+            use std::io::Read;
+            let mut text = String::new();
+            std::io::stdin().read_to_string(&mut text)?;
+            Ok(Some(text.trim_end().to_string()))
+        }
+        Some(p) => Ok(Some(p.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// stdout 是终端且没设 `NO_COLOR` 才上色。管道 / 重定向到文件时裸文本更好用。
+fn color_allowed() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+/// 一次性模式的几个开关，免得 `run_oneshot` 的参数表再长下去。
+struct OneshotOpts {
+    format: OutputFormat,
+    color: bool,
+    timeout: Option<std::time::Duration>,
+}
+
+/// 一次性模式的最终汇总（`--output-format json` 整个 stdout 就是它；
+/// `stream-json` 作为最后一行 `result` 事件）。字段名一旦发出就是对外约定，别随手改。
+#[derive(Debug, serde::Serialize)]
+struct OneshotResult {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    /// `assistant`（正常收尾）/ `limit`（触顶 max_turns）/ `cancelled`
+    /// （Ctrl+C）/ `timeout` / `error`。
+    outcome: &'static str,
+    session_id: String,
+    model: String,
+    /// 最后一段 assistant 正文。
+    result: String,
+    /// 本次 prompt 实际发出的模型请求数。
+    turns: u32,
+    duration_ms: u64,
+    usage: crate::ndjson::WireUsage,
+    cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 /// 一次性 stdout 模式（向后兼容 M1–M3）。
+#[allow(clippy::too_many_arguments)]
 async fn run_oneshot(
     mut thread: Thread,
+    session_meta: crate::session::SessionMeta,
     prompt: String,
     provider: Arc<dyn LlmProvider>,
     model: crate::registry::ModelInfo,
@@ -445,7 +563,9 @@ async fn run_oneshot(
     config: Config,
     show_thinking: bool,
     system: Vec<String>,
+    opts: OneshotOpts,
 ) -> Result<std::process::ExitCode> {
+    let started = std::time::Instant::now();
     // 续接时 thread 已含历史；追加本次 prompt（并落盘）。
     // `@图片.png` 等内联图片附件先转成 `[img:...]` token，便于 provider 边界组多模态。
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -489,7 +609,14 @@ async fn run_oneshot(
         // oneshot 没有自动继续：跑完就退出，`goal_update` 留着只会让模型以为有人接着推。
         None,
     );
-    let mut sink = StdoutSink::new();
+
+    // 出口按输出形态选：text 裸打印；json 静默只留汇总；stream-json 走 NDJSON 事件行。
+    // 三种都包一层 Capture，拿到最终正文给汇总用。
+    let mut sink: Capture<Box<dyn UiSink>> = Capture::new(match opts.format {
+        OutputFormat::Text => Box::new(StdoutSink::new().with_color(opts.color)),
+        OutputFormat::Json => Box::new(NullSink),
+        OutputFormat::StreamJson => Box::new(crate::ndjson::NdjsonSink::detached()),
+    });
 
     // SessionStart hook：oneshot 也算一次 session。
     hooks
@@ -503,6 +630,34 @@ async fn run_oneshot(
         )
         .await;
 
+    // Ctrl+C → 协作式取消（让这一轮正常收尾、MCP 子进程回收），不是硬杀。
+    // `--timeout` 同理：到点只是 set 同一个 token。
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let cancel = cancel.clone();
+        let interrupted = interrupted.clone();
+        let timed_out = timed_out.clone();
+        let timeout = opts.timeout;
+        tokio::spawn(async move {
+            let sleep = async {
+                match timeout {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ = sleep => {
+                    timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            cancel.set();
+        })
+    };
+
     let run_res = run_turn(
         &mut thread,
         &*provider,
@@ -514,10 +669,26 @@ async fn run_oneshot(
         &cancel,
     )
     .await;
+    watchdog.abort();
 
     // 回收 MCP 子进程（无论成功失败都先 shutdown，再传播错误）。
     mcp_mgr.shutdown().await;
-    let (outcome, usage) = run_res?;
+
+    // 致命错误（provider 连不上等）在 json 形态下也要进汇总，而不是只剩 stderr 一行。
+    let (outcome, usage) = match run_res {
+        Ok(v) => v,
+        Err(e) => (TurnOutcome::Error(e.to_string()), Default::default()),
+    };
+    let outcome = match outcome {
+        TurnOutcome::Cancelled if timed_out.load(std::sync::atomic::Ordering::SeqCst) => {
+            TurnOutcome::Error(format!(
+                "timeout after {}s",
+                opts.timeout.map(|d| d.as_secs()).unwrap_or_default()
+            ))
+        }
+        o => o,
+    };
+    let is_timeout = timed_out.load(std::sync::atomic::Ordering::SeqCst);
 
     // SessionEnd hook：返回最终用量。
     hooks
@@ -531,7 +702,44 @@ async fn run_oneshot(
         )
         .await;
 
-    Ok(outcome_to_code(outcome))
+    if !matches!(opts.format, OutputFormat::Text) {
+        let (label, error) = match &outcome {
+            TurnOutcome::Assistant => ("assistant", None),
+            TurnOutcome::Limit => ("limit", None),
+            TurnOutcome::Cancelled => ("cancelled", None),
+            TurnOutcome::Error(msg) if is_timeout => ("timeout", Some(msg.clone())),
+            TurnOutcome::Error(msg) => ("error", Some(msg.clone())),
+        };
+        let summary = OneshotResult {
+            kind: "result",
+            outcome: label,
+            session_id: session_meta.id.clone(),
+            model: model.key.clone(),
+            result: sink.final_text().to_string(),
+            turns: thread.turns,
+            duration_ms: started.elapsed().as_millis() as u64,
+            usage: crate::ndjson::WireUsage::from(&usage),
+            // 六位小数：再往后全是浮点噪声（0.048438999999）。
+            cost_usd: (crate::cost::compute(&usage, &model.pricing) * 1e6).round() / 1e6,
+            error,
+        };
+        let line = serde_json::to_string(&summary).unwrap_or_else(|e| {
+            format!("{{\"type\":\"result\",\"outcome\":\"error\",\"error\":\"serialize: {e}\"}}")
+        });
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    }
+
+    if is_timeout {
+        // 与 coreutils `timeout` 的约定一致。
+        return Ok(std::process::ExitCode::from(124));
+    }
+    Ok(outcome_to_code(
+        outcome,
+        matches!(opts.format, OutputFormat::Text),
+    ))
 }
 
 /// 交互式 TUI REPL 模式。agent loop 跑在独立任务里，经通道与 TUI 通信。
@@ -1421,12 +1629,16 @@ fn current_meta_placeholder() -> crate::session::SessionMeta {
     }
 }
 
-fn outcome_to_code(outcome: TurnOutcome) -> std::process::ExitCode {
+/// turn 结果 → 进程退出码。`print_error` 为 false 时错误已经进了 JSON 汇总，
+/// 不再往 stderr 重复一遍。
+fn outcome_to_code(outcome: TurnOutcome, print_error: bool) -> std::process::ExitCode {
     match outcome {
         TurnOutcome::Assistant | TurnOutcome::Limit => std::process::ExitCode::SUCCESS,
         TurnOutcome::Cancelled => std::process::ExitCode::from(130),
         TurnOutcome::Error(msg) => {
-            eprintln!("turn error: {msg}");
+            if print_error {
+                eprintln!("turn error: {msg}");
+            }
             std::process::ExitCode::FAILURE
         }
     }

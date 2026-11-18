@@ -188,14 +188,94 @@ impl CancelToken {
 
 /// 裸 ANSI sink —— 把 M3 之前 turn.rs 里的打印逻辑搬到这里。
 /// 供 `--no-tui` / 一次性 / 管道场景。
-#[derive(Default)]
+///
+/// `color = false` 时一个转义序列都不写：输出要进文件、进评测脚本的时候，
+/// 夹着 ANSI 码的文本得先洗一遍才能用。
 pub struct StdoutSink {
     in_thinking: bool,
+    color: bool,
+}
+
+impl Default for StdoutSink {
+    fn default() -> Self {
+        Self {
+            in_thinking: false,
+            color: true,
+        }
+    }
 }
 
 impl StdoutSink {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 是否输出 ANSI 颜色。
+    pub fn with_color(mut self, color: bool) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// 颜色开着就返回转义序列，否则空串。
+    fn c(&self, code: &'static str) -> &'static str {
+        if self.color { code } else { "" }
+    }
+}
+
+impl UiSink for Box<dyn UiSink> {
+    fn emit(&mut self, ev: UiEvent) {
+        (**self).emit(ev)
+    }
+}
+
+/// 什么都不输出的 sink。JSON 结果模式用：过程不打印，只要最后那份汇总。
+#[derive(Default)]
+pub struct NullSink;
+
+impl UiSink for NullSink {
+    fn emit(&mut self, _ev: UiEvent) {}
+}
+
+/// 包一层：事件原样转给内层 sink，顺手记下**最后一段** assistant 正文。
+///
+/// 一次性 / 评测场景要的是「模型最终说了什么」，而 `run_turn` 只返回 outcome 和用量；
+/// 正文只经过 sink 流过去。与其让 turn 层多返回一个字段，不如在出口处截一份。
+pub struct Capture<S: UiSink> {
+    inner: S,
+    current: String,
+    last: String,
+}
+
+impl<S: UiSink> Capture<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            current: String::new(),
+            last: String::new(),
+        }
+    }
+
+    /// 最后一个已结束的 assistant 文本块；若最后一块没收到 `AssistantTextEnd`
+    /// （中途取消）则返回那半截。
+    pub fn final_text(&self) -> &str {
+        if self.current.is_empty() {
+            &self.last
+        } else {
+            &self.current
+        }
+    }
+}
+
+impl<S: UiSink> UiSink for Capture<S> {
+    fn emit(&mut self, ev: UiEvent) {
+        match &ev {
+            UiEvent::AssistantTextDelta(t) => self.current.push_str(t),
+            UiEvent::AssistantTextEnd if !self.current.is_empty() => {
+                self.last = std::mem::take(&mut self.current);
+            }
+            _ => {}
+        }
+        self.inner.emit(ev);
     }
 }
 
@@ -203,10 +283,19 @@ impl UiSink for StdoutSink {
     fn emit(&mut self, ev: UiEvent) {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        let (reset, dim, cyan, green, red, yellow, magenta) = (
+            self.c("\x1b[0m"),
+            self.c("\x1b[90m"),
+            self.c("\x1b[36m"),
+            self.c("\x1b[32m"),
+            self.c("\x1b[31m"),
+            self.c("\x1b[33m"),
+            self.c("\x1b[35m"),
+        );
         match ev {
             UiEvent::ThinkingDelta(t) => {
                 if !self.in_thinking {
-                    let _ = write!(out, "\x1b[90m[thinking] ");
+                    let _ = write!(out, "{dim}[thinking] ");
                     self.in_thinking = true;
                 }
                 let _ = write!(out, "{t}");
@@ -214,7 +303,7 @@ impl UiSink for StdoutSink {
             }
             UiEvent::AssistantTextDelta(t) => {
                 if self.in_thinking {
-                    let _ = write!(out, "\x1b[0m\n");
+                    let _ = writeln!(out, "{reset}");
                     self.in_thinking = false;
                 }
                 let _ = write!(out, "{t}");
@@ -222,41 +311,37 @@ impl UiSink for StdoutSink {
             }
             UiEvent::AssistantTextEnd => {
                 if self.in_thinking {
-                    let _ = write!(out, "\x1b[0m");
+                    let _ = write!(out, "{reset}");
                     self.in_thinking = false;
                 }
                 let _ = writeln!(out);
                 let _ = out.flush();
             }
             UiEvent::ToolCallStarted { name, args_preview } => {
-                let _ = writeln!(out, "\x1b[36m⚙ {name}({args_preview})\x1b[0m");
+                let _ = writeln!(out, "{cyan}⚙ {name}({args_preview}){reset}");
             }
             UiEvent::ToolResult { ok, summary } => {
-                let (mark, color) = if ok {
-                    ("✓", "\x1b[32m")
-                } else {
-                    ("✗", "\x1b[31m")
-                };
-                let _ = writeln!(out, "{color}  {mark} {summary}\x1b[0m");
+                let (mark, color) = if ok { ("✓", green) } else { ("✗", red) };
+                let _ = writeln!(out, "{color}  {mark} {summary}{reset}");
             }
             UiEvent::TodoUpdated(todos) => {
                 for t in &todos {
                     let (mark, color, text) = match t.status {
-                        TodoStatus::Completed => ("[x]", "\x1b[32m", &t.content),
-                        TodoStatus::InProgress => ("[~]", "\x1b[33m", &t.active_form),
-                        TodoStatus::Pending => ("[ ]", "\x1b[90m", &t.content),
+                        TodoStatus::Completed => ("[x]", green, &t.content),
+                        TodoStatus::InProgress => ("[~]", yellow, &t.active_form),
+                        TodoStatus::Pending => ("[ ]", dim, &t.content),
                     };
-                    let _ = writeln!(out, "{color}  {mark} {text}\x1b[0m");
+                    let _ = writeln!(out, "{color}  {mark} {text}{reset}");
                 }
             }
             UiEvent::Notice(msg) => {
-                let _ = writeln!(out, "\x1b[90m{msg}\x1b[0m");
+                let _ = writeln!(out, "{dim}{msg}{reset}");
             }
             // oneshot 不生成标题；穷尽 match 需此臂。
             UiEvent::Title(_) => {}
             UiEvent::ModelChanged(_) => {}
             UiEvent::Divider(label) => {
-                let _ = writeln!(out, "\x1b[90m──── {label} ────\x1b[0m");
+                let _ = writeln!(out, "{dim}──── {label} ────{reset}");
             }
             // oneshot 不 resume，无历史可回放。
             UiEvent::ReplayHistory(_) => {}
@@ -271,7 +356,7 @@ impl UiSink for StdoutSink {
                             .unwrap_or_default(),
                         other => format!(" · {other}"),
                     };
-                    let _ = writeln!(out, "\x1b[35m  · {}{tail}\x1b[0m", a.description);
+                    let _ = writeln!(out, "{magenta}  · {}{tail}{reset}", a.description);
                 }
             }
             // oneshot 无 streaming 态可恢复，忽略。
@@ -288,7 +373,7 @@ impl UiSink for StdoutSink {
                     let head = q.header.as_deref().unwrap_or("");
                     let _ = writeln!(
                         out,
-                        "\x1b[33m[ask]{} {}\x1b[0m",
+                        "{yellow}[ask]{} {}{reset}",
                         if head.is_empty() {
                             String::new()
                         } else {
@@ -299,7 +384,7 @@ impl UiSink for StdoutSink {
                     if !q.options.is_empty() {
                         let labels: Vec<&str> =
                             q.options.iter().map(|o| o.label.as_str()).collect();
-                        let _ = writeln!(out, "\x1b[33m  options: {}\x1b[0m", labels.join(" | "));
+                        let _ = writeln!(out, "{yellow}  options: {}{reset}", labels.join(" | "));
                     }
                     answers.push(
                         q.options
