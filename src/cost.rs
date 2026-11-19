@@ -35,7 +35,6 @@ mod tests {
                     total: write,
                     ..Default::default()
                 },
-                ..Default::default()
             },
             ..Default::default()
         }

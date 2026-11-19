@@ -159,8 +159,7 @@ struct PendingAsk {
     answers: Vec<Vec<String>>,
     /// 正在作答第几题。
     cursor: usize,
-    response_tx:
-        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<Vec<String>>>>>>,
+    response_tx: crate::agent::AskResponder,
 }
 
 impl PendingAsk {
@@ -576,10 +575,10 @@ impl App {
         let Some(ask) = self.pending_ask.take() else {
             return;
         };
-        if let Ok(mut guard) = ask.response_tx.lock() {
-            if let Some(tx) = guard.take() {
-                let _ = tx.send(ask.answers);
-            }
+        if let Ok(mut guard) = ask.response_tx.lock()
+            && let Some(tx) = guard.take()
+        {
+            let _ = tx.send(ask.answers);
         }
     }
 
@@ -807,10 +806,10 @@ impl App {
     /// 取某命令的参数候选，带缓存：同命令过滤期间复用；首次打开时拉取
     /// （resume/fork 走动态来源以即时反映新建会话；其余取静态表）。
     fn arg_candidates_cached(&mut self, cmd: &str) -> Option<Vec<CompletionItem>> {
-        if let Some((c, v)) = &self.arg_cache {
-            if c == cmd {
-                return Some(v.clone());
-            }
+        if let Some((c, v)) = &self.arg_cache
+            && c == cmd
+        {
+            return Some(v.clone());
         }
         let dynamic = match cmd {
             "resume" | "fork" => self.session_candidates.as_ref(),
@@ -1040,10 +1039,10 @@ fn fuzzy_score(query: &str, cand: &str) -> Option<i32> {
             if i == 0 {
                 score += 15; // 前缀命中
             }
-            if let Some(li) = last {
-                if i == li + 1 {
-                    score += 5; // 连续命中
-                }
+            if let Some(li) = last
+                && i == li + 1
+            {
+                score += 5; // 连续命中
             }
             last = Some(i);
             qi += 1;
@@ -1725,7 +1724,9 @@ fn fmt_tokens(n: u64) -> String {
 /// 修复策略：把 `insert_before` 的 Err **降级为 warn** —— 这一行 divider/历史回放可能丢，
 /// 但会话不死、用户可继续输入。比让进程崩好得多。
 /// （ratatui 0.30 的 `insert_before` 签名是 `FnOnce`，retry 需要重建闭包，故只做一次尝试。）
-
+// 参数就是 TUI 需要的全部注入点，各自来源不同（补全、历史、通道、取消），
+// 硬塞进一个 struct 只是把同样的 11 项换个地方写。
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     model: String,
     commands: Vec<CompletionItem>,

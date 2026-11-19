@@ -124,6 +124,8 @@ pub struct CompactModel {
 /// 无 tool_call → 收尾；有 → 回灌 assistant 消息 + 执行工具 + 回灌结果，再循环。
 /// 渲染经 `ui` sink；`cancel` 命中则丢弃本轮、返回 Cancelled。
 /// 返回 (结果, 跨轮累计 usage)。
+// 公开 API，宿主直接调用；8 个参数全是借用、各有独立生命周期，打包反而要额外的 struct 生命周期参数。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     thread: &mut Thread,
     provider: &dyn LlmProvider,
@@ -399,11 +401,12 @@ pub async fn run_turn(
 
         // 写盘 + 特判 todo_write（成功则把 todo 写入 Thread.todos）。
         for (tc, result) in pending_calls.iter().zip(results.iter()) {
-            if tc.name == "todo_write" && result.ok {
-                if let Ok(todos) = parse_todos(&tc.args) {
-                    thread.set_todos(todos);
-                    ui.emit(UiEvent::TodoUpdated(thread.todos.clone()));
-                }
+            if tc.name == "todo_write"
+                && result.ok
+                && let Ok(todos) = parse_todos(&tc.args)
+            {
+                thread.set_todos(todos);
+                ui.emit(UiEvent::TodoUpdated(thread.todos.clone()));
             }
         }
 

@@ -82,16 +82,16 @@ impl Recorder {
                     return;
                 }
             }
-            if let Some(header) = inner.deferred_header.take() {
-                if let Some(f) = inner.file.as_mut() {
-                    let _ = writeln!(f, "{header}");
-                }
+            if let Some(header) = inner.deferred_header.take()
+                && let Some(f) = inner.file.as_mut()
+            {
+                let _ = writeln!(f, "{header}");
             }
         }
-        if let Some(f) = inner.file.as_mut() {
-            if let Err(e) = writeln!(f, "{line}").and_then(|_| f.flush()) {
-                tracing::warn!("session: write record failed: {e}");
-            }
+        if let Some(f) = inner.file.as_mut()
+            && let Err(e) = writeln!(f, "{line}").and_then(|_| f.flush())
+        {
+            tracing::warn!("session: write record failed: {e}");
         }
     }
 }

@@ -1,6 +1,6 @@
 //! 多层记忆 —— 受 Claude Code 的 CLAUDE.md / Codex 的 AGENTS.md 启发。
 //! 发现并拼装分层记忆文件：全局（`~/.carter/CARTER.md` + facts.md + profile.md）
-//! + 项目祖先链（从 cwd 逐级上溯到 git 根或文件系统根，每层的 `CARTER.md` / `AGENTS.md`）。
+//! 加上项目祖先链（从 cwd 逐级上溯到 git 根或文件系统根，每层的 `CARTER.md` / `AGENTS.md`）。
 //! 作为单个 system 段注入，是持久背景与偏好。
 //!
 //! 两类内容：

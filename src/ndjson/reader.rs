@@ -47,11 +47,11 @@ pub async fn run_stdin_reader(
         }
         match parse_line(&line) {
             Ok(cmd) => {
-                if let Some(should_stop) = dispatch(cmd, &input_tx, &steer, &cancel, &asks).await {
-                    if should_stop {
-                        let _ = stop.send(());
-                        return;
-                    }
+                if let Some(should_stop) = dispatch(cmd, &input_tx, &steer, &cancel, &asks).await
+                    && should_stop
+                {
+                    let _ = stop.send(());
+                    return;
                 }
             }
             Err(e) => {

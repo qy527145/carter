@@ -92,23 +92,23 @@ impl UiSink for NdjsonSink {
             } => {
                 // 提取 Sender —— UiEvent::AskUser.response_tx 是 Arc<Mutex<Option<Sender>>>，
                 // 设计上"只有一个 sink 应该消费"。这里 take 出来移交 pending 表。
-                if let Ok(mut guard) = response_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        if self.auto_answer {
-                            // 与 StdoutSink 的 oneshot 策略一致：每题取第一个选项，无选项则跳过。
-                            let answers: Vec<Vec<String>> = questions
-                                .iter()
-                                .map(|q| {
-                                    q.options
-                                        .first()
-                                        .map(|o| vec![o.label.clone()])
-                                        .unwrap_or_default()
-                                })
-                                .collect();
-                            let _ = tx.send(answers);
-                        } else if let Ok(mut pending) = self.asks.lock() {
-                            pending.insert(id, tx);
-                        }
+                if let Ok(mut guard) = response_tx.lock()
+                    && let Some(tx) = guard.take()
+                {
+                    if self.auto_answer {
+                        // 与 StdoutSink 的 oneshot 策略一致：每题取第一个选项，无选项则跳过。
+                        let answers: Vec<Vec<String>> = questions
+                            .iter()
+                            .map(|q| {
+                                q.options
+                                    .first()
+                                    .map(|o| vec![o.label.clone()])
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let _ = tx.send(answers);
+                    } else if let Ok(mut pending) = self.asks.lock() {
+                        pending.insert(id, tx);
                     }
                 }
                 Event::AskUser { id, questions }

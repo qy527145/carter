@@ -60,6 +60,11 @@ pub fn replay_from_messages(msgs: &[WireMessage]) -> Vec<ReplayMsg> {
     out
 }
 
+/// `AskUser` 的应答通道：`Mutex<Option<oneshot::Sender>>` 让事件可 Clone，
+/// 而真正的 Sender 只能被一个 sink 取走一次。
+pub type AskResponder =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<Vec<String>>>>>>;
+
 /// agent loop 渲染事件。turn.rs / context.rs 只 emit 这些，不直接碰终端。
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -83,9 +88,7 @@ pub enum UiEvent {
         questions: Vec<crate::agent::AskQuestion>,
         /// 用 Mutex<Option<...>> 包裹 oneshot Sender，因为 UiEvent 必须 Clone（多个 sink），
         /// 但 oneshot Sender 不是 Clone —— 实际只有一个 sink 应该消费 Sender。
-        response_tx: std::sync::Arc<
-            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<Vec<String>>>>>,
-        >,
+        response_tx: AskResponder,
     },
     /// todo 列表更新。
     TodoUpdated(Vec<TodoItem>),
@@ -393,10 +396,10 @@ impl UiSink for StdoutSink {
                             .unwrap_or_default(),
                     );
                 }
-                if let Ok(mut guard) = response_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(answers);
-                    }
+                if let Ok(mut guard) = response_tx.lock()
+                    && let Some(tx) = guard.take()
+                {
+                    let _ = tx.send(answers);
                 }
             }
             UiEvent::TurnUsage { usage, cost, model } => {

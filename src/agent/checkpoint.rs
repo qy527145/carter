@@ -208,10 +208,10 @@ mod tests {
 
         let mut store = CheckpointStore::default();
         // cp1：改 existing 前快照（prior = "原始内容"）。
-        store.snapshot("edit keep", &[existing.clone()]);
+        store.snapshot("edit keep", std::slice::from_ref(&existing));
         std::fs::write(&existing, "被改坏了").unwrap();
         // cp2：建 created 前快照（prior = None）。
-        store.snapshot("write new", &[created.clone()]);
+        store.snapshot("write new", std::slice::from_ref(&created));
         std::fs::write(&created, "新文件").unwrap();
 
         assert_eq!(store.len(), 2);
@@ -231,9 +231,9 @@ mod tests {
         let f = dir.join("f.txt");
         std::fs::write(&f, "v0").unwrap();
         let mut store = CheckpointStore::default();
-        store.snapshot("e1", &[f.clone()]); // prior v0
+        store.snapshot("e1", std::slice::from_ref(&f)); // prior v0
         std::fs::write(&f, "v1").unwrap();
-        store.snapshot("e2", &[f.clone()]); // prior v1
+        store.snapshot("e2", std::slice::from_ref(&f)); // prior v1
         std::fs::write(&f, "v2").unwrap();
         // 回滚到 cp2 之前 → 文件回到 v1，cp1 保留。
         store.rewind_to(2).unwrap();

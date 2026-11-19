@@ -102,7 +102,7 @@ mod tests {
     fn cl100k_handles_chinese() {
         // 4 汉字"中文测试"在 cl100k_base 下大约 3-8 tokens（cl100k 有 CJK BPE 合并）。
         let n = count_text("中文测试", "cl100k");
-        assert!(n >= 2 && n <= 12, "got {n}");
+        assert!((2..=12).contains(&n), "got {n}");
     }
 
     #[test]

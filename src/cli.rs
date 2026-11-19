@@ -362,12 +362,12 @@ fn resolve_session(
         let entry = find_session(cwd, sel)?;
         return crate::session::fork(&entry);
     }
-    if args.continue_session {
-        if let Some(entry) = crate::session::latest(cwd) {
-            return crate::session::load(&entry);
-        }
-        // 当前目录无历史 → 起新会话。
+    if args.continue_session
+        && let Some(entry) = crate::session::latest(cwd)
+    {
+        return crate::session::load(&entry);
     }
+    // 当前目录无历史 → 起新会话。
     let opts = crate::session::SessionOpts {
         session_id: args.session_id.clone(),
     };
@@ -380,10 +380,11 @@ fn find_session(cwd: &std::path::Path, sel: &str) -> Result<crate::session::Sess
     if let Some(e) = entries.iter().find(|e| e.meta.id == *sel) {
         return Ok(e.clone());
     }
-    if let Ok(idx) = sel.parse::<usize>() {
-        if idx >= 1 && idx <= entries.len() {
-            return Ok(entries[idx - 1].clone());
-        }
+    if let Ok(idx) = sel.parse::<usize>()
+        && idx >= 1
+        && idx <= entries.len()
+    {
+        return Ok(entries[idx - 1].clone());
     }
     // id 前缀（如状态栏/列表显示的 8 位短 id）。
     let prefixed: Vec<&crate::session::SessionEntry> = entries
@@ -901,6 +902,7 @@ fn model_completion_items(config: &Config, cache_json: &str) -> Vec<crate::tui::
 }
 
 /// 交互式 TUI REPL 模式。agent loop 跑在独立任务里，经通道与 TUI 通信。
+#[allow(clippy::too_many_arguments)]
 async fn run_tui(
     thread: Thread,
     session_meta: crate::session::SessionMeta,

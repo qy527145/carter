@@ -17,10 +17,10 @@ const REVISION_KEEP: usize = 10;
 /// 原子写文件：先备份现有版本到 revisions 目录，再 tmp + rename。
 pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     // 0. 确保父目录存在。
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     // 1. 备份现有内容（如果有）到 revisions/。
@@ -78,7 +78,7 @@ fn prune_revisions(revs_dir: &Path, filename: &str) -> std::io::Result<()> {
             entries.push((e.path(), mtime));
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1)); // 最新在前
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1)); // 最新在前
     for (path, _) in entries.into_iter().skip(REVISION_KEEP) {
         let _ = std::fs::remove_file(path);
     }

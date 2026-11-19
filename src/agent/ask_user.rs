@@ -359,12 +359,11 @@ mod tests {
         let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
         let tool = AskUserQuestionTool::new(ui_tx);
         tokio::spawn(async move {
-            if let Some(UiEvent::AskUser { response_tx, .. }) = ui_rx.recv().await {
-                if let Ok(mut guard) = response_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(vec![vec!["Postgres".to_string()], vec![]]);
-                    }
-                }
+            if let Some(UiEvent::AskUser { response_tx, .. }) = ui_rx.recv().await
+                && let Ok(mut guard) = response_tx.lock()
+                && let Some(tx) = guard.take()
+            {
+                let _ = tx.send(vec![vec!["Postgres".to_string()], vec![]]);
             }
         });
         let res = tool

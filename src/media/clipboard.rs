@@ -53,10 +53,9 @@ pub fn paste_image() -> std::io::Result<Option<ImageRef>> {
     if let Err(e) = image::DynamicImage::ImageRgba8(buffer)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("clipboard image: PNG encode failed: {e}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "clipboard image: PNG encode failed: {e}"
+        )));
     }
 
     // 4. 走标准入库路径（自动 downsample + 内容寻址）。

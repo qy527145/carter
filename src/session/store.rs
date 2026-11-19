@@ -235,7 +235,7 @@ pub fn list(cwd: &Path, all: bool) -> Vec<SessionEntry> {
             }
         }
     }
-    entries.sort_by(|a, b| b.meta.created_at.cmp(&a.meta.created_at));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.meta.created_at));
     entries
 }
 

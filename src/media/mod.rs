@@ -164,22 +164,21 @@ pub fn parse_segments(text: &str) -> Vec<Segment> {
         let close = after_open + close_rel;
         let body = &text[after_open..close];
         // body 形如 `<hash>.<ext>`，仅当确实能拆出两段时才识别为引用。
-        if let Some((hash, ext)) = body.rsplit_once('.') {
-            if !hash.is_empty()
-                && !ext.is_empty()
-                && hash.chars().all(|c| c.is_ascii_hexdigit())
-                && ext.chars().all(|c| c.is_ascii_alphanumeric())
-            {
-                if open > cursor {
-                    out.push(Segment::Text(text[cursor..open].to_string()));
-                }
-                out.push(Segment::Image(ImageRef {
-                    hash: hash.to_string(),
-                    ext: ext.to_ascii_lowercase(),
-                }));
-                cursor = close + 1;
-                continue;
+        if let Some((hash, ext)) = body.rsplit_once('.')
+            && !hash.is_empty()
+            && !ext.is_empty()
+            && hash.chars().all(|c| c.is_ascii_hexdigit())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            if open > cursor {
+                out.push(Segment::Text(text[cursor..open].to_string()));
             }
+            out.push(Segment::Image(ImageRef {
+                hash: hash.to_string(),
+                ext: ext.to_ascii_lowercase(),
+            }));
+            cursor = close + 1;
+            continue;
         }
         // 不是合法引用 → 当文本处理，跳过这个 `[img:` 起点的 1 字节避免死循环。
         out.push(Segment::Text(text[cursor..open + 1].to_string()));

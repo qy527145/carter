@@ -142,15 +142,14 @@ fn elide_old_tool_outputs(messages: &mut [WireMessage], keep_recent: usize) {
                 content,
                 ..
             } = block
+                && let ToolResultContent::Text { text } = content
             {
-                if let ToolResultContent::Text { text } = content {
-                    // 已折叠过的不再处理。
-                    if text.starts_with("[tool result elided") {
-                        continue;
-                    }
-                    let bytes = text.len();
-                    *text = format!("[tool result elided: {bytes} bytes, call_id={tool_use_id}]");
+                // 已折叠过的不再处理。
+                if text.starts_with("[tool result elided") {
+                    continue;
                 }
+                let bytes = text.len();
+                *text = format!("[tool result elided: {bytes} bytes, call_id={tool_use_id}]");
             }
         }
     }

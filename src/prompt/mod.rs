@@ -74,10 +74,10 @@ const BUILTIN: &str = r#"你是 **Carter**，一名在终端里执行任务的�
 /// `[agent].system_prompt_file` 指定的文件 → 约定位置 `~/.carter/system.md` → 内置默认。
 /// 文件存在但读失败或为空则回落下一级。
 pub fn base(config: &Config) -> String {
-    if let Some(path) = &config.agent.system_prompt_file {
-        if let Some(s) = read_nonempty(Path::new(path)) {
-            return s;
-        }
+    if let Some(path) = &config.agent.system_prompt_file
+        && let Some(s) = read_nonempty(Path::new(path))
+    {
+        return s;
     }
     if let Some(s) = read_nonempty(&paths::system_prompt_path()) {
         return s;
@@ -95,11 +95,11 @@ pub fn project_info(cwd: &Path, model_label: &str, git: Option<&GitInfo>, now_ms
     out.push_str(&format!("- 工作目录：{}\n", cwd.display()));
     out.push_str(&format!("- 操作系统：{}\n", std::env::consts::OS));
     out.push_str(&format!("- 模型：{model_label}\n"));
-    if let Some(g) = git {
-        if !g.commit.is_empty() {
-            let branch = if g.branch.is_empty() { "-" } else { &g.branch };
-            out.push_str(&format!("- Git：分支 {branch} @ {}\n", g.commit));
-        }
+    if let Some(g) = git
+        && !g.commit.is_empty()
+    {
+        let branch = if g.branch.is_empty() { "-" } else { &g.branch };
+        out.push_str(&format!("- Git：分支 {branch} @ {}\n", g.commit));
     }
     out.trim_end().to_string()
 }
@@ -113,6 +113,33 @@ fn read_nonempty(path: &Path) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// 组装 system 分段数组：人设（内置或自定义文件）→ skills 目录 → 多层记忆 → 运行环境。
+/// 记忆段开启时总会注入（哪怕还没有记忆，也要告诉模型往哪写）；`memory_enabled=false` 跳过。
+pub fn assemble_system(
+    config: &Config,
+    cwd: &std::path::Path,
+    model_label: &str,
+    git: Option<&crate::session::GitInfo>,
+    skill_metas: &[crate::skills::SkillMeta],
+    memory_enabled: bool,
+) -> Vec<String> {
+    let mut system: Vec<String> = Vec::new();
+    system.push(crate::prompt::base(config));
+    if !skill_metas.is_empty() {
+        system.push(crate::skills::render_catalog(skill_metas));
+    }
+    if memory_enabled {
+        system.push(crate::memory::load(cwd));
+    }
+    system.push(crate::prompt::project_info(
+        cwd,
+        model_label,
+        git,
+        crate::session::now_ms(),
+    ));
+    system
 }
 
 #[cfg(test)]
@@ -151,31 +178,4 @@ mod tests {
         let info = project_info(Path::new("/tmp"), "m", Some(&git), 0);
         assert!(info.contains("分支 main @ abc1234"));
     }
-}
-
-/// 组装 system 分段数组：人设（内置或自定义文件）→ skills 目录 → 多层记忆 → 运行环境。
-/// 记忆段开启时总会注入（哪怕还没有记忆，也要告诉模型往哪写）；`memory_enabled=false` 跳过。
-pub fn assemble_system(
-    config: &Config,
-    cwd: &std::path::Path,
-    model_label: &str,
-    git: Option<&crate::session::GitInfo>,
-    skill_metas: &[crate::skills::SkillMeta],
-    memory_enabled: bool,
-) -> Vec<String> {
-    let mut system: Vec<String> = Vec::new();
-    system.push(crate::prompt::base(config));
-    if !skill_metas.is_empty() {
-        system.push(crate::skills::render_catalog(skill_metas));
-    }
-    if memory_enabled {
-        system.push(crate::memory::load(cwd));
-    }
-    system.push(crate::prompt::project_info(
-        cwd,
-        model_label,
-        git,
-        crate::session::now_ms(),
-    ));
-    system
 }

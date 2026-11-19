@@ -672,7 +672,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_subagents_share_session_but_not_agent_id() {
         let rec = Arc::new(MetaRecorder::default());
-        let factory: ToolFactory = Arc::new(|| Vec::new());
+        let factory: ToolFactory = Arc::new(Vec::new);
         let task = TaskTool::new(
             rec.clone(),
             fake_model(),
@@ -703,9 +703,11 @@ mod tests {
     #[tokio::test]
     async fn depth_limit_refuses_spawn_beyond_max() {
         let provider: Arc<dyn LlmProvider> = Arc::new(FixedProvider("ok".into()));
-        let mut cfg = AgentConfig::default();
-        cfg.subagent_max_depth = Some(2);
-        let factory: ToolFactory = Arc::new(|| Vec::new());
+        let cfg = AgentConfig {
+            subagent_max_depth: Some(2),
+            ..Default::default()
+        };
+        let factory: ToolFactory = Arc::new(Vec::new);
         let task = TaskTool::new(
             provider,
             fake_model(),
@@ -728,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn single_prompt_returns_fixed_text() {
         let provider: Arc<dyn LlmProvider> = Arc::new(FixedProvider("done".into()));
-        let factory: ToolFactory = Arc::new(|| Vec::new());
+        let factory: ToolFactory = Arc::new(Vec::new);
         let task = TaskTool::new(
             provider,
             fake_model(),
@@ -751,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_prompts_aggregate_results() {
         let provider: Arc<dyn LlmProvider> = Arc::new(FixedProvider("subdone".into()));
-        let factory: ToolFactory = Arc::new(|| Vec::new());
+        let factory: ToolFactory = Arc::new(Vec::new);
         let task = TaskTool::new(
             provider,
             fake_model(),
@@ -778,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn missing_prompt_and_prompts_errors() {
         let provider: Arc<dyn LlmProvider> = Arc::new(FixedProvider("ok".into()));
-        let factory: ToolFactory = Arc::new(|| Vec::new());
+        let factory: ToolFactory = Arc::new(Vec::new);
         let task = TaskTool::new(
             provider,
             fake_model(),

@@ -37,12 +37,11 @@ impl Tool for WriteFile {
             Err(e) => return e,
         };
 
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    return ToolResult::err(format!("cannot create parent dir for {path}: {e}"));
-                }
-            }
+        if let Some(parent) = std::path::Path::new(&path).parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            return ToolResult::err(format!("cannot create parent dir for {path}: {e}"));
         }
 
         match tokio::fs::write(&path, &content).await {

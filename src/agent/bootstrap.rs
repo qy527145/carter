@@ -27,6 +27,8 @@ use crate::tools::{
 /// `task` 工具持有「工厂闭包」用于子 agent 派生时重建工具池：
 /// - 工厂里**不含** `task`（递归守卫由这里保证）
 /// - 工厂里包含所有 builtin + skill + MCP 工具（子 agent 也能用 MCP）
+// 公开 API，宿主（carter-app）按位置传参；收成 struct 是破坏性改动，留到下个大版本。
+#[allow(clippy::too_many_arguments)]
 pub fn build_tools(
     skills_enabled: bool,
     provider: Arc<dyn LlmProvider>,

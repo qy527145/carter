@@ -36,10 +36,10 @@ pub fn discover(dir: &Path) -> Vec<SkillMeta> {
     };
     for entry in entries.flatten() {
         let md = entry.path().join("SKILL.md");
-        if let Ok(raw) = std::fs::read_to_string(&md) {
-            if let Some((meta, _body)) = parse_skill_md(&raw) {
-                out.push(meta);
-            }
+        if let Ok(raw) = std::fs::read_to_string(&md)
+            && let Some((meta, _body)) = parse_skill_md(&raw)
+        {
+            out.push(meta);
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));

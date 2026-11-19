@@ -144,16 +144,16 @@ pub const TOOL_OUTPUT_PERSIST_CAP: usize = 32 * 1024;
 pub fn cap_for_persist(msg: &WireMessage) -> WireMessage {
     let mut out = msg.clone();
     for block in &mut out.content {
-        if let Block::ToolResult { content, .. } = block {
-            if let ToolResultContent::Text { text } = content {
-                let total = text.len();
-                if total > TOOL_OUTPUT_PERSIST_CAP {
-                    let kept: String = text.chars().take(TOOL_OUTPUT_PERSIST_CAP).collect();
-                    *text = format!(
-                        "{kept}
+        if let Block::ToolResult { content, .. } = block
+            && let ToolResultContent::Text { text } = content
+        {
+            let total = text.len();
+            if total > TOOL_OUTPUT_PERSIST_CAP {
+                let kept: String = text.chars().take(TOOL_OUTPUT_PERSIST_CAP).collect();
+                *text = format!(
+                    "{kept}
 [tool result truncated for session log: {total} bytes total]"
-                    );
-                }
+                );
             }
         }
     }

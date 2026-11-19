@@ -17,6 +17,7 @@ use crate::registry::ReasoningEffort;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub agent: AgentConfig,
     pub reasoning: ReasoningConfig,
@@ -313,21 +314,6 @@ impl Config {
 
 fn default_enabled() -> bool {
     true
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            agent: AgentConfig::default(),
-            reasoning: ReasoningConfig::default(),
-            skills: SkillsConfig::default(),
-            mcp: McpConfig::default(),
-            providers: HashMap::new(),
-            env: HashMap::new(),
-            debug: DebugConfig::default(),
-            hooks: Vec::new(),
-        }
-    }
 }
 
 impl Default for AgentConfig {

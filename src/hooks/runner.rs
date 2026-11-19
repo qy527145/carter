@@ -206,7 +206,7 @@ fn decide(event: HookEvent, exit_code: i32, stdout: &str) -> HookDecision {
             if event.is_blockable() {
                 let reason = stdout.trim();
                 let reason = if reason.is_empty() {
-                    format!("blocked by hook (exit 2)")
+                    "blocked by hook (exit 2)".to_string()
                 } else {
                     reason.to_string()
                 };
