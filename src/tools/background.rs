@@ -15,8 +15,12 @@
 //! 完成通知（见 [`BackgroundShells::subscribe`]）：宿主在这一轮结束后把它作为一条
 //! user 消息追加进历史，再起一轮。模型启动后台命令之后就可以结束这一轮，用户照常聊别的。
 //!
-//! 不通知的两种情况：被 `kill_shell` / 关会话收掉的（那是有人主动结束的，没什么
-//! 好报）；模型已经用 `bash_output` 亲眼看到它结束了（再报一遍是重复）。
+//! 不通知的情况：模型自己 `kill_shell` 的、关会话收掉的（前者模型已经知道，后者没人听）；
+//! 模型已经用 `bash_output` 亲眼看到它结束了（再报一遍是重复）。
+//!
+//! **用户**在界面上终止的要通知（[`BackgroundShells::kill_by_user`]），而且话要和「自己
+//! 跑完了」分开说：模型还以为它在跑，不告诉它的话，它会一直等一条永远不来的完成通知；
+//! 只说「结束了」的话，它会把半截输出当成完整结果。
 //!
 //! ## 输出怎么拿回来
 //!
@@ -75,6 +79,7 @@ pub struct RunningShell {
     pub command: String,
     /// 开始的时刻（epoch 毫秒）。
     pub started_at: u64,
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +89,8 @@ pub enum ShellStatus {
     Exited(i32),
     /// 被 `kill_shell` / 宿主关闭收掉的。
     Killed,
+    /// 用户在界面上手动终止的。与 `Killed` 分开：这一种要通知模型。
+    KilledByUser,
 }
 
 impl ShellStatus {
@@ -92,6 +99,7 @@ impl ShellStatus {
             ShellStatus::Running => "running".to_string(),
             ShellStatus::Exited(code) => format!("exited(code={code})"),
             ShellStatus::Killed => "killed".to_string(),
+            ShellStatus::KilledByUser => "killed(by user)".to_string(),
         }
     }
 
@@ -112,6 +120,29 @@ struct ShellState {
     told: bool,
     /// 起它的时刻（epoch 毫秒）。
     started_at: u64,
+    /// 怎么进的后台。完成通知里要说清楚（模型自己起的 / 用户转的 / 超时转的）。
+    origin: Origin,
+}
+
+/// 一条后台命令怎么来的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// 模型写了 `run_in_background: true`。
+    Model,
+    /// 先在前台跑，用户按了「转后台」。
+    User,
+    /// 先在前台跑，超时后按设置自动转的。
+    Timeout,
+}
+
+impl Origin {
+    fn phrase(self) -> &'static str {
+        match self {
+            Origin::Model => "你之前在后台启动的命令",
+            Origin::User => "用户之前手动转到后台的命令",
+            Origin::Timeout => "之前因前台超时自动转到后台的命令",
+        }
+    }
 }
 
 /// 接管过来的一条命令（前台转后台）。见 [`BackgroundShells::adopt`]。
@@ -193,6 +224,7 @@ impl BackgroundShells {
                     id: id.clone(),
                     command: s.command.clone(),
                     started_at: s.started_at,
+                    origin: s.origin,
                 })
             })
             .collect();
@@ -276,6 +308,7 @@ impl BackgroundShells {
             pid,
             told: false,
             started_at: crate::session::now_ms(),
+            origin: Origin::Model,
         }));
         // 先进表、推快照，再挂等待退出的任务：短命令可能在挂任务之前就结束了，
         // 反过来写的话两份快照的顺序会飘（先「没了」再「有一条」）。
@@ -306,6 +339,7 @@ impl BackgroundShells {
         command: &str,
         session_id: &str,
         pid: Option<u32>,
+        origin: Origin,
     ) -> Result<AdoptedShell, String> {
         use std::io::Write as _;
 
@@ -321,7 +355,12 @@ impl BackgroundShells {
             .map_err(|e| format!("建日志文件失败：{e}"))?;
         // 日志开头写清楚它是哪条命令 —— 之后 `bash_output` 只给模型看增量，
         // 没有这一行它就分不清这是哪条命令的输出。
-        let _ = writeln!(file, "（这条命令先在前台跑，已转到后台）\n$ {command}");
+        let why = if origin == Origin::Timeout {
+            "超时后自动转到后台"
+        } else {
+            "已转到后台"
+        };
+        let _ = writeln!(file, "（这条命令先在前台跑，{why}）\n$ {command}");
 
         let state = Arc::new(Mutex::new(ShellState {
             command: command.to_string(),
@@ -331,6 +370,7 @@ impl BackgroundShells {
             pid,
             told: false,
             started_at: crate::session::now_ms(),
+            origin,
         }));
         self.shells
             .lock()
@@ -378,13 +418,32 @@ impl BackgroundShells {
         Ok((text, s.status.clone()))
     }
 
-    /// 一条命令的完成通知正文。`None` = 不用通知（模型已经知道了、被 kill 的、
+    /// 一条命令的完成通知正文。`None` = 不用通知（模型已经知道了、模型自己 kill 的、
     /// 还在跑的、或者不认识这个 id）。
+    ///
+    /// 两种结束分开说：**自己跑完**（带退出码）与**被用户终止**（输出是半截的）。
     pub fn completion(&self, id: &str) -> Option<String> {
         let state = self.shells.lock().unwrap().get(id).cloned()?;
         let mut s = state.lock().unwrap();
-        let ShellStatus::Exited(code) = s.status else {
-            return None;
+        let (headline, guide) = match s.status {
+            ShellStatus::Exited(code) => (
+                format!("已结束（退出码 {code}）"),
+                format!(
+                    "这是系统通知，不是用户说的话：{}自己跑完了。\
+                     据此接着做原来的事，或者把结果告诉用户。",
+                    s.origin.phrase()
+                ),
+            ),
+            ShellStatus::KilledByUser => (
+                "已被用户终止".to_string(),
+                format!(
+                    "这是系统通知：{}没有跑完，是**用户在界面上手动终止**的（不是它自己失败，\
+                     也不是超时）。下面的输出是半截的，不要当成完整结果。\
+                     不要自作主张重跑它；先简短确认一下，问用户接下来想怎么做。",
+                    s.origin.phrase()
+                ),
+            ),
+            _ => return None,
         };
         if std::mem::replace(&mut s.told, true) {
             return None;
@@ -413,9 +472,7 @@ impl BackgroundShells {
             all.to_string()
         };
         Some(format!(
-            "{DONE_MARK}{id} · 已结束（退出码 {code}）\n\
-             这是系统通知，不是用户说的话：你之前在后台启动的命令跑完了。\
-             据此接着做原来的事，或者把结果告诉用户。\n\
+            "{DONE_MARK}{id} · {headline}\n{guide}\n\
              $ {}\n日志：{}\n--- 未读输出 ---\n{tail}",
             s.command,
             s.log.display()
@@ -430,8 +487,24 @@ impl BackgroundShells {
             .map(|s| s.lock().unwrap().status.clone())
     }
 
-    /// 结束一条后台命令（整棵进程树）。
+    /// 结束一条后台命令（整棵进程树）。模型的 `kill_shell` 与宿主收尾走这里，不通知。
     pub fn kill(&self, id: &str) -> Result<ShellStatus, String> {
+        self.kill_as(id, ShellStatus::Killed).map(|(s, _)| s)
+    }
+
+    /// 用户在界面上终止一条后台命令。与 [`BackgroundShells::kill`] 的区别：模型并不知道，
+    /// 所以和「自己跑完了」一样送一条通知（正文说清是用户终止的，见 [`BackgroundShells::completion`]）。
+    pub fn kill_by_user(&self, id: &str) -> Result<ShellStatus, String> {
+        let (status, now) = self.kill_as(id, ShellStatus::KilledByUser)?;
+        // 只有**这一下**真的结束了它才通知：已经结束的再按一次，不该再报一遍。
+        if now && let Some(tx) = self.notify.lock().unwrap().as_ref() {
+            let _ = tx.send(id.to_string());
+        }
+        Ok(status)
+    }
+
+    /// 返回 `(状态, 是不是这一下结束的)`。
+    fn kill_as(&self, id: &str, as_status: ShellStatus) -> Result<(ShellStatus, bool), String> {
         let state = self
             .shells
             .lock()
@@ -442,16 +515,16 @@ impl BackgroundShells {
         {
             let mut s = state.lock().unwrap();
             if !s.status.is_running() {
-                return Ok(s.status.clone());
+                return Ok((s.status.clone(), false));
             }
             if let Some(pid) = s.pid {
                 kill_process_tree(pid);
             }
-            s.status = ShellStatus::Killed;
+            s.status = as_status.clone();
         }
         // 被结束也是「不在跑了」：提醒条要跟着少一条。
         self.publish();
-        Ok(ShellStatus::Killed)
+        Ok((as_status, true))
     }
 
     /// 宿主退出时把还活着的全部收掉。
@@ -717,6 +790,34 @@ mod tests {
         let none = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
         assert!(none.is_err(), "被 kill 的不该通知：{none:?}");
         assert!(shells.completion(&killed).is_none());
+    }
+
+    /// 用户在界面上终止：要通知，而且话和「自己跑完了」不一样。
+    #[tokio::test]
+    async fn a_user_kill_is_announced_differently_from_a_normal_exit() {
+        let shells = shells();
+        let mut rx = shells.subscribe();
+        let (id, _) = shells
+            .spawn(
+                "echo half; sleep 30",
+                &std::env::temp_dir(),
+                &sh(),
+                "test-session",
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(shells.kill_by_user(&id).unwrap(), ShellStatus::KilledByUser);
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert_eq!(got.ok().flatten().as_deref(), Some(id.as_str()));
+        let text = shells.completion(&id).expect("用户终止要通知");
+        assert!(text.contains("已被用户终止"), "{text}");
+        assert!(text.contains("不要当成完整结果"), "{text}");
+        assert!(!text.contains("退出码"), "{text}");
+        assert!(shells.completion(&id).is_none(), "只通知一次");
+        // 已经结束的再按一次：原样返回，不再通知。
+        assert_eq!(shells.kill_by_user(&id).unwrap(), ShellStatus::KilledByUser);
+        let none = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(none.is_err());
     }
 
     /// 宿主的提醒条认的是这份快照：起来了就有一条，被结束之后就没有。

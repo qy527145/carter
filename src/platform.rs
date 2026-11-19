@@ -233,8 +233,8 @@ pub fn bash_tool_description() -> String {
     let inv = shell.invocation();
 
     let mut d = format!(
-        "执行 shell 命令并返回 stdout / stderr / 退出码。带超时（默认 120s）、\
-         大输出截断、危险命令软警告。\n\n\
+        "执行 shell 命令并返回 stdout / stderr / 退出码。带超时（时长与超时后的处理见 \
+         `timeout_secs` 参数说明）、大输出截断、危险命令软警告。\n\n\
          **长时间运行的命令**（起服务、跑长构建、`tail -f`）加 `run_in_background: true`：\
          它立刻返回一个 shell_id，不卡住这一轮；之后用 `bash_output` 读它的新输出、\
          用 `kill_shell` 结束它。前台命令在用户点「停止」时会被立即杀掉。\n\n\

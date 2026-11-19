@@ -20,10 +20,13 @@ use serde_json::Value;
 use crate::provider::ToolSpec;
 
 pub use background::{
-    AdoptedShell, BackgroundShells, BashOutputTool, DONE_MARK, KillShellTool, RunningShell,
+    AdoptedShell, BackgroundShells, BashOutputTool, DONE_MARK, KillShellTool, Origin, RunningShell,
     ShellStatus, follow_up, kill_process_tree,
 };
-pub use bash::{CommandControl, ControlLookup, PlatformBash, ShellCwd};
+pub use bash::{
+    CommandControl, ControlLookup, DEFAULT_TIMEOUT_SECS as DEFAULT_BASH_TIMEOUT_SECS, PlatformBash,
+    ShellCwd,
+};
 pub use goal_update::GoalUpdateTool;
 pub use grep::EmbeddedGrep;
 pub use save_memory::SaveMemory;

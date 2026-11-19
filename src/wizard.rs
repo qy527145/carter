@@ -306,6 +306,10 @@ fn render_config(a: &Answers) -> String {
     ));
     s.push_str("max_output_tokens = 16000\n");
     s.push_str("# fast_model = \"<provider>/<model>\"   # 压缩/标题用的快模型，省略则用主模型。\n");
+    s.push_str("# bash_timeout_secs = 120          # 前台命令超时秒数。\n");
+    s.push_str(
+        "# bash_on_timeout = \"background\"  # 超时后：background 转后台继续跑 | kill 结束。\n",
+    );
     s.push_str("# system_prompt_file = \"~/.carter/system.md\"   # 覆盖内置「特工卡特」人设。\n\n");
 
     s.push_str("[reasoning]\n");

@@ -62,12 +62,15 @@ pub fn build_tools(
         // `bash` 换成本 crate 的跨平台实现：探测 shell、跟 `cd`、能转后台。
         // carter 里那份 `Bash` 只是占位（`builtin()` 给子 agent 快照与展示用）。
         if t.name() == "bash" {
-            tools.push(Arc::new(PlatformBash::new(
-                shell_cwd.clone(),
-                cancel.clone(),
-                shells.clone(),
-                session_id.clone(),
-            )));
+            tools.push(Arc::new(
+                PlatformBash::new(
+                    shell_cwd.clone(),
+                    cancel.clone(),
+                    shells.clone(),
+                    session_id.clone(),
+                )
+                .with_timeout(agent_cfg.bash_timeout_secs, agent_cfg.bash_on_timeout),
+            ));
             continue;
         }
         tools.push(t.clone());

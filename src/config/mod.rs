@@ -65,6 +65,30 @@ pub struct AgentConfig {
     /// 开关的语义也就该是同一份 —— 宿主再各自过滤一遍，两边迟早对不上。
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// 前台 bash 命令的超时秒数（模型单次调用可用 `timeout_secs` 覆盖）。缺省 120。
+    pub bash_timeout_secs: u64,
+    /// 前台命令超时之后怎么办：`background`（转到后台继续跑，缺省）| `kill`（结束它）。
+    pub bash_on_timeout: OnTimeout,
+}
+
+/// 前台命令超时之后的处理。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnTimeout {
+    /// 转到后台继续跑，结束时通知模型。命令多半只是慢，杀掉等于白跑一趟。
+    #[default]
+    Background,
+    /// 结束整棵进程树。
+    Kill,
+}
+
+impl OnTimeout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnTimeout::Background => "background",
+            OnTimeout::Kill => "kill",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -318,6 +342,8 @@ impl Default for AgentConfig {
             compact_threshold_ratio: 0.75,
             subagent_max_depth: None,
             disabled_tools: Vec::new(),
+            bash_timeout_secs: crate::tools::DEFAULT_BASH_TIMEOUT_SECS,
+            bash_on_timeout: OnTimeout::default(),
         }
     }
 }
@@ -411,6 +437,18 @@ kind = "anthropic"
 
         let cfg: Config = toml::from_str("[agent]\nfast_model = \"ws/haiku\"\n").unwrap();
         assert_eq!(cfg.agent.fast_model.as_deref(), Some("ws/haiku"));
+    }
+
+    #[test]
+    fn bash_timeout_defaults_to_120s_and_background() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.agent.bash_timeout_secs, 120);
+        assert_eq!(cfg.agent.bash_on_timeout, OnTimeout::Background);
+        let cfg: Config =
+            toml::from_str("[agent]\nbash_timeout_secs = 30\nbash_on_timeout = \"kill\"\n")
+                .unwrap();
+        assert_eq!(cfg.agent.bash_timeout_secs, 30);
+        assert_eq!(cfg.agent.bash_on_timeout, OnTimeout::Kill);
     }
 
     #[test]

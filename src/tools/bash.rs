@@ -46,13 +46,15 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::agent::CancelToken;
+use crate::config::OnTimeout;
 use crate::platform::{ShellKind, detect_shell};
 
 use super::background::BackgroundShells;
 use super::{Tool, ToolResult};
 
 const MAX_OUTPUT: usize = 30_000;
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// 前台命令的缺省超时。宿主可用 [`PlatformBash::with_timeout`] 换掉（配置项 `agent.bash_timeout_secs`）。
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 /// 单条命令的控制句柄：宿主在界面上那条「运行中…」卡片的两颗按钮与实时输出。
 #[async_trait::async_trait]
@@ -186,6 +188,19 @@ pub struct PlatformBash {
     session_id: String,
     /// 单条命令的控制句柄怎么取。`None` = 不接（CLI）。
     control: Option<ControlLookup>,
+    /// 模型没给 `timeout_secs` 时用的超时。
+    default_timeout: u64,
+    /// 前台命令超时之后：转后台还是结束。
+    on_timeout: OnTimeout,
+}
+
+/// 前台命令为什么转到了后台。两种情况给模型的话不一样 —— 不说清楚，模型会自己编一个原因。
+#[derive(Debug, Clone, Copy)]
+enum Handover {
+    /// 用户在命令卡片上按了「转后台」。
+    User,
+    /// 跑满了超时（配置是「超时转后台」）。
+    Timeout(u64),
 }
 
 impl PlatformBash {
@@ -202,7 +217,21 @@ impl PlatformBash {
             shells,
             session_id: session_id.into(),
             control: None,
+            default_timeout: DEFAULT_TIMEOUT_SECS,
+            on_timeout: OnTimeout::default(),
         }
+    }
+
+    /// 超时策略（配置项 `agent.bash_timeout_secs` / `agent.bash_on_timeout`）。
+    pub fn with_timeout(mut self, secs: u64, on_timeout: OnTimeout) -> Self {
+        self.default_timeout = secs.max(1);
+        self.on_timeout = on_timeout;
+        self
+    }
+
+    /// 超时之后真的会转后台：配置要求，且这个实例有后台表可交。
+    fn backgrounds_on_timeout(&self) -> bool {
+        self.on_timeout == OnTimeout::Background && self.shells.is_some()
     }
 
     /// 接上宿主的单条命令控制（见模块头）。
@@ -223,11 +252,25 @@ impl Tool for PlatformBash {
     }
 
     fn parameters(&self) -> Value {
+        // 超时之后会发生什么由配置决定，写进描述 —— 模型据此判断要不要一开始就用后台。
+        let timeout_hint = if self.backgrounds_on_timeout() {
+            format!(
+                "超时秒数（缺省 {}，仅前台执行有效）。超时后命令**转到后台继续跑**，\
+                 你会拿到 shell_id、结束时收到通知；明知要跑很久的直接用 run_in_background",
+                self.default_timeout
+            )
+        } else {
+            format!(
+                "超时秒数（缺省 {}，仅前台执行有效）。超时后命令**被结束**（进程树清理）；\
+                 预计跑得久的用 run_in_background",
+                self.default_timeout
+            )
+        };
         json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "要执行的命令" },
-                "timeout_secs": { "type": "integer", "description": "超时秒数（缺省 120，仅前台执行有效）。超时会结束命令，不会自动转后台；预计跑得久的用 run_in_background" },
+                "timeout_secs": { "type": "integer", "description": timeout_hint },
                 "run_in_background": {
                     "type": "boolean",
                     "description": "后台执行，立刻返回 shell_id。适合起服务、跑长构建、tail -f 这类\
@@ -246,7 +289,7 @@ impl Tool for PlatformBash {
         let timeout = args
             .get("timeout_secs")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+            .unwrap_or(self.default_timeout);
         let background = args
             .get("run_in_background")
             .and_then(Value::as_bool)
@@ -418,15 +461,43 @@ impl Tool for PlatformBash {
                     )
                 });
             }
+            How::Timeout if self.backgrounds_on_timeout() => {
+                return self.hand_over_to_background(
+                    command,
+                    &live,
+                    &exit,
+                    kill_pid,
+                    Handover::Timeout(timeout),
+                );
+            }
             How::Timeout => {
                 kill_if_running(kill_pid);
                 drain(readers.take()).await;
-                return ToolResult::err(format!("命令超过 {timeout}s 未结束（进程树已清理）"));
+                let (out, err) = live.snapshot();
+                let tail = merge_streams(&out, &err);
+                let mut msg = format!(
+                    "命令超过 {timeout}s 未结束，按设置（超时即结束）已被终止，进程树已清理。\
+                     这是超时，不是用户中断，也不是命令自己失败。\
+                     预计要跑很久的命令请用 run_in_background: true，或调大 timeout_secs 重试。"
+                );
+                if !tail.trim().is_empty() {
+                    msg.push_str(&format!(
+                        "\n终止前已产生的输出：\n{}",
+                        truncate(&tail, MAX_OUTPUT)
+                    ));
+                }
+                return ToolResult::err(msg);
             }
             How::Background => {
                 // 读取任务**不 join**：它们继续把输出写进日志。调用在这里返回，
                 // `readers` 随之被 drop —— tokio 的 JoinHandle 是 detach 语义，任务照跑。
-                return self.hand_over_to_background(command, &live, &exit, kill_pid);
+                return self.hand_over_to_background(
+                    command,
+                    &live,
+                    &exit,
+                    kill_pid,
+                    Handover::User,
+                );
             }
         };
         let code = status.code().unwrap_or(-1);
@@ -478,11 +549,16 @@ impl PlatformBash {
         live: &LiveOutput,
         exit: &Mutex<ExitSlot>,
         pid: Option<u32>,
+        why: Handover,
     ) -> ToolResult {
         let Some(shells) = &self.shells else {
             return ToolResult::err("这个会话不支持后台命令。");
         };
-        match shells.adopt(command, &self.session_id, pid) {
+        let origin = match why {
+            Handover::User => super::background::Origin::User,
+            Handover::Timeout(_) => super::background::Origin::Timeout,
+        };
+        match shells.adopt(command, &self.session_id, pid, origin) {
             Ok(mut adopted) => {
                 if let Err(e) = live.start_logging(&mut adopted.file) {
                     return ToolResult::err(format!("转到后台失败：{e}"));
@@ -490,12 +566,19 @@ impl PlatformBash {
                 let (id, log) = (adopted.id.clone(), adopted.log.clone());
                 // 进程可能已经在这几步之间退出了 —— `attach` 会把这个状态补上。
                 exit.lock().unwrap().attach(adopted);
-                // 这条路**只有**用户按「转后台」才会走到（超时是杀掉，不会转后台）。
-                // 必须把「是谁转的」写进结果：不写的话模型会自己编一个原因 ——
-                // 实际见过它对用户说「工具层超时自动转了后台」，而这个机制并不存在。
+                // 必须把「为什么转的」写进结果：不写的话模型会自己编一个原因 ——
+                // 实际见过它把用户手动转的说成「超时自动转了后台」。
+                let why = match why {
+                    Handover::User => "用户在命令运行中手动把它转到了后台，命令继续运行。\
+                                       （这不是超时，也不是你的选择。）"
+                        .to_string(),
+                    Handover::Timeout(secs) => format!(
+                        "命令跑满 {secs}s 超时仍未结束，按设置（超时转后台）已自动转到后台继续运行。\
+                         （这不是用户操作，命令也没有被结束。）"
+                    ),
+                };
                 ToolResult::ok(format!(
-                    "用户在命令运行中手动把它转到了后台，命令继续运行。\
-                     （工具不会自动把命令转后台，这不是超时，也不是你的选择。）\n\
+                    "{why}\n\
                      shell_id={id}\n\
                      日志：{}\n\
                      {}",
@@ -824,8 +907,8 @@ mod tests {
         assert!(sniff_dangerous("cargo build").is_none());
     }
 
-    /// 前台命令转后台只有一种来路：用户按了「转后台」。结果里必须说清是用户转的 —— 不说的话，
-    /// 模型会自己编个原因（实际见过它说成「工具层超时自动转后台」）。
+    /// 用户按「转后台」：结果里必须说清是用户转的 —— 不说的话，模型会自己编个原因
+    /// （实际见过它说成「工具层超时自动转后台」）。
     #[cfg(unix)]
     #[tokio::test]
     async fn a_manual_background_names_the_user_not_a_timeout() {
@@ -861,6 +944,72 @@ mod tests {
         assert!(r.ok, "{}", r.content);
         assert!(r.content.contains("用户"), "{}", r.content);
         assert!(r.content.contains("不是超时"), "{}", r.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn timeout_bash(
+        tag: &str,
+        on: OnTimeout,
+    ) -> (PlatformBash, Arc<BackgroundShells>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("carter-to-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shells = BackgroundShells::at(dir.join("shells"));
+        let bash = PlatformBash::new(
+            ShellCwd::new(dir.clone()),
+            CancelToken::new(),
+            Some(shells.clone()),
+            "t",
+        )
+        .with_timeout(1, on);
+        (bash, shells, dir)
+    }
+
+    /// 超时转后台（缺省）：命令还在跑，结果说清是超时转的、不是用户。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_hands_the_command_to_the_background_by_default() {
+        let (bash, shells, dir) = timeout_bash("bg", OnTimeout::Background);
+        assert!(bash.parameters().to_string().contains("转到后台继续跑"));
+        let r = bash
+            .execute(serde_json::json!({ "command": "echo early; sleep 5" }))
+            .await;
+        assert!(r.ok, "{}", r.content);
+        assert!(
+            r.content.contains("超时") && r.content.contains("不是用户操作"),
+            "{}",
+            r.content
+        );
+        assert_eq!(shells.running_count(), 1, "命令应当还在后台跑");
+        assert_eq!(
+            shells.running()[0].origin,
+            super::super::background::Origin::Timeout
+        );
+        shells.kill_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 超时即结束：命令被清理，结果说清是超时、不是用户中断，并带上已有的输出。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_kills_the_command_when_configured_to() {
+        let (bash, shells, dir) = timeout_bash("kill", OnTimeout::Kill);
+        assert!(bash.parameters().to_string().contains("被结束"));
+        let r = bash
+            .execute(serde_json::json!({ "command": "echo early; sleep 5" }))
+            .await;
+        assert!(!r.ok);
+        assert!(
+            r.content.contains("超时") && r.content.contains("不是用户中断"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains("early"),
+            "终止前的输出要带上：{}",
+            r.content
+        );
+        assert_eq!(shells.running_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
