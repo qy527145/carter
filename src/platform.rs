@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// `CreateProcessW` 的 `CREATE_NO_WINDOW`。
 #[cfg(windows)]
@@ -223,6 +224,276 @@ fn is_executable_file(p: &Path) -> bool {
     p.is_file()
 }
 
+// ---------------------------------------------------------------------------
+// Python 探测（只在 Windows 上做）
+// ---------------------------------------------------------------------------
+//
+// Windows 上模型写 cmd / PowerShell 的出错率远高于写 bash：引号、转义、变量展开、
+// `&&` 与 `;` 的差异，几乎每一条超过一行的命令都要返工一次。而 Python 在 Windows
+// 开发机上十分常见（python.org 安装器、`py` 启动器、`uv`），模型写 Python 又稳得多。
+// 所以在 Windows 上探测一次有没有 Python，有就在 bash 工具描述里明确说：
+// **多行逻辑写成 Python 脚本跑，不要硬写 cmd / PowerShell**。
+//
+// 为什么要真的跑一次 `--version` 而不是只看文件在不在：
+// 微软商店在 `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe` 放了一个「应用执行
+// 别名」—— Python 没装时它也在，运行只会弹商店。只看 `is_file()` 会被它骗到。
+// 带参数运行它只打印一句「Python was not found」并返回 9009，不弹窗，所以用
+// `--version` 的退出码判定是安全的。
+//
+// 为什么只在 Windows 上探：macOS 上没装 Command Line Tools 时 `/usr/bin/python3`
+// 是 xcode-select 的占位，一运行就弹「要不要安装开发者工具」的对话框 —— 而 Unix
+// 上 bash 本来就好用，没必要为一段提示去冒这个险。
+
+/// 找到的是哪一种 Python 入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonKind {
+    /// 直接的解释器：`python` / `python3`。
+    Interpreter,
+    /// Windows 的 `py` 启动器（随 python.org 安装器一起装）。
+    Launcher,
+    /// `uv`：能 `uv run python`，还能 `--with` 临时带第三方库；没装 Python 时会自己下一个。
+    Uv,
+}
+
+/// 一个能用的 Python 入口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PythonRuntime {
+    pub kind: PythonKind,
+    /// 可执行文件。`on_path` 为真时这是裸名字（`python`），否则是绝对路径。
+    pub program: PathBuf,
+    /// 是否从 PATH 里找到的 —— 决定描述里让模型写 `python` 还是写完整路径。
+    pub on_path: bool,
+}
+
+impl PythonRuntime {
+    /// 写进命令行的形态：PATH 里的用裸名字，别处的给绝对路径并加引号（路径多半带空格）。
+    fn command(&self) -> String {
+        if self.on_path {
+            self.program.to_string_lossy().into_owned()
+        } else {
+            format!("\"{}\"", self.program.display())
+        }
+    }
+
+    /// 「运行一个脚本」的前缀：`python`、`py -3`、`uv run python`。
+    pub fn run_prefix(&self) -> String {
+        match self.kind {
+            PythonKind::Interpreter => self.command(),
+            PythonKind::Launcher => format!("{} -3", self.command()),
+            PythonKind::Uv => format!("{} run python", self.command()),
+        }
+    }
+}
+
+/// 探测本机的 Python 入口（Windows 专属；别的平台恒为空）。
+///
+/// 返回的顺序就是推荐顺序：解释器 > `py` 启动器 > `uv`。只跑一次，结果缓存 ——
+/// 它要 spawn 子进程做验证，而工具描述每一轮构造工具池时都会读。
+pub fn detect_python() -> &'static [PythonRuntime] {
+    static CACHE: OnceLock<Vec<PythonRuntime>> = OnceLock::new();
+    CACHE.get_or_init(detect_python_uncached).as_slice()
+}
+
+fn detect_python_uncached() -> Vec<PythonRuntime> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+
+    // 解释器：PATH 里的 python / python3，再看 python.org 安装器的默认目录。
+    let interp = ["python", "python3"]
+        .iter()
+        .find_map(|name| which(name).map(|_| (PathBuf::from(name), true)))
+        .or_else(|| {
+            python_install_dirs()
+                .into_iter()
+                .map(|d| d.join("python.exe"))
+                .find(|p| p.is_file())
+                .map(|p| (p, false))
+        });
+    if let Some((program, on_path)) = interp
+        && runs_ok(&program, &["--version"])
+    {
+        found.push(PythonRuntime {
+            kind: PythonKind::Interpreter,
+            program,
+            on_path,
+        });
+    }
+
+    // `py` 启动器：通常在 %WINDIR%（PATH 里一定有），也可能装在用户目录。
+    let launcher = which("py")
+        .map(|_| (PathBuf::from("py"), true))
+        .or_else(|| {
+            let mut cands = Vec::new();
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                cands.push(PathBuf::from(local).join("Programs/Python/Launcher/py.exe"));
+            }
+            if let Some(win) = std::env::var_os("WINDIR") {
+                cands.push(PathBuf::from(win).join("py.exe"));
+            }
+            cands.into_iter().find(|p| p.is_file()).map(|p| (p, false))
+        });
+    if let Some((program, on_path)) = launcher
+        && runs_ok(&program, &["-3", "--version"])
+    {
+        found.push(PythonRuntime {
+            kind: PythonKind::Launcher,
+            program,
+            on_path,
+        });
+    }
+
+    // uv：官方安装脚本放在 ~/.local/bin，`cargo install` 放在 ~/.cargo/bin。
+    let uv = which("uv")
+        .map(|_| (PathBuf::from("uv"), true))
+        .or_else(|| {
+            let home = std::env::var_os("USERPROFILE").map(PathBuf::from)?;
+            [
+                home.join(".local/bin/uv.exe"),
+                home.join(".cargo/bin/uv.exe"),
+            ]
+            .into_iter()
+            .find(|p| p.is_file())
+            .map(|p| (p, false))
+        });
+    if let Some((program, on_path)) = uv
+        && runs_ok(&program, &["--version"])
+    {
+        found.push(PythonRuntime {
+            kind: PythonKind::Uv,
+            program,
+            on_path,
+        });
+    }
+
+    found
+}
+
+/// python.org 安装器的默认位置：`%LOCALAPPDATA%\Programs\Python\Python3xx`、
+/// `%ProgramFiles%\Python3xx`、`C:\Python3xx`。版本号在目录名里，所以要列目录。
+fn python_install_dirs() -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        parents.push(PathBuf::from(local).join("Programs/Python"));
+    }
+    for var in ["ProgramFiles", "ProgramW6432"] {
+        if let Some(pf) = std::env::var_os(var) {
+            parents.push(PathBuf::from(pf));
+        }
+    }
+    parents.push(PathBuf::from(r"C:\"));
+
+    let mut dirs: Vec<PathBuf> = parents
+        .iter()
+        .filter_map(|p| std::fs::read_dir(p).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("Python3"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    // 版本高的排前面：`Python313` > `Python39`（按长度再按字典序，避免 39 > 313）。
+    dirs.sort_by(|a, b| {
+        let (a, b) = (
+            a.to_string_lossy().to_string(),
+            b.to_string_lossy().to_string(),
+        );
+        b.len().cmp(&a.len()).then_with(|| b.cmp(&a))
+    });
+    dirs
+}
+
+/// 跑一下 `program args`，看它能不能正常退出。
+///
+/// 只用于探测：输出不读（`--version` 这种一行的输出撑不满管道），超时就杀掉当失败。
+/// 超时的意义是兜住「程序卡住等输入」的情况 —— 探测在启动路径上，不能挂住整个进程。
+fn runs_ok(program: &Path, args: &[&str]) -> bool {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    hide_console(&mut cmd);
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Windows 上关于「优先用 Python」的那一段描述。拆成纯函数是为了能在任何平台上测文案。
+///
+/// `pythons` 为空时也要说一句「没探测到」—— 否则模型会凭经验试 `python`，
+/// 撞上商店占位程序或「不是内部或外部命令」再绕回来。
+fn python_guidance(pythons: &[PythonRuntime], shell: ShellKind, temp_dir: &Path) -> String {
+    let Some(primary) = pythons.first() else {
+        return "\n**本机没探测到 Python**（`python` / `py` / `uv` 都不在），别去试它们；\
+                多行逻辑只能靠 shell 自己或 `powershell -NoProfile -Command \"...\"`。\n"
+            .to_string();
+    };
+    let listing = pythons
+        .iter()
+        .map(|p| match p.kind {
+            PythonKind::Interpreter => format!("解释器 `{}`", p.command()),
+            PythonKind::Launcher => format!("`py` 启动器（`{} -3`）", p.command()),
+            PythonKind::Uv => format!("`uv`（`{} run`）", p.command()),
+        })
+        .collect::<Vec<_>>()
+        .join("、");
+    let run = primary.run_prefix();
+    let script = temp_dir.join("carter-任务名.py");
+    let script = script.display();
+
+    let mut d = format!(
+        "\n**优先用 Python 写逻辑，不要硬写 cmd / PowerShell**：本机有 {listing}。\
+         cmd 与 PowerShell 的引号、转义、变量展开规则很容易写错；凡是超过一行的逻辑\
+         （遍历 / 批量改名文件、文本替换、JSON / CSV 处理、条件与循环、HTTP 请求、\
+         拼装多步操作）一律写成 Python 脚本：先用 `write_file` 把脚本写到 `{script}`，\
+         再 `{run} \"{script}\"` 运行。单行小表达式可以 `{run} -c \"...\"`，\
+         但里面一出现引号就改成写文件。\
+         Python 标准库的 pathlib / shutil / subprocess / json / re / urllib \
+         覆盖了绝大多数 shell 任务，默认不装第三方包"
+    );
+    if shell == ShellKind::Posix {
+        d.push_str("；在 POSIX shell 下也可以用 heredoc 内联：`");
+        d.push_str(&run);
+        d.push_str(" - <<'EOF' ... EOF`");
+    }
+    d.push('。');
+    match pythons.iter().find(|p| p.kind == PythonKind::Uv) {
+        Some(uv) => {
+            d.push_str(&format!(
+                "真要用第三方库时用 `{} run --with 包名 脚本.py` 临时带上，\
+                 不要 pip install 进全局环境。\n",
+                uv.command()
+            ));
+        }
+        None => {
+            d.push_str("真要用第三方库时 `python -m pip install --user 包名`，装前先问用户。\n")
+        }
+    }
+    d
+}
+
 /// 探测结果 + 平台上手要点，一起写进 bash 工具的描述。
 ///
 /// 这一段是给**模型**看的，不是给人看的。所以要写它真正会踩的坑：
@@ -282,6 +553,13 @@ pub fn bash_tool_description() -> String {
                  不要指望 bash 命令能跑。\n",
             );
         }
+    }
+    if current_os() == Os::Windows {
+        d.push_str(&python_guidance(
+            detect_python(),
+            shell.kind,
+            &std::env::temp_dir(),
+        ));
     }
     d
 }
@@ -363,6 +641,101 @@ mod tests {
         );
         if current_os() == Os::Macos {
             assert!(d.contains("sips"), "macOS 上要给出自带的裁图工具：{d}");
+        }
+    }
+
+    fn rt(kind: PythonKind, program: &str, on_path: bool) -> PythonRuntime {
+        PythonRuntime {
+            kind,
+            program: PathBuf::from(program),
+            on_path,
+        }
+    }
+
+    /// 有 Python 就要把「别写 cmd / PowerShell、写 Python 脚本」说清楚，
+    /// 并给出能直接照抄的运行命令与脚本落点。
+    #[test]
+    fn python_guidance_tells_the_model_to_write_scripts() {
+        let py = [
+            rt(PythonKind::Interpreter, "python", true),
+            rt(PythonKind::Uv, "uv", true),
+        ];
+        let d = python_guidance(&py, ShellKind::Cmd, Path::new(r"C:\Temp"));
+        assert!(d.contains("优先用 Python"), "{d}");
+        assert!(d.contains("write_file"), "要告诉模型脚本怎么落盘：{d}");
+        // 分隔符跟平台走（macOS 上 join 出来是 `/`），期望值用同一个 join 算。
+        let script = Path::new(r"C:\Temp").join("carter-任务名.py");
+        assert!(
+            d.contains(&format!("python \"{}\"", script.display())),
+            "{d}"
+        );
+        assert!(
+            d.contains("uv run --with"),
+            "有 uv 就该推荐它带第三方库：{d}"
+        );
+        assert!(!d.contains("heredoc"), "cmd 下没有 heredoc：{d}");
+    }
+
+    /// 只有 `py` 启动器时运行前缀是 `py -3`；只有 uv 时是 `uv run python`。
+    #[test]
+    fn run_prefix_follows_the_kind() {
+        assert_eq!(rt(PythonKind::Launcher, "py", true).run_prefix(), "py -3");
+        assert_eq!(rt(PythonKind::Uv, "uv", true).run_prefix(), "uv run python");
+        // PATH 之外的解释器要给绝对路径并加引号 —— 路径多半带空格。
+        assert_eq!(
+            rt(
+                PythonKind::Interpreter,
+                r"C:\Program Files\Python313\python.exe",
+                false
+            )
+            .run_prefix(),
+            r#""C:\Program Files\Python313\python.exe""#
+        );
+    }
+
+    /// Git Bash 下多给一条 heredoc 的写法；没有 uv 时推荐 pip 并要求先问用户。
+    #[test]
+    fn python_guidance_adapts_to_posix_shell_and_missing_uv() {
+        let py = [rt(PythonKind::Launcher, "py", true)];
+        let d = python_guidance(&py, ShellKind::Posix, Path::new(r"C:\Temp"));
+        assert!(d.contains("py -3 - <<'EOF'"), "{d}");
+        assert!(d.contains("pip install --user"), "{d}");
+    }
+
+    /// 没探测到 Python 时要明说，免得模型凭经验去试 `python` 再撞商店占位程序。
+    #[test]
+    fn python_guidance_says_so_when_nothing_is_found() {
+        let d = python_guidance(&[], ShellKind::Cmd, Path::new(r"C:\Temp"));
+        assert!(d.contains("没探测到 Python"), "{d}");
+        assert!(!d.contains("write_file"), "{d}");
+    }
+
+    /// 非 Windows 上既不探测、也不往描述里塞 Python 段 —— 那里 bash 本来就好用，
+    /// 而且 macOS 的 python3 占位一运行会弹安装对话框。
+    #[test]
+    fn python_detection_is_windows_only() {
+        if current_os() != Os::Windows {
+            assert!(detect_python().is_empty());
+            assert!(!bash_tool_description().contains("优先用 Python"));
+        } else {
+            // Windows 上两种结果都合法，但描述里必须二选一地提到 Python。
+            let d = bash_tool_description();
+            assert!(
+                d.contains("优先用 Python") || d.contains("没探测到 Python"),
+                "{d}"
+            );
+        }
+    }
+
+    /// 探测到的每一个入口都得真的能跑 —— 这条在 Windows 机器上挡「找到了商店占位程序」。
+    #[test]
+    fn every_detected_python_actually_runs() {
+        for p in detect_python() {
+            let args: &[&str] = match p.kind {
+                PythonKind::Launcher => &["-3", "--version"],
+                _ => &["--version"],
+            };
+            assert!(runs_ok(&p.program, args), "{:?} 跑不起来", p);
         }
     }
 

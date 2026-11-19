@@ -166,7 +166,7 @@ carter completion zsh      # 输出 shell 补全脚本
 
 ## 能力一览
 
-**工具**：`bash`（可后台执行、进程组超时清理、Windows 下按 OEM 代码页解码）、
+**工具**：`bash`（可后台执行、进程组超时清理、Windows 下按 OEM 代码页解码，并探测 `python` / `py` / `uv`，有就引导模型写 Python 脚本代替 cmd / PowerShell）、
 `read_file` / `write_file` / `edit_file`、`glob`、`grep`（内置 ripgrep，遵守 .gitignore）、
 `todo_write`、`save_memory`、`task`（并发派子 agent，带进度）、`ask_user_question`、
 `goal_update`，以及 MCP server 透明并入的工具。`[agent].disabled_tools` 可按名关掉。
