@@ -227,7 +227,7 @@ impl Tool for PlatformBash {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "要执行的命令" },
-                "timeout_secs": { "type": "integer", "description": "超时秒数（缺省 120，仅前台执行有效）" },
+                "timeout_secs": { "type": "integer", "description": "超时秒数（缺省 120，仅前台执行有效）。超时会结束命令，不会自动转后台；预计跑得久的用 run_in_background" },
                 "run_in_background": {
                     "type": "boolean",
                     "description": "后台执行，立刻返回 shell_id。适合起服务、跑长构建、tail -f 这类\
@@ -490,8 +490,12 @@ impl PlatformBash {
                 let (id, log) = (adopted.id.clone(), adopted.log.clone());
                 // 进程可能已经在这几步之间退出了 —— `attach` 会把这个状态补上。
                 exit.lock().unwrap().attach(adopted);
+                // 这条路**只有**用户按「转后台」才会走到（超时是杀掉，不会转后台）。
+                // 必须把「是谁转的」写进结果：不写的话模型会自己编一个原因 ——
+                // 实际见过它对用户说「工具层超时自动转了后台」，而这个机制并不存在。
                 ToolResult::ok(format!(
-                    "命令已转到后台继续运行。\n\
+                    "用户在命令运行中手动把它转到了后台，命令继续运行。\
+                     （工具不会自动把命令转后台，这不是超时，也不是你的选择。）\n\
                      shell_id={id}\n\
                      日志：{}\n\
                      {}",
@@ -818,6 +822,46 @@ mod tests {
     fn benign_commands_pass() {
         assert!(sniff_dangerous("ls -la").is_none());
         assert!(sniff_dangerous("cargo build").is_none());
+    }
+
+    /// 前台命令转后台只有一种来路：用户按了「转后台」。结果里必须说清是用户转的 —— 不说的话，
+    /// 模型会自己编个原因（实际见过它说成「工具层超时自动转后台」）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_manual_background_names_the_user_not_a_timeout() {
+        struct PressNow;
+        #[async_trait::async_trait]
+        impl CommandControl for PressNow {
+            async fn interrupted(&self) {
+                std::future::pending::<()>().await
+            }
+            async fn backgrounded(&self) {}
+            fn streams_output(&self) -> bool {
+                false
+            }
+            fn emit_output(&self, _: String) {}
+        }
+
+        let dir = std::env::temp_dir().join(format!("carter-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shells = BackgroundShells::at(dir.join("shells"));
+        let ctl: Arc<dyn CommandControl> = Arc::new(PressNow);
+        let bash = PlatformBash::new(
+            ShellCwd::new(dir.clone()),
+            CancelToken::new(),
+            Some(shells.clone()),
+            "t",
+        )
+        .with_control(Arc::new(move || Some(ctl.clone())));
+
+        let r = bash
+            .execute(serde_json::json!({ "command": "sleep 5" }))
+            .await;
+        shells.kill_all();
+        assert!(r.ok, "{}", r.content);
+        assert!(r.content.contains("用户"), "{}", r.content);
+        assert!(r.content.contains("不是超时"), "{}", r.content);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 描述必须写明当前平台与 shell —— 模型只能从描述里知道该写 `ls` 还是 `dir`。
