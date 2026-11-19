@@ -4,8 +4,8 @@
 use futures::StreamExt;
 
 use crate::provider::{
-    Block, ChatRequest, LlmProvider, RequestMeta, RequestPurpose, Role, StreamChunk,
-    ToolResultContent, WireMessage, WireRequest,
+    Block, ChatRequest, LlmProvider, RequestMeta, RequestPurpose, ResponseFormat, Role,
+    StreamChunk, ToolResultContent, WireMessage, WireRequest,
 };
 use crate::registry::ModelInfo;
 
@@ -242,6 +242,7 @@ async fn summarize(
         &compact_input(&rendered),
         system,
         SUMMARY_MAX_TOKENS,
+        ResponseFormat::Text,
         provider,
         model,
         meta,
@@ -269,6 +270,7 @@ async fn summarize_structured(
         &compact_input(&rendered),
         structured_summary_system(),
         L3_SUMMARY_MAX_TOKENS,
+        ResponseFormat::Text,
         provider,
         model,
         meta,
@@ -297,6 +299,7 @@ async fn run_prompt(
     user_text: &str,
     system: &str,
     max_tokens: u32,
+    format: ResponseFormat,
     provider: &dyn LlmProvider,
     model: &ModelInfo,
     meta: &RequestMeta,
@@ -305,6 +308,7 @@ async fn run_prompt(
     wire.system = vec![Block::text(system)];
     wire.messages = vec![WireMessage::user_text(user_text)];
     wire.max_tokens = Some(max_tokens);
+    wire.response_format = format;
     wire.meta = meta.clone();
     let req = ChatRequest {
         protocol: None,
@@ -326,34 +330,123 @@ async fn run_prompt(
     Ok(summary)
 }
 
-/// 为会话生成简短标题：用首条 user prompt 调一次（fast）模型，取首行去引号。
+/// 为会话生成简短标题：用首条 user prompt 调一次（fast）模型。
 /// 整个会话只调一次（由调用方保证）。失败由调用方静默忽略。
 ///
 /// `session_id` 是这个标题所属的会话：起标题的请求也算这条对话的一部分，
 /// 网关要靠它把请求归进来。
+///
+/// ## 结构化输出，带降级
+///
+/// 先用 json_schema 约束输出（`{"title": "..."}`）—— 比「请只输出标题」稳：不会多出
+/// 引号、解释、第二行。但不是每个渠道都认：中转站、OpenAI 兼容端点常常不支持
+/// `response_format`，会 400；也有的收下了却照样回纯文本。所以：
+///
+/// 1. 渠道**拒绝**这个请求（400 / 422 / 参数校验 / 编码器说不支持）→ 不带 schema
+///    原样重发一次，走纯文本提示；
+/// 2. 不管哪条路，回来的文本都用 [`parse_title`] 宽松解析：是 JSON 就取 `title`，
+///    不是就取首行去引号。
+///
+/// 限流、网络、鉴权之类不是「不认 schema」，不换写法，原样交给调用方。
 pub async fn generate_title(
     first_prompt: &str,
     session_id: Option<&str>,
     provider: &dyn LlmProvider,
     model: &ModelInfo,
 ) -> crate::Result<String> {
-    let system = "为下面这条用户消息开启的对话生成一个简洁的 3-6 词中文标题。\
-                  只输出标题本身，不要引号、不要标点结尾、不要解释。";
     let meta = RequestMeta {
         session_id: session_id.map(str::to_string),
         purpose: RequestPurpose::Title,
         ..Default::default()
     };
     // 用户那句话原样发：它不是一段待压缩的历史（见 `COMPACT_HEADING`）。
-    let out = run_prompt(first_prompt, system, 32, provider, model, &meta).await?;
-    let title = out
-        .lines()
-        .next()
-        .unwrap_or("")
+    let structured = run_prompt(
+        first_prompt,
+        TITLE_SYSTEM,
+        TITLE_MAX_TOKENS,
+        title_format(),
+        provider,
+        model,
+        &meta,
+    )
+    .await;
+    let out = match structured {
+        Err(crate::error::CarterError::Llm(ref e)) if format_rejected(e) => {
+            tracing::debug!(model = %model.api_name, "渠道不认结构化输出，标题改用纯文本：{e}");
+            run_prompt(
+                first_prompt,
+                TITLE_SYSTEM,
+                TITLE_MAX_TOKENS,
+                ResponseFormat::Text,
+                provider,
+                model,
+                &meta,
+            )
+            .await?
+        }
+        other => other?,
+    };
+    Ok(parse_title(&out))
+}
+
+/// 起标题的 system 提示。结构化与纯文本两条路共用：schema 管形状，
+/// 提示管内容；纯文本那条路上「只输出标题本身」这句才真正起作用。
+const TITLE_SYSTEM: &str = "为下面这条用户消息开启的对话生成一个简洁的 3-6 词中文标题。\
+                            只输出标题本身，不要引号、不要标点结尾、不要解释。\
+                            如果要求 JSON，就输出 {\"title\": \"标题\"}。";
+
+/// 标题请求的输出上限。JSON 外壳（`{"title":""}`）要占十来个 token，比纯文本多留一点。
+const TITLE_MAX_TOKENS: u32 = 48;
+
+/// 标题的 JSON schema：只有一个必填字符串字段。
+fn title_format() -> ResponseFormat {
+    ResponseFormat::JsonSchema {
+        name: "session_title".into(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": false,
+        }),
+        strict: true,
+    }
+}
+
+/// 这个错误是「渠道不认结构化输出」吗 —— 只有这种才值得去掉 schema 重发。
+fn format_rejected(err: &llm_adapt_core::LLMError) -> bool {
+    use llm_adapt_core::LLMError;
+    match err {
+        LLMError::Validation { .. } | LLMError::Unsupported { .. } => true,
+        LLMError::Provider { ctx, .. } => matches!(ctx.http_status, Some(400 | 422)),
+        _ => false,
+    }
+}
+
+/// 从模型输出里取出标题：JSON 就取 `title`，否则取首行。都去掉首尾引号与空白。
+///
+/// 宽松是故意的：有的渠道收下 schema 却照样回纯文本，有的把 JSON 包在代码围栏里。
+fn parse_title(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    // 是 JSON 但没有 `title`：当作没起出来（空串，调用方会重试或兜底），
+    // 而不是把一串 JSON 当标题挂到侧栏上。
+    let text = match serde_json::from_str::<serde_json::Value>(unfenced) {
+        Ok(v) if v.is_object() => v
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => unfenced.lines().next().unwrap_or("").to_string(),
+    };
+    text.trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”' | '「' | '」'))
         .trim()
-        .trim_matches('"')
-        .to_string();
-    Ok(title)
+        .to_string()
 }
 
 /// 把消息渲染成纯文本（供摘要输入）。
@@ -652,6 +745,105 @@ mod tests {
     #[test]
     fn compaction_input_keeps_its_heading() {
         assert_eq!(compact_input("用户: 你好"), "【待压缩历史】\n用户: 你好");
+    }
+
+    /// 不认 `response_format` 的渠道：带 schema 就 400，不带才回 `text`。记下每次请求的格式。
+    struct NoSchema {
+        text: &'static str,
+        error: fn() -> crate::error::CarterError,
+        formats: std::sync::Mutex<Vec<ResponseFormat>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoSchema {
+        async fn stream(&self, req: ChatRequest) -> crate::Result<EventStream> {
+            let fmt = req.wire.response_format.clone();
+            self.formats.lock().unwrap().push(fmt.clone());
+            if fmt != ResponseFormat::Text {
+                return Err((self.error)());
+            }
+            let events = vec![Ok(StreamChunk::TextDelta {
+                index: 0,
+                text: self.text.to_string(),
+            })];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn bad_request() -> crate::error::CarterError {
+        crate::error::CarterError::Llm(llm_adapt_core::LLMError::Provider {
+            message: "unknown field response_format".into(),
+            ctx: llm_adapt_core::ErrorContext {
+                http_status: Some(400),
+                ..Default::default()
+            },
+        })
+    }
+
+    fn rate_limited() -> crate::error::CarterError {
+        crate::error::CarterError::Llm(llm_adapt_core::LLMError::RateLimit {
+            message: "slow down".into(),
+            retry_after_ms: None,
+            ctx: Default::default(),
+        })
+    }
+
+    /// 结构化输出是第一选择：请求带 schema，回来的 JSON 取 `title`。
+    #[tokio::test]
+    async fn generate_title_asks_for_json_and_reads_it() {
+        let provider = FakeProvider {
+            text: r#"{"title": "修复字间隔"}"#.to_string(),
+            seen: Default::default(),
+        };
+        let title = generate_title("帮我修复", None, &provider, &fake_model())
+            .await
+            .unwrap();
+        assert_eq!(title, "修复字间隔");
+    }
+
+    /// 渠道不认 schema（400）：去掉 schema 再发一次，纯文本照样出标题。
+    #[tokio::test]
+    async fn generate_title_falls_back_to_text_when_schema_is_rejected() {
+        let provider = NoSchema {
+            text: "\"工具功能一览\"\n解释",
+            error: bad_request,
+            formats: Default::default(),
+        };
+        let title = generate_title("你好", None, &provider, &fake_model())
+            .await
+            .unwrap();
+        assert_eq!(title, "工具功能一览");
+        let formats = provider.formats.lock().unwrap();
+        assert_eq!(formats.len(), 2);
+        assert!(matches!(formats[0], ResponseFormat::JsonSchema { .. }));
+        assert_eq!(formats[1], ResponseFormat::Text);
+    }
+
+    /// 限流不是「不认 schema」：不换写法重发，原样交给调用方去退避。
+    #[tokio::test]
+    async fn generate_title_does_not_downgrade_on_rate_limit() {
+        let provider = NoSchema {
+            text: "",
+            error: rate_limited,
+            formats: Default::default(),
+        };
+        assert!(
+            generate_title("你好", None, &provider, &fake_model())
+                .await
+                .is_err()
+        );
+        assert_eq!(provider.formats.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_title_accepts_json_fences_and_plain_text() {
+        assert_eq!(parse_title(r#"{"title":"工具功能一览"}"#), "工具功能一览");
+        assert_eq!(
+            parse_title("```json\n{\"title\": \"代码围栏\"}\n```"),
+            "代码围栏"
+        );
+        assert_eq!(parse_title("「纯文本标题」\n第二行"), "纯文本标题");
+        assert_eq!(parse_title(r#"{"other": 1}"#), "");
     }
 
     #[tokio::test]

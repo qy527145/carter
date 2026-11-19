@@ -1082,6 +1082,8 @@ async fn run_tui(
         // 注：子 agent 的 `task` 工具仍持旧 model（重建 MCP 工具代价高，列为已知限制）。
         let mut model = model;
         let mut provider = provider;
+        // 起标题跑在另一条任务里，事件也要能发回 TUI：留一份发送端。
+        let title_tx = ui_tx.clone();
         let mut sink = ChannelSink::new(ui_tx);
 
         // 续接：回显标题 + 分隔线 + 回放历史上下文到视图（让用户看见已恢复的对话）。
@@ -1271,24 +1273,37 @@ async fn run_tui(
                 thread.append_user(text);
                 if needs_title {
                     needs_title = false;
+                    // 起标题**不挡这一轮**：它是一次完整的模型调用，串在这里，用户就得
+                    // 先等标题回来才看得到第一句回答。另起一条任务，回来了再落盘、通知界面。
                     // fast 模型短输出；失败静默忽略（错误即数据，不阻断会话）。
-                    if let Ok(title) = crate::agent::generate_title(
-                        &prompt,
-                        thread.session_id.as_deref(),
-                        &*fast_provider,
-                        &fast_model,
-                    )
-                    .await
-                    {
-                        if !title.is_empty() {
-                            if let Some(rec) = thread.recorder() {
-                                rec.record(crate::session::RecordKind::Title {
-                                    title: title.clone(),
-                                });
-                            }
-                            sink.emit(crate::agent::UiEvent::Title(title));
+                    let title_provider = fast_provider.clone();
+                    let title_model = fast_model.clone();
+                    let session_id = thread.session_id.clone();
+                    let recorder = thread.recorder();
+                    let title_tx = title_tx.clone();
+                    let prompt = prompt.clone();
+                    tokio::spawn(async move {
+                        let Ok(title) = crate::agent::generate_title(
+                            &prompt,
+                            session_id.as_deref(),
+                            &*title_provider,
+                            &title_model,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        if title.is_empty() {
+                            return;
                         }
-                    }
+                        // 会话自己那个 recorder（内部有锁），与主循环的写入不会绞在一起。
+                        if let Some(rec) = recorder {
+                            rec.record(crate::session::RecordKind::Title {
+                                title: title.clone(),
+                            });
+                        }
+                        let _ = title_tx.send(crate::agent::UiEvent::Title(title));
+                    });
                 }
                 // 一轮，加上 `/goal` 推起来的自动继续。退出条件全在
                 // `goal::decide_after_turn`（纯函数、逐条测过），这里只负责照做。
