@@ -3,7 +3,8 @@
 //! ## 跨平台
 //!
 //! 用 [`crate::platform::detect_shell`] 探测本机的 shell：Windows 上优先 POSIX sh，
-//! 找不到才退回 `cmd /C`；Unix 上就是 `sh`。探测结果也写进工具描述 —— 模型只能从
+//! 找不到才退回 `cmd /C`；Unix 上用用户自己的默认 shell（`$SHELL`，macOS 上通常是
+//! zsh），拿不到才退回 `sh`。探测结果也写进工具描述 —— 模型只能从
 //! 描述里知道该写 `ls` 还是 `dir`。
 //!
 //! 保留的行为（与旧实现一致）：超时、大输出截断、危险命令软警告、Unix 下用进程组

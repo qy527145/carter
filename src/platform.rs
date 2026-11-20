@@ -93,7 +93,10 @@ pub struct Shell {
 
 impl Shell {
     /// 描述里用来告诉模型「命令是怎么被执行的」。
-    pub fn label(&self) -> &'static str {
+    ///
+    /// 名字按**真正用的那个** shell 写（zsh / bash / sh），不写死成 `sh`：描述里说
+    /// `sh` 而实际跑的是 zsh，模型就会以为 `[[ ]]`、`**/*` 这些不能用，白白绕路。
+    pub fn label(&self) -> String {
         match self.kind {
             ShellKind::Posix => {
                 let name = self
@@ -101,15 +104,14 @@ impl Shell {
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "sh".into());
-                // `sh` 与 `bash` 对模型来说是一回事，但 Git Bash 值得一提 ——
-                // 它意味着 Windows 上也有完整的 POSIX 工具集。
-                if name.contains("bash") {
-                    "Git Bash（POSIX shell）"
+                // Git Bash 值得单独点出来 —— 它意味着 Windows 上也有完整的 POSIX 工具集。
+                if cfg!(windows) && name.contains("bash") {
+                    "Git Bash（POSIX shell）".to_string()
                 } else {
-                    "POSIX shell（sh）"
+                    format!("POSIX shell（{name}）")
                 }
             }
-            ShellKind::Cmd => "Windows cmd.exe",
+            ShellKind::Cmd => "Windows cmd.exe".to_string(),
         }
     }
 
@@ -133,9 +135,11 @@ pub fn detect_shell() -> Shell {
 
 fn detect_shell_uncached() -> Shell {
     if !cfg!(windows) {
-        // Unix 上 sh 一定在，不用探测。
+        // 用用户的默认 shell（终端里那一个），而不是硬编码的 `sh`：两边行为一致，
+        // 模型也不会因为「描述说 sh、实际是 zsh」而避开 zsh 能用的写法。
+        // 拿不到 `$SHELL` 时才退回 `sh` —— 它在任何 Unix 上都在。
         return Shell {
-            program: PathBuf::from("sh"),
+            program: login_shell().unwrap_or_else(|| PathBuf::from("sh")),
             flag: "-c",
             kind: ShellKind::Posix,
         };
@@ -159,6 +163,118 @@ fn detect_shell_uncached() -> Shell {
         flag: "/C",
         kind: ShellKind::Cmd,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 默认 shell 与登录环境
+// ---------------------------------------------------------------------------
+//
+// GUI 进程（carter-app）从 Finder / 开始菜单启动，不读 shell 启动文件，拿到的 PATH
+// 只有系统默认的几条；而 bun / cargo / brew 的目录都是用户在 `.zshrc` / `.zshenv`
+// 里补进去的。于是「终端里明明能跑的 `bun run dev`，工具里就是 command not found」。
+// 用户感受到的是「工具没用我的 shell」，实际差别在 PATH。
+//
+// 这里做两件事：选用户终端里那一个 shell（[`login_shell`]），以及把它的 PATH 读回来
+// 交给宿主合并（[`login_shell_path`]）。
+
+/// 能用 `-c` 传命令、且语法与模型写出来的命令足够兼容的 shell。
+/// fish / nu 之类不在列 —— 语法差得远，写进工具描述只会把模型带偏。
+const POSIX_SHELLS: &[&str] = &["zsh", "bash", "sh", "dash", "ksh", "ksh93", "mksh", "ash"];
+
+/// 用户的默认 shell：`$SHELL` 优先，其次 `/bin/zsh`、`/bin/bash`。
+pub fn login_shell() -> Option<PathBuf> {
+    pick_posix_shell(std::env::var("SHELL").ok().as_deref(), &|p| p.is_file())
+}
+
+/// `$SHELL` 是外部输入，不能无条件信：可能是 fish，也可能指向已经被删掉的路径。
+/// 拆成纯函数是为了能在任何平台上测。
+fn pick_posix_shell(env_shell: Option<&str>, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    let usable = |p: &Path| {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+        p.is_absolute() && name.is_some_and(|n| POSIX_SHELLS.iter().any(|s| *s == n)) && exists(p)
+    };
+    if let Some(s) = env_shell
+        && usable(Path::new(s))
+    {
+        return Some(PathBuf::from(s));
+    }
+    ["/bin/zsh", "/bin/bash"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| usable(p))
+}
+
+/// 用户登录 + 交互 shell 里的 `PATH`，顺序与那个 shell 里一致。
+///
+/// 探测只做一次（「探不到」也缓存）：它要起一个 shell 读 rc 文件，慢且不可预测，
+/// 不能挂在每一次工具调用或每一轮描述构造上。
+pub fn login_shell_path() -> Option<Vec<PathBuf>> {
+    static CACHE: OnceLock<Option<Vec<PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(probe_login_shell_path).clone()
+}
+
+fn probe_login_shell_path() -> Option<Vec<PathBuf>> {
+    if cfg!(windows) {
+        // Windows 上没有「登录 shell」这回事，PATH 由注册表给，宿主自己补目录。
+        return None;
+    }
+    let shell = login_shell()?;
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args(["-l", "-i", "-c", PROBE_SCRIPT])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        // rc 文件里的告警、`-i` 的 job control 提示都走 stderr，别让它们掺进解析。
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        let _ = out.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(raw) => {
+            let _ = child.wait();
+            parse_login_path(&raw)
+        }
+        // rc 里可能挂着要交互的东西（询问、下载）。启动路径上不能等，直接杀掉。
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+/// 带标记行输出 PATH：rc 文件自己也可能往 stdout 写东西，靠标记才认得出哪一行是它。
+const PROBE_SCRIPT: &str = "printf 'CARTER_LOGIN_PATH=%s\\n' \"$PATH\"";
+
+fn parse_login_path(raw: &str) -> Option<Vec<PathBuf>> {
+    // 取最后一行：rc 里若自己也 echo 了同名标记，最靠后的才是我们这一句的输出。
+    let value = raw
+        .lines()
+        .filter_map(|l| l.trim_end_matches('\r').strip_prefix("CARTER_LOGIN_PATH="))
+        .next_back()?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(value)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    (!dirs.is_empty()).then_some(dirs)
+}
+
+/// 合并两份 PATH：`first` 整体在前，随后追加 `second` 里没出现过的条目。
+///
+/// 幂等 —— 把结果再和自己合并得到同一份列表，宿主可以放心地反复调用。
+pub fn merge_path(first: &[PathBuf], second: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(first.len() + second.len());
+    for p in first.iter().chain(second) {
+        if p.as_os_str().is_empty() || out.contains(p) {
+            continue;
+        }
+        out.push(p.clone());
+    }
+    out
 }
 
 /// 找一个能用的 POSIX shell：先看 PATH，再看几个常见安装位置。
@@ -576,6 +692,97 @@ pub fn bash_tool_description_leaked() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 描述里写的必须是**真正在用**的那个 shell。macOS 上默认是 zsh，
+    /// 写死成 `sh` 会让模型避开 zsh 能用的写法。
+    #[test]
+    fn the_label_names_the_actual_shell() {
+        let s = Shell {
+            program: PathBuf::from("/bin/zsh"),
+            flag: "-c",
+            kind: ShellKind::Posix,
+        };
+        assert!(s.label().contains("zsh"), "{}", s.label());
+        let b = Shell {
+            program: PathBuf::from("/bin/bash"),
+            flag: "-c",
+            kind: ShellKind::Posix,
+        };
+        assert!(b.label().contains("bash"), "{}", b.label());
+        assert!(b.invocation().contains("/bin/bash -c"));
+    }
+
+    /// `$SHELL` 是外部输入：fish 的语法不一样，指向已删除的路径也不能用。
+    #[test]
+    fn only_posix_shells_are_accepted() {
+        let yes = |_: &Path| true;
+        assert_eq!(
+            pick_posix_shell(Some("/bin/zsh"), &yes),
+            Some(PathBuf::from("/bin/zsh"))
+        );
+        let picked = pick_posix_shell(Some("/opt/homebrew/bin/fish"), &yes);
+        assert!(
+            picked
+                .as_ref()
+                .is_none_or(|p| p.file_stem().is_some_and(|s| s != "fish")),
+            "fish 不能被当成 POSIX shell：{picked:?}"
+        );
+        // 不存在的路径同样跳过，退到下一个候选。
+        let only_bash = |p: &Path| p == Path::new("/bin/bash");
+        assert_eq!(
+            pick_posix_shell(Some("/bin/zsh"), &only_bash),
+            Some(PathBuf::from("/bin/bash"))
+        );
+    }
+
+    /// 探测脚本的输出里可能混着 rc 文件自己 echo 的东西：只认标记行，且取最后一行。
+    #[test]
+    fn the_probe_output_is_parsed_by_marker() {
+        let raw = "Welcome\nCARTER_LOGIN_PATH=/usr/bin:/bin\nbye\n";
+        assert_eq!(
+            parse_login_path(raw).unwrap(),
+            vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+        );
+        let raw = "CARTER_LOGIN_PATH=/old\nCARTER_LOGIN_PATH=/a:/b\n";
+        assert_eq!(
+            parse_login_path(raw).unwrap(),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+        assert!(parse_login_path("no marker here").is_none());
+        assert!(parse_login_path("CARTER_LOGIN_PATH=\n").is_none());
+    }
+
+    /// 本机探测要真能拿到 PATH —— 挡的是「探了但解析错 / 超时，宿主悄悄退回兜底目录」。
+    #[cfg(unix)]
+    #[test]
+    fn the_login_shell_path_is_probed_on_unix() {
+        if login_shell().is_none() {
+            return;
+        }
+        let dirs = login_shell_path().expect("登录 shell 的 PATH 应该能读回来");
+        assert!(
+            dirs.iter()
+                .any(|d| d == Path::new("/usr/bin") || d == Path::new("/bin")),
+            "读回来的 PATH 不像 PATH：{dirs:?}"
+        );
+    }
+
+    /// 合并保留顺序、去重，并且幂等 —— 宿主每次启动都会调。
+    #[test]
+    fn merge_path_keeps_order_and_dedupes() {
+        let login = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let current = vec![PathBuf::from("/b"), PathBuf::from("/c"), PathBuf::from("")];
+        let merged = merge_path(&login, &current);
+        assert_eq!(
+            merged,
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c")
+            ]
+        );
+        assert_eq!(merge_path(&merged, &merged), merged);
+    }
 
     #[test]
     fn a_shell_is_always_found() {
