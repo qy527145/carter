@@ -8,7 +8,7 @@
 model = "ws/sonnet"              # 默认模型，引用形如 "provider/model"
 fast_model = "ws/haiku"          # 上下文压缩 / 标题生成专用模型（缺省回落 model）
 max_turns = 50                   # 单轮 task 最多多少轮工具循环
-max_output_tokens = 16000        # 单次推理最大输出 tokens
+max_output_tokens = 32000        # 单次推理最大输出 tokens
 compact_enabled = true           # 自动上下文压缩
 compact_threshold_ratio = 0.75   # 真实 input tokens > context_window * ratio 时触发
 subagent_max_depth = 3           # 子代理链最大深度（task → task → ...）

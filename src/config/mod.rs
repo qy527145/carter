@@ -323,7 +323,7 @@ impl Default for AgentConfig {
             fast_model: None,
             system_prompt_file: None,
             max_turns: 50,
-            max_output_tokens: Some(16000),
+            max_output_tokens: Some(32000),
             compact_enabled: true,
             compact_threshold_ratio: 0.75,
             subagent_max_depth: None,

@@ -304,7 +304,7 @@ fn render_config(a: &Answers) -> String {
         a.provider_name,
         a.model_name()
     ));
-    s.push_str("max_output_tokens = 16000\n");
+    s.push_str("max_output_tokens = 32000\n");
     s.push_str("# fast_model = \"<provider>/<model>\"   # 压缩/标题用的快模型，省略则用主模型。\n");
     s.push_str("# bash_timeout_secs = 120          # 前台命令超时秒数。\n");
     s.push_str(
