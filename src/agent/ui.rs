@@ -122,6 +122,11 @@ pub enum UiEvent {
 /// 一个子 agent 的进度（`task` 工具那张卡片的一行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
+    /// 这个子 agent 的 id（`Thread::agent_id`，每次派生新生成）。
+    ///
+    /// 宿主靠它把子 agent 自己的工具调用（[`crate::agent::current_agent_id`] 标出来的）
+    /// 归到这一行底下 —— 描述会重名，位置会随并发乱，只有 id 是稳的。
+    pub id: String,
     /// 主对话给这一行的短标题。
     pub description: String,
     /// `running` | `done` | `failed` | `cancelled`。

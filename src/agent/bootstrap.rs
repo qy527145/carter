@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::agent::{CancelToken, TaskTool, ToolFactory, UiEvent};
+use crate::agent::{BackgroundAgents, CancelToken, TaskTool, ToolFactory, UiEvent};
 use crate::config::AgentConfig;
 use crate::goal::GoalSignal;
 use crate::provider::LlmProvider;
@@ -41,6 +41,7 @@ pub fn build_tools(
     shells: Option<Arc<BackgroundShells>>,
     cwd: Option<std::path::PathBuf>,
     goal_signal: Option<Arc<GoalSignal>>,
+    background_agents: Option<Arc<BackgroundAgents>>,
 ) -> ToolRegistry {
     // 工具开关（`[agent].disabled_tools`）。在装配期就筛掉，而不是执行时回一句
     // 「这个工具被关掉了」—— 后者模型会反复试，因为它的工具表里还看得见它。
@@ -123,6 +124,11 @@ pub fn build_tools(
     // 有 UI 才接进度事件：没有宿主的 oneshot 模式没人看，也就没必要攒。
     if let Some(tx) = &ui_tx {
         task_tool = task_tool.with_progress(tx.clone());
+    }
+    // 有登记表才让模型写 `run_in_background`：没人收完成通知的宿主（oneshot）
+    // 不该把子 agent 丢进一个没人管的后台。
+    if let Some(agents) = &background_agents {
+        task_tool = task_tool.with_background(agents.clone());
     }
     tools.push(Arc::new(task_tool));
 

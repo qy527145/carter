@@ -47,6 +47,8 @@ pub async fn run_ndjson(
     let cancel = CancelToken::new();
     // 后台命令表：一个 NDJSON 会话一份。
     let shells = crate::tools::BackgroundShells::new();
+    // 后台子 agent 表：同样一份，结束时走同一条「追进历史再跑一轮」的路。
+    let agents_bg = crate::agent::BackgroundAgents::new();
     let asks: super::sink::PendingAsks = Arc::new(Mutex::new(HashMap::new()));
 
     // 1. 提前 Ready 事件 —— 让 host 知道 carter 已就绪。
@@ -83,6 +85,7 @@ pub async fn run_ndjson(
 
     // 4. 启动 agent 任务（与 TUI 同款的 while-let 循环）。
     let agent_shells = shells.clone();
+    let agent_agents = agents_bg.clone();
     // 插话没被取走时退回输入队列；那份 sender 归任务，外层留一个用于退出。
     let agent_input_tx = input_tx.clone();
     let agent_cancel = cancel.clone();
@@ -114,6 +117,7 @@ pub async fn run_ndjson(
             Some(cwd.clone()),
             // NDJSON 由 host 驱动；自动继续是交互式 REPL 的行为，这里不挂 `goal_update`。
             None,
+            Some(agent_agents.clone()),
         );
 
         // SessionStart hook。
@@ -142,6 +146,7 @@ pub async fn run_ndjson(
         let mut session_usage = crate::provider::Usage::default();
         // 后台命令结束时的通知：取正文追进历史，再跑一轮。
         let mut shell_done = agent_shells.subscribe();
+        let mut agents_done = agent_agents.subscribe();
         loop {
             let prompt = tokio::select! {
                 p = input_rx.recv() => match p {
@@ -154,6 +159,33 @@ pub async fn run_ndjson(
                     let Some(text) = agent_shells.completion(&id) else { continue };
                     sink.emit(crate::agent::UiEvent::Notice(format!(
                         "后台命令 {id} 已结束，接着处理"
+                    )));
+                    thread.append_user(text);
+                    agent_steer.set_open(true);
+                    let result = run_turn(
+                        &mut thread,
+                        &*provider,
+                        &model,
+                        &config.agent,
+                        &run_opts,
+                        &tools,
+                        &mut sink,
+                        &agent_cancel,
+                    )
+                    .await;
+                    agent_steer.set_open(false);
+                    if let Ok((_, usage)) = result {
+                        session_usage.add(&usage);
+                    }
+                    sink.emit(crate::agent::UiEvent::Idle);
+                    continue;
+                }
+                // 后台子 agent 全部结束：结论作为一条 user 消息追进历史再跑一轮。
+                id = agents_done.recv() => {
+                    let Some(id) = id else { continue };
+                    let Some(text) = agent_agents.completion(&id) else { continue };
+                    sink.emit(crate::agent::UiEvent::Notice(format!(
+                        "后台子 agent {id} 已结束，接着处理"
                     )));
                     thread.append_user(text);
                     agent_steer.set_open(true);

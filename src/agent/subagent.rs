@@ -10,13 +10,27 @@
 //!   缺省=全开。
 //! - **深度上限**：父子 agent 链总深度由 `agent_cfg.subagent_max_depth` 控制（缺省 3）；
 //!   每个子 agent 持 `depth: u32`，超过上限直接拒绝派生。
-//! - **上下文 fork**：可传 `fork_messages: N` 把父 thread 最近 N 条消息复制给子 thread
-//!   作为开局上下文。
 //! - **并行派生**：`tasks: [{description, prompt}]` 一次性并发跑最多 8 个子 agent，
 //!   按声明顺序返回结果汇总文本。旧的 `prompt` / `prompts` 形态仍然认。
 //! - **进度事件**：每个子 agent 的「当前工具 / 步数 / 最近输出」写进共享槽位，节流地
 //!   发整表快照（`UiEvent::AgentProgress`）。没有它，界面上就是一个跑二十分钟的转圈卡片。
+//!
+//! ## 前台与后台
+//!
+//! 默认是**前台**：`execute` 等全部子 agent 跑完才返回，结论直接作为工具结果回灌。
+//! 这一轮会一直等着 —— 对「我要这几份调研的结论才能往下走」是对的。
+//!
+//! `run_in_background: true` 是**后台**：工具立刻返回一个 `task_id`，这一轮可以收工，
+//! 子 agent 在 [`BackgroundAgents`] 里继续跑。它们**全部**结束时，宿主收到一条完成通知
+//! （以 [`AGENT_DONE_MARK`] 开头，带每个子 agent 的结论），作为一条 user 消息追加进历史、
+//! 再起一轮 —— 与后台命令（`tools::background`）同一套做法：模型派完活就可以去做别的，
+//! 不必守着轮询。与后台命令一样，一个宿主一份登记表，宿主退出时整组取消。
+//!
+//! 为什么不是「超时自动转后台」：模型的请求里没有「这组活会跑很久」这个信息，拿到一个
+//! 超时结果它只会立刻再查一次。让模型显式写 `run_in_background` 才有用 —— 它知道自己
+//! 接下来还有别的事可做。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,9 +56,227 @@ const PROGRESS_TAIL: usize = 600;
 /// 子 agent 链的默认最大深度（agent_cfg.subagent_max_depth 缺省值）。
 pub const DEFAULT_MAX_DEPTH: u32 = 3;
 
+/// 后台子 agent 组的完成通知送进会话时加在前面的标记。宿主靠它认出「这不是用户说的话」；
+/// 模型也靠它认出这是系统通知。与 `tools::background::DONE_MARK` 平行。
+pub const AGENT_DONE_MARK: &str = "【子 agent】";
+
+/// 起完后台子 agent 之后告诉模型的那句话：重点是「别轮询，结束了会通知你」。
+pub fn agent_follow_up(task_id: &str, count: usize) -> String {
+    format!(
+        "已在后台派出 {count} 个子 agent（task_id=\"{task_id}\"）。它们全部结束时会自动通知你\
+         （以一条 `{AGENT_DONE_MARK}` 开头的消息，带每个子 agent 的结论），不要反复查询或等待。\
+         接下来没有别的事要做的话，告诉用户子 agent 在后台跑着、结束这一轮即可。"
+    )
+}
+
 /// 重建子 agent 工具池的工厂。每次派生产出一份新的 Vec<Arc<dyn Tool>>（Arc 实例共享底层，
 /// 复制非常便宜）。工厂内已确保**不含 TaskTool**（递归守卫由 main.rs 在 push TaskTool 前先建工厂保证）。
 pub type ToolFactory = Arc<dyn Fn() -> Vec<Arc<dyn Tool>> + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// 后台登记表
+// ---------------------------------------------------------------------------
+
+/// 一组还在后台跑的子 agent（宿主画提醒条用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningAgent {
+    /// `task_id`（`task` 工具返回给模型的那个；同时也是这组的 `call_id`）。
+    pub id: String,
+    /// 开始的时刻（epoch 毫秒）。
+    pub started_at: u64,
+    /// 这组里每个子 agent 的当前状态（与 `UiEvent::AgentProgress` 同一份）。
+    pub agents: Vec<AgentRun>,
+}
+
+/// 完成通知的发送端，由宿主订阅。见 [`BackgroundAgents::subscribe`]。
+type Notifier = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>;
+/// 表变化时推给宿主的回调（整表快照，只含还在跑的）。见 [`BackgroundAgents::set_observer`]。
+type Observer = Arc<dyn Fn(Vec<RunningAgent>) + Send + Sync>;
+
+struct GroupState {
+    started_at: u64,
+    runs: Arc<Mutex<Vec<AgentRun>>>,
+    cancel: CancelToken,
+    /// 跑完之后的结论（按子任务顺序）。`None` = 还在跑。
+    results: Option<Vec<Result<String, String>>>,
+    /// 完成通知已经取过一次（`completion` 只给一次）。
+    told: bool,
+    /// 是用户在界面上终止的（通知要说清不是它自己结束的）。
+    killed_by_user: bool,
+}
+
+/// 一条会话的后台子 agent 表。与 [`crate::tools::BackgroundShells`] 同构：
+/// `subscribe` 收完成通知，`set_observer` 收整表快照，`cancel_by_user` 终止，
+/// `cancel_all` 收尾。
+#[derive(Default)]
+pub struct BackgroundAgents {
+    groups: Mutex<HashMap<String, Arc<Mutex<GroupState>>>>,
+    notify: Notifier,
+    observer: Mutex<Option<Observer>>,
+}
+
+impl BackgroundAgents {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 订阅表的变化（起一组、进度、结束、被终止）。一个宿主订阅一次，再订阅会顶掉前一个。
+    pub fn set_observer(&self, observer: Observer) {
+        *self.observer.lock().unwrap() = Some(observer);
+    }
+
+    /// 订阅完成通知：一组全部结束时收到它的 `task_id`。收到之后用
+    /// [`BackgroundAgents::completion`] 取通知正文。
+    pub fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.notify.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    /// 还在跑的组，按开始时间排序。
+    pub fn running(&self) -> Vec<RunningAgent> {
+        let mut out: Vec<RunningAgent> = self
+            .groups
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, g)| {
+                let g = g.lock().unwrap();
+                g.results.is_none().then(|| RunningAgent {
+                    id: id.clone(),
+                    started_at: g.started_at,
+                    agents: g.runs.lock().map(|v| v.clone()).unwrap_or_default(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out
+    }
+
+    pub fn running_count(&self) -> usize {
+        self.running().len()
+    }
+
+    fn publish(&self) {
+        let observer = self.observer.lock().unwrap().clone();
+        if let Some(f) = observer {
+            f(self.running());
+        }
+    }
+
+    fn register(&self, id: &str, runs: Arc<Mutex<Vec<AgentRun>>>, cancel: CancelToken) {
+        self.groups.lock().unwrap().insert(
+            id.to_string(),
+            Arc::new(Mutex::new(GroupState {
+                started_at: crate::session::now_ms(),
+                runs,
+                cancel,
+                results: None,
+                told: false,
+                killed_by_user: false,
+            })),
+        );
+        self.publish();
+    }
+
+    /// 一组跑完了：记下结论、推宿主、唤醒。
+    fn finish(&self, id: &str, results: Vec<Result<String, String>>) {
+        let Some(g) = self.groups.lock().unwrap().get(id).cloned() else {
+            return;
+        };
+        {
+            let mut g = g.lock().unwrap();
+            if g.results.is_some() {
+                return;
+            }
+            g.results = Some(results);
+        }
+        // 先推宿主再唤醒：唤醒之后紧接着就是新一轮，提醒条不该在那之后还挂着。
+        self.publish();
+        if let Some(tx) = self.notify.lock().unwrap().as_ref() {
+            let _ = tx.send(id.to_string());
+        }
+    }
+
+    /// 用户在界面上终止一组。子 agent 收到取消后会以 `cancelled` 收尾，完成通知照常来、
+    /// 但正文说清是用户终止的（模型不知道，不告诉它会一直等）。
+    pub fn cancel_by_user(&self, id: &str) -> Result<(), String> {
+        let g = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("没有这组子 agent：{id}"))?;
+        let mut g = g.lock().unwrap();
+        if g.results.is_some() {
+            return Ok(());
+        }
+        g.killed_by_user = true;
+        g.cancel.set();
+        Ok(())
+    }
+
+    /// 宿主退出时把还在跑的全部取消。不通知 —— 没人听。
+    pub fn cancel_all(&self) {
+        let groups: Vec<_> = self.groups.lock().unwrap().values().cloned().collect();
+        for g in groups {
+            let g = g.lock().unwrap();
+            if g.results.is_none() {
+                g.cancel.set();
+            }
+        }
+    }
+
+    /// 一组的完成通知正文。`None` = 不用通知（还在跑、已经通知过、或不认识这个 id）。
+    pub fn completion(&self, id: &str) -> Option<String> {
+        let g = self.groups.lock().unwrap().get(id).cloned()?;
+        let mut g = g.lock().unwrap();
+        g.results.as_ref()?;
+        if std::mem::replace(&mut g.told, true) {
+            return None;
+        }
+        let results = g.results.clone().unwrap_or_default();
+        let runs = g.runs.lock().map(|v| v.clone()).unwrap_or_default();
+        let (headline, guide) = if g.killed_by_user {
+            (
+                "已被用户终止".to_string(),
+                "这是系统通知：这组子 agent 没有跑完，是**用户在界面上手动终止**的。\
+                 下面的结论是半截的，不要当成完整结果。不要自作主张重派；\
+                 先简短确认一下，问用户接下来想怎么做。",
+            )
+        } else {
+            (
+                format!("{} 个子 agent 已全部结束", results.len()),
+                "这是系统通知，不是用户说的话：你之前在后台派出的子 agent 跑完了。\
+                 据此接着做原来的事，或者把结论告诉用户。",
+            )
+        };
+        let mut body = String::new();
+        for (i, r) in results.iter().enumerate() {
+            let label = runs
+                .get(i)
+                .map(|a| a.description.clone())
+                .unwrap_or_else(|| format!("子任务 {}", i + 1));
+            body.push_str(&format!("\n--- subagent {}：{label} ---\n", i + 1));
+            match r {
+                Ok(t) => body.push_str(t),
+                Err(e) => body.push_str(&format!("ERROR: {e}")),
+            }
+        }
+        Some(format!(
+            "{AGENT_DONE_MARK}{id} · {headline}\n{guide}\n{body}"
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 工具
+// ---------------------------------------------------------------------------
 
 pub struct TaskTool {
     provider: Arc<dyn LlmProvider>,
@@ -61,6 +293,8 @@ pub struct TaskTool {
     depth: u32,
     /// 进度事件的出口。`None` = 宿主不接（oneshot / 测试），不发事件。
     progress: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+    /// 后台登记表。`None` = 不支持 `run_in_background`（参数里也不声明）。
+    background: Option<Arc<BackgroundAgents>>,
     /// 没有 `call_id` 时现编编号用。
     seq: Arc<AtomicU64>,
 }
@@ -84,6 +318,7 @@ impl TaskTool {
             tool_factory,
             depth,
             progress: None,
+            background: None,
             seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -91,6 +326,12 @@ impl TaskTool {
     /// 接上宿主的事件通道：子 agent 的进度会以 `UiEvent::AgentProgress` 发出去。
     pub fn with_progress(mut self, tx: tokio::sync::mpsc::UnboundedSender<UiEvent>) -> Self {
         self.progress = Some(tx);
+        self
+    }
+
+    /// 接上后台登记表：模型可以写 `run_in_background: true` 让这一轮不等子 agent。
+    pub fn with_background(mut self, agents: Arc<BackgroundAgents>) -> Self {
+        self.background = Some(agents);
         self
     }
 }
@@ -102,46 +343,69 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &str {
-        "派生多个隔离子 agent 并行完成任务。每个子 agent 有独立的上下文与完整的工具池，\
-         自己读文件、跑命令，最后只把结论交回来 —— 主对话不必装下它们翻过的东西。\n\n\
-         什么时候用：\n\
-         - 好几个互不依赖的调研 / 搜索 / 改造可以同时做（一次 tasks 里全给它们）；\n\
-         - 某件事要翻很多文件、试很多次，过程对主对话没用，只要结论。\n\
-         什么时候别用：几件事有先后依赖（那就一件一件做，或者自己直接做）。\n\n\
-         每个子任务的 prompt 要**自包含**：它看不到主对话，不知道你们刚聊过什么。\
-         把需要的路径、约定、输出格式写清楚。"
+        if self.background.is_some() {
+            "派生多个隔离子 agent 并行完成任务。每个子 agent 有独立的上下文与完整的工具池，\
+             自己读文件、跑命令，最后只把结论交回来 —— 主对话不必装下它们翻过的东西。\n\n\
+             什么时候用：\n\
+             - 好几个互不依赖的调研 / 搜索 / 改造可以同时做（一次 tasks 里全给它们）；\n\
+             - 某件事要翻很多文件、试很多次，过程对主对话没用，只要结论。\n\
+             什么时候别用：几件事有先后依赖（那就一件一件做，或者自己直接做）。\n\n\
+             前台（默认）：等它们全部结束，结论直接作为结果返回。\n\
+             后台（`run_in_background: true`）：立刻返回 task_id，这一轮可以收工去做别的 / \
+             回复用户；它们全部结束时会以一条系统通知把结论送回来，**不要轮询或等待**。\
+             结论不是眼下这一步的前提时用后台。\n\n\
+             每个子任务的 prompt 要**自包含**：它看不到主对话，不知道你们刚聊过什么。\
+             把需要的路径、约定、输出格式写清楚。"
+        } else {
+            "派生多个隔离子 agent 并行完成任务。每个子 agent 有独立的上下文与完整的工具池，\
+             自己读文件、跑命令，最后只把结论交回来 —— 主对话不必装下它们翻过的东西。\n\n\
+             什么时候用：\n\
+             - 好几个互不依赖的调研 / 搜索 / 改造可以同时做（一次 tasks 里全给它们）；\n\
+             - 某件事要翻很多文件、试很多次，过程对主对话没用，只要结论。\n\
+             什么时候别用：几件事有先后依赖（那就一件一件做，或者自己直接做）。\n\n\
+             每个子任务的 prompt 要**自包含**：它看不到主对话，不知道你们刚聊过什么。\
+             把需要的路径、约定、输出格式写清楚。"
+        }
     }
 
     fn parameters(&self) -> Value {
+        let mut props = json!({
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "这一行的短标题（几字，显示在界面上）"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "完整、自包含的指令：要看哪些文件、做什么、最后输出什么"
+                        }
+                    },
+                    "required": ["description", "prompt"]
+                },
+                "description": "要并行跑的子任务。只有一个时也用它。"
+            },
+            "tools": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "子 agent 可用的工具白名单（如 [\"read_file\",\"grep\"]）。缺省 = 全部。"
+            }
+        });
+        if self.background.is_some() {
+            props["run_in_background"] = json!({
+                "type": "boolean",
+                "description": "true = 立刻返回 task_id，子 agent 在后台跑，全部结束时以系统通知送回结论；\
+                                false（默认）= 等它们跑完再返回。"
+            });
+        }
         json!({
             "type": "object",
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 8,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {
-                                "type": "string",
-                                "description": "这一行的短标题（几字，显示在界面上）"
-                            },
-                            "prompt": {
-                                "type": "string",
-                                "description": "完整、自包含的指令：要看哪些文件、做什么、最后输出什么"
-                            }
-                        },
-                        "required": ["description", "prompt"]
-                    },
-                    "description": "要并行跑的子任务。只有一个时也用它。"
-                },
-                "tools": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "子 agent 可用的工具白名单（如 [\"read_file\",\"grep\"]）。缺省 = 全部。"
-                }
-            },
+            "properties": props,
             "required": ["tasks"]
         })
     }
@@ -194,6 +458,7 @@ impl Tool for TaskTool {
             tasks
                 .iter()
                 .map(|t| AgentRun {
+                    id: uuid::Uuid::new_v4().to_string(),
                     description: t.description.clone(),
                     status: "running".into(),
                     steps: 0,
@@ -202,33 +467,134 @@ impl Tool for TaskTool {
                 })
                 .collect(),
         ));
+
+        let group = Group {
+            call_id: call_id.clone(),
+            tasks,
+            tools,
+            runs: runs.clone(),
+            session_id: crate::agent::current_session_id(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            agent_cfg: self.agent_cfg.clone(),
+            base_system: self.base_system.clone(),
+            child_depth: self.depth + 1,
+            progress: self.progress.clone(),
+        };
+
+        let in_background = args
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match (&self.background, in_background) {
+            (Some(registry), true) => {
+                // 后台：登记、起任务、立刻返回。子 cancel 不挂父 cancel —— 用户按「停止」
+                // 停的是这一轮，而后台组的意义就是不属于这一轮；要停它去提醒条上按。
+                let cancel = CancelToken::new();
+                let count = group.tasks.len();
+                registry.register(&call_id, runs, cancel.clone());
+                let registry = registry.clone();
+                let id = call_id.clone();
+                tokio::spawn(async move {
+                    let results = group.run(cancel).await;
+                    registry.finish(&id, results);
+                });
+                ToolResult::ok(format!(
+                    "task_id={call_id}\n{}",
+                    agent_follow_up(&call_id, count)
+                ))
+            }
+            _ => {
+                // 前台：子 cancel 跟着父 cancel 走（父取消则子取消）。
+                let cancel = CancelToken::new();
+                let parent = self.parent_cancel.clone();
+                let child = cancel.clone();
+                let watcher = tokio::spawn(async move {
+                    parent.cancelled().await;
+                    child.set();
+                });
+                let results = group.run(cancel).await;
+                watcher.abort();
+                combine(results, &runs)
+            }
+        }
+    }
+}
+
+/// 前台模式的结果汇总：单个原样回（旧契约），多个按子任务标号拼起来。
+fn combine(results: Vec<Result<String, String>>, runs: &Mutex<Vec<AgentRun>>) -> ToolResult {
+    let mut results = results;
+    if results.len() == 1 {
+        return match results.pop().expect("len == 1") {
+            Ok(text) => ToolResult::ok(text),
+            Err(msg) => ToolResult::err(msg),
+        };
+    }
+    let mut combined = String::new();
+    let mut any_err = false;
+    for (i, r) in results.into_iter().enumerate() {
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        let label = runs
+            .lock()
+            .ok()
+            .and_then(|v| v.get(i).map(|a| a.description.clone()))
+            .unwrap_or_else(|| format!("子任务 {}", i + 1));
+        combined.push_str(&format!("--- subagent {}：{label} ---\n", i + 1));
+        match r {
+            Ok(text) => combined.push_str(&text),
+            Err(msg) => {
+                any_err = true;
+                combined.push_str(&format!("ERROR: {msg}"));
+            }
+        }
+    }
+    if any_err {
+        ToolResult::err(combined)
+    } else {
+        ToolResult::ok(combined)
+    }
+}
+
+/// 一次 `task` 调用派出的一组子 agent。前台与后台共用这一份跑法，区别只在
+/// 「等不等」与「取消跟谁」。
+struct Group {
+    call_id: String,
+    tasks: Vec<Task>,
+    tools: Vec<Arc<dyn Tool>>,
+    runs: Arc<Mutex<Vec<AgentRun>>>,
+    session_id: Option<String>,
+    provider: Arc<dyn LlmProvider>,
+    model: ModelInfo,
+    agent_cfg: AgentConfig,
+    base_system: String,
+    child_depth: u32,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<UiEvent>>,
+}
+
+impl Group {
+    /// 并发跑完全部子 agent，按声明顺序返回各自的结论。
+    async fn run(self, cancel: CancelToken) -> Vec<Result<String, String>> {
         let publish = |runs: &Arc<Mutex<Vec<AgentRun>>>| {
             if let Some(tx) = &self.progress {
                 let agents = runs.lock().map(|v| v.clone()).unwrap_or_default();
                 let _ = tx.send(UiEvent::AgentProgress {
-                    call_id: call_id.clone(),
+                    call_id: self.call_id.clone(),
                     agents,
                 });
             }
         };
-        publish(&runs);
+        publish(&self.runs);
 
-        // 子 agent 的请求挂在父会话下（各自再带一个 agent id 单独成线）。
-        // 必须在 spawn 之前取：任务局部变量不会跟进新任务。
-        let session_id = crate::agent::current_session_id();
-        let count = tasks.len();
-        // `self` 的生命周期不进 spawn：要用的几样先拷出来。
-        let parent_cancel = self.parent_cancel.clone();
-        let child_depth = self.depth + 1;
-        let base_system = self.base_system.clone();
-        let progress = self.progress.clone();
+        let count = self.tasks.len();
         let mut handles = Vec::with_capacity(count);
-        for (i, task) in tasks.into_iter().enumerate() {
+        for (i, task) in self.tasks.into_iter().enumerate() {
             let provider = self.provider.clone();
             let model = self.model.clone();
             let mut cfg = self.agent_cfg.clone();
             cfg.max_turns = SUBAGENT_MAX_TURNS;
-            let mut system = base_system.clone();
+            let mut system = self.base_system.clone();
             // 子 agent 看不到主对话，得先知道自己是谁、在哪 —— 补一句，也免得它
             // 以为「刚才说的那几个文件」还在上下文里。
             system.push_str(
@@ -237,12 +603,18 @@ impl Tool for TaskTool {
                  做完就停，最后一条消息要能直接当作结论交回去（写清做了什么、看到了什么、\
                  还差什么），不要问问题 —— 没有人能回答你。",
             );
-            let tools = tools.clone();
-            let runs = runs.clone();
-            let progress = progress.clone();
-            let parent_cancel = parent_cancel.clone();
-            let call_id = call_id.clone();
-            let session_id = session_id.clone();
+            let tools = self.tools.clone();
+            let runs = self.runs.clone();
+            let progress = self.progress.clone();
+            let cancel = cancel.clone();
+            let call_id = self.call_id.clone();
+            let session_id = self.session_id.clone();
+            let agent_id = runs
+                .lock()
+                .ok()
+                .and_then(|v| v.get(i).map(|a| a.id.clone()))
+                .unwrap_or_default();
+            let child_depth = self.child_depth;
             handles.push(tokio::spawn(async move {
                 let mut sink = ProgressSink {
                     runs: runs.clone(),
@@ -257,12 +629,13 @@ impl Tool for TaskTool {
                 let out = spawn_one(
                     task.prompt.clone(),
                     session_id,
+                    agent_id,
                     Vec::new(),
                     provider,
                     model,
                     cfg,
                     system,
-                    parent_cancel.clone(),
+                    cancel,
                     Arc::new(move || tools.clone()),
                     None,
                     child_depth,
@@ -300,41 +673,8 @@ impl Tool for TaskTool {
             }
         }
         results.sort_by_key(|(i, _)| *i);
-        publish(&runs);
-
-        // 单个子任务：原样回结果（保持旧契约 —— 多套一层标题只是噪音）。
-        if results.len() == 1 {
-            return match results.pop().expect("len == 1").1 {
-                Ok(text) => ToolResult::ok(text),
-                Err(msg) => ToolResult::err(msg),
-            };
-        }
-
-        let mut combined = String::new();
-        let mut any_err = false;
-        for (i, r) in results {
-            if !combined.is_empty() {
-                combined.push_str("\n\n");
-            }
-            let label = runs
-                .lock()
-                .ok()
-                .and_then(|v| v.get(i).map(|a| a.description.clone()))
-                .unwrap_or_else(|| format!("子任务 {}", i + 1));
-            combined.push_str(&format!("--- subagent {}：{label} ---\n", i + 1));
-            match r {
-                Ok(text) => combined.push_str(&text),
-                Err(msg) => {
-                    any_err = true;
-                    combined.push_str(&format!("ERROR: {msg}"));
-                }
-            }
-        }
-        if any_err {
-            ToolResult::err(combined)
-        } else {
-            ToolResult::ok(combined)
-        }
+        publish(&self.runs);
+        results.into_iter().map(|(_, r)| r).collect()
     }
 }
 
@@ -522,28 +862,32 @@ impl UiSink for ProgressSink {
     }
 }
 
-/// 跑一个子 agent（单 prompt）。封装 cancel watcher、工具池构建、run_turn 调用。
+/// 跑一个子 agent（单 prompt）。封装取消、工具池构建、run_turn 调用。
+///
+/// `cancel` 是这个子 agent 自己的令牌：前台时由调用方接到父 cancel 上，后台时由
+/// 登记表握着。`run_turn` 取消后会 `reset()` 它，所以**不能**直接传父 cancel 进来。
 #[allow(clippy::too_many_arguments)]
 async fn spawn_one(
     prompt: String,
     session_id: Option<String>,
+    agent_id: String,
     initial_messages: Vec<WireMessage>,
     provider: Arc<dyn LlmProvider>,
     model: ModelInfo,
     agent_cfg: AgentConfig,
     base_system: String,
-    parent_cancel: CancelToken,
+    cancel: CancelToken,
     factory: ToolFactory,
     whitelist: Option<Vec<String>>,
     child_depth: u32,
     sink: &mut ProgressSink,
 ) -> Result<String, String> {
-    // 子 cancel：独立 token；起一个监视任务把父取消传播到子（单向）。
+    // 组级 cancel 是几个子 agent 共用的，而 `run_turn` 收到取消会 `reset()` —— 第一个
+    // 退出的子 agent 会把别的也清掉。所以每个子 agent 再派生一个自己的，单向传播。
     let child_cancel = CancelToken::new();
-    let parent = parent_cancel.clone();
     let child_for_watch = child_cancel.clone();
     let watcher = tokio::spawn(async move {
-        parent.cancelled().await;
+        cancel.cancelled().await;
         child_for_watch.set();
     });
 
@@ -575,8 +919,9 @@ async fn spawn_one(
     // 子 agent 不挂 recorder（不持久化中间过程；最终输出会 ToolResult 进父 thread 落盘）。
     let mut thread = Thread::new_empty();
     thread.session_id = session_id;
-    // 每个子 agent 一个新 id：并行派出的几个 system 提示完全一样，只能靠它区分。
-    thread.set_agent_id(uuid::Uuid::new_v4().to_string());
+    // 与进度表里那一行同一个 id：并行派出的几个 system 提示完全一样，只能靠它区分；
+    // 宿主也靠它把子 agent 自己的工具调用归到那一行底下。
+    thread.set_agent_id(agent_id);
     for m in initial_messages {
         thread.messages.push(m);
     }
@@ -669,19 +1014,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn parallel_subagents_share_session_but_not_agent_id() {
-        let rec = Arc::new(MetaRecorder::default());
+    fn task_tool(provider: Arc<dyn LlmProvider>) -> TaskTool {
         let factory: ToolFactory = Arc::new(Vec::new);
-        let task = TaskTool::new(
-            rec.clone(),
+        TaskTool::new(
+            provider,
             fake_model(),
             AgentConfig::default(),
             "system".to_string(),
             CancelToken::new(),
             factory,
             0,
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn parallel_subagents_share_session_but_not_agent_id() {
+        let rec = Arc::new(MetaRecorder::default());
+        let task = task_tool(rec.clone());
         let res = super::super::turn::SESSION_ID
             .scope(
                 Some("parent".to_string()),
@@ -698,6 +1047,31 @@ mod tests {
             assert!(m.agent_id.is_some());
         }
         assert_ne!(metas[0].agent_id, metas[1].agent_id);
+    }
+
+    /// 进度表里那一行的 id 与请求头上的 agent_id 是同一个：宿主靠它把子 agent 的
+    /// 工具调用归到那一行底下，两边对不上这件事就做不成。
+    #[tokio::test]
+    async fn progress_rows_carry_the_same_agent_id_as_requests() {
+        let rec = Arc::new(MetaRecorder::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = task_tool(rec.clone()).with_progress(tx);
+        let res = task
+            .execute(serde_json::json!({ "prompts": ["a", "b"] }))
+            .await;
+        assert!(res.ok, "{}", res.content);
+        let mut ids = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let UiEvent::AgentProgress { agents, .. } = ev {
+                ids = agents.into_iter().map(|a| a.id).collect();
+            }
+        }
+        assert_eq!(ids.len(), 2);
+        let metas = rec.0.lock().unwrap().clone();
+        for m in &metas {
+            let id = m.agent_id.clone().unwrap();
+            assert!(ids.contains(&id), "请求头上的 {id} 不在进度表里：{ids:?}");
+        }
     }
 
     #[tokio::test]
@@ -729,17 +1103,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_prompt_returns_fixed_text() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(FixedProvider("done".into()));
-        let factory: ToolFactory = Arc::new(Vec::new);
-        let task = TaskTool::new(
-            provider,
-            fake_model(),
-            AgentConfig::default(),
-            "system".to_string(),
-            CancelToken::new(),
-            factory,
-            0,
-        );
+        let task = task_tool(Arc::new(FixedProvider("done".into())));
         let res = task
             .execute(serde_json::json!({
                 "description": "x",
@@ -752,17 +1116,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_prompts_aggregate_results() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(FixedProvider("subdone".into()));
-        let factory: ToolFactory = Arc::new(Vec::new);
-        let task = TaskTool::new(
-            provider,
-            fake_model(),
-            AgentConfig::default(),
-            "system".to_string(),
-            CancelToken::new(),
-            factory,
-            0,
-        );
+        let task = task_tool(Arc::new(FixedProvider("subdone".into())));
         let res = task
             .execute(serde_json::json!({
                 "description": "x",
@@ -779,21 +1133,112 @@ mod tests {
 
     #[tokio::test]
     async fn missing_prompt_and_prompts_errors() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(FixedProvider("ok".into()));
-        let factory: ToolFactory = Arc::new(Vec::new);
-        let task = TaskTool::new(
-            provider,
-            fake_model(),
-            AgentConfig::default(),
-            "system".to_string(),
-            CancelToken::new(),
-            factory,
-            0,
-        );
+        let task = task_tool(Arc::new(FixedProvider("ok".into())));
         let res = task
             .execute(serde_json::json!({ "description": "x" }))
             .await;
         assert!(!res.ok);
         assert!(res.content.contains("prompt"));
+    }
+
+    /// 没接登记表时，`run_in_background` 不在参数里、传了也按前台跑 ——
+    /// 没人收完成通知的宿主不该把子 agent 丢进一个没人管的后台。
+    #[tokio::test]
+    async fn without_a_registry_background_is_neither_offered_nor_honoured() {
+        let task = task_tool(Arc::new(FixedProvider("done".into())));
+        assert!(
+            task.parameters()["properties"]
+                .get("run_in_background")
+                .is_none()
+        );
+        let res = task
+            .execute(serde_json::json!({
+                "tasks": [{ "description": "x", "prompt": "a" }],
+                "run_in_background": true
+            }))
+            .await;
+        assert!(res.ok);
+        assert_eq!(res.content, "done", "该直接拿到结论，而不是一个 task_id");
+    }
+
+    /// 后台：立刻返回 task_id，登记表里能看到它在跑，跑完发完成通知、通知里有结论。
+    #[tokio::test]
+    async fn background_returns_at_once_and_notifies_when_done() {
+        let registry = BackgroundAgents::new();
+        let mut done = registry.subscribe();
+        let task = task_tool(Arc::new(FixedProvider("子任务已完成".into())))
+            .with_background(registry.clone());
+        assert!(
+            task.parameters()["properties"]
+                .get("run_in_background")
+                .is_some()
+        );
+
+        let res = task
+            .execute(serde_json::json!({
+                "tasks": [
+                    { "description": "甲", "prompt": "a" },
+                    { "description": "乙", "prompt": "b" }
+                ],
+                "run_in_background": true
+            }))
+            .await;
+        assert!(res.ok, "{}", res.content);
+        let id = res
+            .content
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("task_id="))
+            .expect("第一行是 task_id")
+            .to_string();
+        assert!(res.content.contains(AGENT_DONE_MARK));
+
+        let got = tokio::time::timeout(Duration::from_secs(5), done.recv())
+            .await
+            .expect("要有完成通知");
+        assert_eq!(got.as_deref(), Some(id.as_str()));
+        assert!(registry.running().is_empty(), "跑完就不该再算「在跑」");
+
+        let text = registry.completion(&id).expect("第一次取要有正文");
+        assert!(text.starts_with(AGENT_DONE_MARK), "{text}");
+        assert!(text.contains("2 个子 agent 已全部结束"), "{text}");
+        assert!(text.contains("甲") && text.contains("乙"), "{text}");
+        assert_eq!(text.matches("子任务已完成").count(), 2, "{text}");
+        assert!(registry.completion(&id).is_none(), "通知只给一次");
+    }
+
+    /// 一个永远不回话的 provider：用来验证「用户终止」那条路。
+    struct Hanging;
+    #[async_trait::async_trait]
+    impl LlmProvider for Hanging {
+        async fn stream(&self, _req: ChatRequest) -> crate::Result<EventStream> {
+            let events = futures::stream::pending::<crate::Result<StreamChunk>>();
+            Ok(Box::pin(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_cancel_ends_the_group_and_says_so_in_the_notice() {
+        let registry = BackgroundAgents::new();
+        let mut done = registry.subscribe();
+        let task = task_tool(Arc::new(Hanging)).with_background(registry.clone());
+        let res = task
+            .execute(serde_json::json!({
+                "tasks": [{ "description": "挂着", "prompt": "a" }],
+                "run_in_background": true
+            }))
+            .await;
+        assert!(res.ok);
+        let id = registry.running()[0].id.clone();
+        assert_eq!(registry.running()[0].agents[0].description, "挂着");
+
+        registry.cancel_by_user(&id).unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), done.recv())
+            .await
+            .expect("终止之后要有通知");
+        assert_eq!(got.as_deref(), Some(id.as_str()));
+        let text = registry.completion(&id).unwrap();
+        assert!(text.contains("已被用户终止"), "{text}");
+        assert!(registry.cancel_by_user("nope").is_err());
     }
 }

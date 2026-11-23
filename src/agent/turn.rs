@@ -58,8 +58,19 @@ pub enum TurnOutcome {
 tokio::task_local! {
     /// 正在执行工具的那一轮所属的会话 id。
     pub(crate) static SESSION_ID: Option<String>;
+    /// 正在执行工具的那一轮属于哪个子 agent（`Thread::agent_id`）。主对话为 None。
+    pub(crate) static AGENT_ID: Option<String>;
     /// 正在执行的这次工具调用的编号（模型给的 `ToolCall.id`）。
     static CALL_ID: String;
+}
+
+/// 工具执行时取所属子 agent 的 id。
+///
+/// 宿主的记录层靠它把「这次调用是哪个子 agent 敲的」标在事件上 —— 没有它，子 agent
+/// 的几十次 bash 与主对话自己的调用在界面上是同一排平铺的卡片，分不出层次。
+/// 主对话里、或不在 [`run_turn`] 的工具执行里调用时为 None。
+pub fn current_agent_id() -> Option<String> {
+    AGENT_ID.try_with(|s| s.clone()).ok().flatten()
 }
 
 /// 工具执行时取这次调用的编号。
@@ -392,10 +403,14 @@ pub async fn run_turn(
         // 顺序保持：派发顺序与回灌顺序与 model 给的 pending_calls 完全一致。
         // hook 在每个工具前后触发（PreToolUse 可改写 args / 阻断；PostToolUse 仅观测）。
         let session_id = thread.session_id.clone();
+        let agent_id = thread.agent_id.clone();
         let results = SESSION_ID
             .scope(
                 session_id,
-                execute_tool_calls(&pending_calls, tools, thread, ui, &run_opts.hooks, cancel),
+                AGENT_ID.scope(
+                    agent_id,
+                    execute_tool_calls(&pending_calls, tools, thread, ui, &run_opts.hooks, cancel),
+                ),
             )
             .await;
 

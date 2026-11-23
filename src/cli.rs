@@ -656,6 +656,8 @@ async fn run_oneshot(
         // 只有 `--goal` 才挂 `goal_update`：普通一次性执行跑完就退出，
         // 留着这个工具只会让模型以为有人接着推。
         goal_signal.clone(),
+        // 一次性执行没有下一轮来接结论，后台子 agent 同样没有意义。
+        None,
     );
 
     // 出口按输出形态选：text 裸打印；json 静默只留汇总；stream-json 走 NDJSON 事件行。
@@ -929,6 +931,8 @@ async fn run_tui(
     let cancel = CancelToken::new();
     // 后台命令表：进程级一份，活过整个 REPL。关会话 / 退出时 `kill_all` 收掉。
     let shells = crate::tools::BackgroundShells::new();
+    // 后台子 agent 表：与后台命令同一套做法（派完就收工，结束了再被叫回来）。
+    let agents_bg = crate::agent::BackgroundAgents::new();
 
     // MCP：会话级 manager 留在外层 scope（活过整个 agent 任务）；工具（持克隆 peer）移入任务。
     let (mcp_mgr, mcp_tools) = crate::mcp::McpManager::start(&config.mcp).await;
@@ -1048,6 +1052,7 @@ async fn run_tui(
     let agent_cancel = cancel.clone();
     let agent_hooks = hooks.clone();
     let agent_shells = shells.clone();
+    let agent_agents = agents_bg.clone();
     let agent_cwd = cwd.clone();
     let agent_task = tokio::spawn(async move {
         let mut thread = thread;
@@ -1079,6 +1084,7 @@ async fn run_tui(
             Some(agent_shells.clone()),
             Some(agent_cwd),
             Some(goal_signal.clone()),
+            Some(agent_agents.clone()),
         );
         // 主模型 / provider 设为可变：会话内 `/model` 热切换会重绑它们（run_turn 每轮取最新）。
         // 注：子 agent 的 `task` 工具仍持旧 model（重建 MCP 工具代价高，列为已知限制）。
@@ -1128,6 +1134,8 @@ async fn run_tui(
         // 后台命令自己结束时的通知：拿到 shell_id 后取正文，作为一条 user 消息
         // 追进历史再跑一轮 —— 否则模型启动完后台命令就结束了一轮，之后没人推进。
         let mut shell_done = agent_shells.subscribe();
+        // 后台子 agent 全部结束时的通知：同一条路。
+        let mut agents_done = agent_agents.subscribe();
         loop {
             let prompt = tokio::select! {
                 p = input_rx.recv() => match p {
@@ -1142,6 +1150,33 @@ async fn run_tui(
                     let Some(text) = agent_shells.completion(&id) else { continue };
                     sink.emit(crate::agent::UiEvent::Notice(format!(
                         "后台命令 {id} 已结束，接着处理"
+                    )));
+                    thread.append_user(text);
+                    agent_steer.set_open(true);
+                    let usage = run_turn(
+                        &mut thread,
+                        &*provider,
+                        &model,
+                        &config.agent,
+                        &run_opts,
+                        &tools,
+                        &mut sink,
+                        &agent_cancel,
+                    )
+                    .await;
+                    agent_steer.set_open(false);
+                    if let Ok((_, usage)) = usage {
+                        session_usage.add(&usage);
+                    }
+                    sink.emit(crate::agent::UiEvent::Idle);
+                    continue;
+                }
+                // 后台子 agent 全部结束：结论作为一条 user 消息追进历史，再跑一轮。
+                id = agents_done.recv() => {
+                    let Some(id) = id else { continue };
+                    let Some(text) = agent_agents.completion(&id) else { continue };
+                    sink.emit(crate::agent::UiEvent::Notice(format!(
+                        "后台子 agent {id} 已结束，接着处理"
                     )));
                     thread.append_user(text);
                     agent_steer.set_open(true);

@@ -102,6 +102,7 @@ pub enum Event {
 /// 一个子 agent 的进度（NDJSON 形态）。
 #[derive(Debug, Clone, Serialize)]
 pub struct WireAgent {
+    pub id: String,
     pub description: String,
     /// `running` | `done` | `failed` | `cancelled`。
     pub status: String,
@@ -113,6 +114,7 @@ pub struct WireAgent {
 impl From<&crate::agent::ui::AgentRun> for WireAgent {
     fn from(a: &crate::agent::ui::AgentRun) -> Self {
         Self {
+            id: a.id.clone(),
             description: a.description.clone(),
             status: a.status.clone(),
             steps: a.steps,

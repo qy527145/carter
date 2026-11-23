@@ -14,12 +14,14 @@ pub use ask_user::{AskOption, AskQuestion, AskUserQuestionTool};
 pub use bootstrap::build_tools;
 pub use context::generate_title;
 pub use steer::{STEER_HEAD, SteerInbox, is_steer, wrap};
-pub use subagent::{TaskTool, ToolFactory};
+pub use subagent::{
+    AGENT_DONE_MARK, BackgroundAgents, RunningAgent, TaskTool, ToolFactory, agent_follow_up,
+};
 pub use thread::Thread;
 #[allow(unused_imports)]
 pub use turn::{
-    CompactModel, RunOptions, Steer, TurnOutcome, TurnState, current_call_id, current_session_id,
-    run_turn,
+    CompactModel, RunOptions, Steer, TurnOutcome, TurnState, current_agent_id, current_call_id,
+    current_session_id, run_turn,
 };
 #[allow(unused_imports)]
 pub use ui::{
