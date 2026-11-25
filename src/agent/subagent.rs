@@ -857,6 +857,18 @@ impl UiSink for ProgressSink {
                 let tail = Self::tail_static(&n);
                 self.set(|run| run.text = tail);
             }
+            UiEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                error,
+            } => {
+                // 没成的那次说到一半的话作废，别拼到重发之后的正文前面。
+                self.buf.clear();
+                let tail =
+                    Self::tail_static(&super::ui::retry_notice(attempt, max, delay_ms, &error));
+                self.set(|run| run.text = tail);
+            }
             _ => {}
         }
     }

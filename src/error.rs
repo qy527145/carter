@@ -29,3 +29,36 @@ pub enum CarterError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
+
+impl CarterError {
+    /// 这个错误是不是暂时性的 —— 原样再发一次有可能就好了。
+    ///
+    /// `is_retryable()` 之外还要看**错误类别**：它读的是 `ErrorContext.retryable`，
+    /// 而流中途出的错（读 SSE 时断线、读空闲超时）上那一位未必填对。限流、网络、
+    /// 超时这三类按类别直接认。鉴权错、请求非法、上下文溢出重发多少次都一样。
+    pub fn is_transient(&self) -> bool {
+        use llm_adapt_core::LLMError;
+        match self {
+            CarterError::Llm(e) => {
+                e.is_retryable()
+                    || matches!(
+                        e,
+                        LLMError::RateLimit { .. }
+                            | LLMError::Network { .. }
+                            | LLMError::Timeout { .. }
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// 上游点名要等多久再来（429 的 `Retry-After`）。
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            CarterError::Llm(llm_adapt_core::LLMError::RateLimit { retry_after_ms, .. }) => {
+                *retry_after_ms
+            }
+            _ => None,
+        }
+    }
+}

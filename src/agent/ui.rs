@@ -110,6 +110,17 @@ pub enum UiEvent {
         cost: f64,
         model: String,
     },
+    /// 模型请求遇到暂时性错误，等 `delay_ms` 之后自动重发（第 `attempt` 次，共 `max` 次）。
+    ///
+    /// 收到这条时，**这一次请求**已经吐出来的正文 / 思考增量作废：它们不进历史，
+    /// 重发之后模型会从头再说一遍。能撤回的宿主（GUI）应该把那半截撤掉。
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay_ms: u64,
+        /// 这次是为什么没成（单行，已截断）。
+        error: String,
+    },
     /// `task` 工具里几个子 agent 的进度（整表快照，按 `call_id` 配对那张卡片）。
     ///
     /// 发整表而不是增量：并发写时增量很容易次序错乱，而这张表本来就只有几行。
@@ -137,6 +148,12 @@ pub struct AgentRun {
     pub tool: Option<String>,
     /// 最近一段输出（尾部截断）。
     pub text: String,
+}
+
+/// [`UiEvent::Retrying`] 的一句话版本，给只会打字的出口（终端、TUI）用。
+pub fn retry_notice(attempt: u32, max: u32, delay_ms: u64, error: &str) -> String {
+    let secs = delay_ms.div_ceil(1000);
+    format!("[retry] 请求失败，{secs} 秒后重试（{attempt}/{max}）：{error}")
 }
 
 /// 渲染出口。两实现：`StdoutSink`（裸 ANSI，向后兼容 / 管道）、`ChannelSink`（TUI）。
@@ -369,6 +386,16 @@ impl UiSink for StdoutSink {
             }
             // oneshot 无 streaming 态可恢复，忽略。
             UiEvent::Idle => {}
+            // 已经打出去的半截收不回来，另起一行说明接下来是重说一遍。
+            UiEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                error,
+            } => {
+                let msg = retry_notice(attempt, max, delay_ms, &error);
+                let _ = writeln!(out, "\n{yellow}{msg}{reset}");
+            }
             UiEvent::AskUser {
                 questions,
                 response_tx,

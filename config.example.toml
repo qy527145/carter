@@ -12,6 +12,8 @@ max_output_tokens = 32000        # 单次推理最大输出 tokens
 compact_enabled = true           # 自动上下文压缩
 compact_threshold_ratio = 0.75   # 真实 input tokens > context_window * ratio 时触发
 subagent_max_depth = 3           # 子代理链最大深度（task → task → ...）
+max_retries = 5                  # 模型请求遇到暂时性错误（限流 / 5xx / 断线 / 超时）时自动重发几次，0 = 不重试
+retry_backoff_ms = 1000          # 第一次重试前等多久，之后每次翻倍（单次不超过 30 秒）
 
 # ----- 推理强度 -----
 [reasoning]

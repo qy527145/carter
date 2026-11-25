@@ -55,6 +55,7 @@ carter --ndjson [--model provider/name] [--resume <id>] [--continue]
 | `idle` | — | 一轮处理结束 — host 据此显示"可输入" |
 | `ask_user` | `id`, `questions: [{question, header?, multi_select, options: [{label, description?}]}]` | 反向 RPC，host **必须**回 `ask_response`。一次可带 1-4 题 |
 | `agent_progress` | `call_id`, `agents: [{description, status, steps, tool?, text}]` | `task` 工具里几个子 agent 的进度（整表快照，按 `call_id` 配对那次调用） |
+| `retrying` | `attempt`, `max`, `delay_ms`, `error` | 模型请求遇到暂时性错误（限流 / 5xx / 断线 / 超时），`delay_ms` 之后自动重发。这一次请求已经发出来的 `text_delta` / `thinking_delta` 作废，host 应该撤掉 |
 | `turn_usage` | `usage: {input,output,cache_read,cache_write,reasoning}`, `cost`, `model` | 用量 + 成本 |
 | `error` | `message` | 致命错误（之后 carter 退出） |
 

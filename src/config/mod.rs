@@ -70,6 +70,12 @@ pub struct AgentConfig {
     pub bash_timeout_secs: u64,
     /// 前台命令超时之后怎么办：`background`（转到后台继续跑，缺省）| `kill`（结束它）。
     pub bash_on_timeout: OnTimeout,
+    /// 模型请求遇到暂时性错误（限流、5xx、断线、超时）时自动重发几次。0 = 不重试。缺省 5。
+    ///
+    /// 按**一次请求**计：重发成功后计数清零，一轮里后面的请求各有各的额度。
+    pub max_retries: u32,
+    /// 第一次重试前等多久（毫秒），之后每次翻倍，单次不超过 30 秒。缺省 1000。
+    pub retry_backoff_ms: u64,
 }
 
 /// 前台命令超时之后的处理。
@@ -330,6 +336,8 @@ impl Default for AgentConfig {
             disabled_tools: Vec::new(),
             bash_timeout_secs: crate::tools::DEFAULT_BASH_TIMEOUT_SECS,
             bash_on_timeout: OnTimeout::default(),
+            max_retries: 5,
+            retry_backoff_ms: 1000,
         }
     }
 }

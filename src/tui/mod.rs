@@ -322,6 +322,20 @@ impl App {
                 self.flush_pending();
                 self.outbox.push(Block_::Notice(msg));
             }
+            UiEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                error,
+            } => {
+                // 已经定稿进 scrollback 的行收不回来；没定稿的残行一起落下去，
+                // 再用一句提示把「下面是重说一遍」讲明白。
+                self.flush_pending();
+                self.outbox
+                    .push(Block_::Notice(crate::agent::ui::retry_notice(
+                        attempt, max, delay_ms, &error,
+                    )));
+            }
             UiEvent::Title(t) => {
                 // 标题只进状态栏，不落入对话历史（避免与上下文混在一起）。
                 self.status.title = Some(t);

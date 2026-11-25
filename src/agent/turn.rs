@@ -277,69 +277,71 @@ pub async fn run_turn(
             wire,
         };
 
-        // 等响应头这段也要听取消：上游迟迟不开口时，用户按了停止不能干等着。
-        let mut stream = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                return finish_cancelled(thread, &total_usage, model, run_opts, ui, cancel).await;
+        // 发请求并把流收完。暂时性的失败（限流、5xx、断线、超时）在这里就地重发：
+        // 这一轮前面可能已经跑了几十次工具，为一次 503 把整轮断掉，用户得手动点
+        // 「继续」，模型还要把上下文重新读一遍。
+        let mut retries: u32 = 0;
+        let attempt = loop {
+            let a = stream_once(provider, req.clone(), run_opts, ui, cancel).await;
+            if a.cancelled {
+                break a;
             }
-            r = provider.stream(req) => r?,
-        };
-
-        // 装配器按块序号归并增量；块间交错也能还原。
-        let mut asm = BlockAssembler::new();
-        let mut stop_reason = FinishReason::Stop;
-        // 有一段正文 / 思考还没封口。「正文 → 思考 → 正文」要各成一段，不能粘在一起。
-        let mut block_open = false;
-        let mut cancelled = false;
-
-        while let Some(ev) = {
-            // 竞速：流的下一个事件 vs 取消通知。取消即时唤醒，断开卡住的 HTTP。
+            let transient = match (&a.error, &a.upstream) {
+                (Some(e), _) => e.is_transient(),
+                // 厂商在流里报了错、流也没正常收尾（Anthropic 的 `overloaded_error` 就是
+                // 这么来的）：没有状态码可看，按暂时性的算。
+                (None, Some(_)) => a.stop_reason.is_none(),
+                (None, None) => false,
+            };
+            if !transient || retries >= agent_cfg.max_retries {
+                break a;
+            }
+            retries += 1;
+            // 没成的那次也可能已经计费（输入在流开头就报了），照实算进去。
+            total_usage.add(a.asm.usage());
+            let reason = match (&a.error, &a.upstream) {
+                (Some(e), _) => e.to_string(),
+                (None, Some(msg)) => msg.clone(),
+                (None, None) => String::new(),
+            };
+            let reason = super::ui::truncate_inline(reason.lines().next().unwrap_or(""), 200);
+            let delay = retry_delay(agent_cfg, retries, a.error.as_ref());
+            tracing::warn!(
+                attempt = retries,
+                max = agent_cfg.max_retries,
+                delay_ms = delay.as_millis() as u64,
+                "模型请求失败，稍后重试：{reason}"
+            );
+            // 这一次已经吐出来的半截正文作废（不进历史），宿主收到这条就该把它撤掉。
+            ui.emit(UiEvent::Retrying {
+                attempt: retries,
+                max: agent_cfg.max_retries,
+                delay_ms: delay.as_millis() as u64,
+                error: reason,
+            });
+            // 等的这段也要听取消：用户不想等了，按停止就该立刻停。
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    cancelled = true;
-                    None
+                    return finish_cancelled(thread, &total_usage, model, run_opts, ui, cancel).await;
                 }
-                ev = stream.next() => ev,
+                _ = tokio::time::sleep(delay) => {}
             }
-        } {
-            let ev = ev?;
-            match &ev {
-                StreamChunk::TextDelta { text, .. } => {
-                    ui.emit(UiEvent::AssistantTextDelta(text.clone()));
-                    block_open = true;
-                }
-                StreamChunk::ThinkingDelta { text, .. } => {
-                    // 签名分片不展示给用户（对模型有用，对人没意义）。
-                    if run_opts.show_thinking && !text.is_empty() {
-                        ui.emit(UiEvent::ThinkingDelta(text.clone()));
-                        block_open = true;
-                    }
-                }
-                StreamChunk::Finish { reason } => {
-                    stop_reason = reason.clone();
-                }
-                StreamChunk::Error { error } => {
-                    // 厂商在流里报的错：告知用户，但不当致命错误 —— 已经生成的内容照常收尾。
-                    ui.emit(UiEvent::Notice(format!("[stream] {error}")));
-                }
-                StreamChunk::BlockStop { .. } if block_open => {
-                    ui.emit(UiEvent::AssistantTextEnd);
-                    block_open = false;
-                }
-                _ => {}
-            }
-            asm.push(&ev);
+        };
+        if let Some(e) = attempt.error {
+            return Err(e);
         }
-
-        // 显式 drop 流，确保取消时立即断连。
-        drop(stream);
-
-        // 流断在半段上（被取消、或上游没发块结束）：也要封口。
-        if block_open {
-            ui.emit(UiEvent::AssistantTextEnd);
+        if let Some(error) = &attempt.upstream {
+            // 厂商在流里报的错：告知用户，但不当致命错误 —— 已经生成的内容照常收尾。
+            ui.emit(UiEvent::Notice(format!("[stream] {error}")));
         }
+        let Attempt {
+            asm,
+            stop_reason,
+            cancelled,
+            ..
+        } = attempt;
+        let stop_reason = stop_reason.unwrap_or(FinishReason::Stop);
 
         // 用量按「一次请求」算：一次请求的用量常拆成几帧下发（Claude 的 `message_start`
         // 报输入、`message_delta` 报输出，后者还可能把输入再报一遍），逐帧累加会重复计费。
@@ -447,6 +449,133 @@ pub async fn run_turn(
         thread.turns += 1;
         // 回到循环顶部，带新历史再 stream。
     }
+}
+
+/// 一次请求的结果：收到了什么、怎么收场的。
+struct Attempt {
+    /// 装配器按块序号归并增量；块间交错也能还原。
+    asm: BlockAssembler,
+    /// 上游给的结束原因。`None` = 流没有正常收尾。
+    stop_reason: Option<FinishReason>,
+    /// 被用户取消打断（已收到的块留着）。
+    cancelled: bool,
+    /// 请求没发出去、或流读到一半断了。
+    error: Option<crate::CarterError>,
+    /// 厂商在流里报的错（只有一句话，没有类别）。
+    upstream: Option<String>,
+}
+
+/// 发一次请求、把流收完，期间把正文 / 思考增量交给 `ui`。不碰历史。
+async fn stream_once(
+    provider: &dyn LlmProvider,
+    req: ChatRequest,
+    run_opts: &RunOptions,
+    ui: &mut dyn UiSink,
+    cancel: &CancelToken,
+) -> Attempt {
+    let mut out = Attempt {
+        asm: BlockAssembler::new(),
+        stop_reason: None,
+        cancelled: false,
+        error: None,
+        upstream: None,
+    };
+    // 等响应头这段也要听取消：上游迟迟不开口时，用户按了停止不能干等着。
+    let mut stream = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            out.cancelled = true;
+            return out;
+        }
+        r = provider.stream(req) => match r {
+            Ok(s) => s,
+            Err(e) => {
+                out.error = Some(e);
+                return out;
+            }
+        },
+    };
+
+    // 有一段正文 / 思考还没封口。「正文 → 思考 → 正文」要各成一段，不能粘在一起。
+    let mut block_open = false;
+
+    while let Some(ev) = {
+        // 竞速：流的下一个事件 vs 取消通知。取消即时唤醒，断开卡住的 HTTP。
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                out.cancelled = true;
+                None
+            }
+            ev = stream.next() => ev,
+        }
+    } {
+        let ev = match ev {
+            Ok(ev) => ev,
+            Err(e) => {
+                out.error = Some(e);
+                break;
+            }
+        };
+        match &ev {
+            StreamChunk::TextDelta { text, .. } => {
+                ui.emit(UiEvent::AssistantTextDelta(text.clone()));
+                block_open = true;
+            }
+            StreamChunk::ThinkingDelta { text, .. } => {
+                // 签名分片不展示给用户（对模型有用，对人没意义）。
+                if run_opts.show_thinking && !text.is_empty() {
+                    ui.emit(UiEvent::ThinkingDelta(text.clone()));
+                    block_open = true;
+                }
+            }
+            StreamChunk::Finish { reason } => {
+                out.stop_reason = Some(reason.clone());
+            }
+            StreamChunk::Error { error } => {
+                out.upstream = Some(error.clone());
+            }
+            StreamChunk::BlockStop { .. } if block_open => {
+                ui.emit(UiEvent::AssistantTextEnd);
+                block_open = false;
+            }
+            _ => {}
+        }
+        out.asm.push(&ev);
+    }
+
+    // 显式 drop 流，确保取消时立即断连。
+    drop(stream);
+
+    // 流断在半段上（被取消、出错、或上游没发块结束）：也要封口。
+    if block_open {
+        ui.emit(UiEvent::AssistantTextEnd);
+    }
+    out
+}
+
+/// 单次退避的上限。
+const MAX_RETRY_DELAY_MS: u64 = 30_000;
+/// 上游点名要等多久（`Retry-After`）时最多听它多少：再长就不是「自动重试」，
+/// 是把用户晾着了 —— 不如把错误交出去让人自己决定。
+const MAX_RETRY_AFTER_MS: u64 = 60_000;
+
+/// 第 `attempt` 次重试（从 1 起）前等多久：指数退避，上游给了 `Retry-After` 就取两者较大的。
+fn retry_delay(
+    cfg: &AgentConfig,
+    attempt: u32,
+    err: Option<&crate::CarterError>,
+) -> std::time::Duration {
+    let exp = attempt.saturating_sub(1).min(16);
+    let backoff = cfg
+        .retry_backoff_ms
+        .saturating_mul(1u64 << exp)
+        .min(MAX_RETRY_DELAY_MS);
+    let asked = err
+        .and_then(crate::CarterError::retry_after_ms)
+        .map(|ms| ms.min(MAX_RETRY_AFTER_MS))
+        .unwrap_or(0);
+    std::time::Duration::from_millis(backoff.max(asked))
 }
 
 /// 被取消的那条收尾：重置令牌、报用量、发 hook。
@@ -1422,5 +1551,274 @@ mod tests {
             .filter(|e| matches!(e, UiEvent::AssistantTextEnd))
             .count();
         assert_eq!(ends, 2);
+    }
+
+    // ---- 暂时性错误的自动重试 ----
+
+    use llm_adapt_core::{ErrorContext, LLMError};
+
+    /// 一次请求怎么收场：连不上、或给一串帧（帧里可以夹一个读流错误）。
+    enum Step {
+        Refuse(LLMError),
+        Frames(Vec<std::result::Result<StreamChunk, LLMError>>),
+    }
+
+    /// 按顺序照着 `Step` 应答的 provider。步骤用完就报错 —— 多发一次请求会露馅。
+    struct Flaky {
+        steps: Mutex<Vec<Step>>,
+        calls: Mutex<usize>,
+    }
+    impl Flaky {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: Mutex::new(steps),
+                calls: Mutex::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+    #[async_trait]
+    impl LlmProvider for Flaky {
+        async fn stream(&self, _req: ChatRequest) -> crate::Result<EventStream> {
+            *self.calls.lock().unwrap() += 1;
+            let mut steps = self.steps.lock().unwrap();
+            assert!(!steps.is_empty(), "步骤用完了：多发了一次请求");
+            match steps.remove(0) {
+                Step::Refuse(e) => Err(e.into()),
+                Step::Frames(frames) => Ok(Box::pin(futures::stream::iter(
+                    frames.into_iter().map(|f| f.map_err(Into::into)),
+                ))),
+            }
+        }
+    }
+
+    fn unavailable() -> LLMError {
+        LLMError::Provider {
+            message: "503 Service Unavailable".into(),
+            ctx: ErrorContext::retryable().with_status(503),
+        }
+    }
+
+    fn ok_frames(text: &str) -> Step {
+        Step::Frames(say(text).into_iter().map(Ok).collect())
+    }
+
+    /// 退避压到 1ms，测试不用真等。
+    fn fast_retry(max_retries: u32) -> AgentConfig {
+        AgentConfig {
+            max_retries,
+            retry_backoff_ms: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn run_flaky(
+        provider: &Flaky,
+        cfg: &AgentConfig,
+    ) -> (
+        crate::Result<(TurnOutcome, Usage)>,
+        crate::agent::Thread,
+        VecSink,
+    ) {
+        let mut thread = crate::agent::Thread::new("x");
+        thread.append_user("hi");
+        let mut sink = VecSink::default();
+        let out = run_turn(
+            &mut thread,
+            provider,
+            &model(100_000),
+            cfg,
+            &opts(),
+            &ToolRegistry::empty(),
+            &mut sink,
+            &CancelToken::new(),
+        )
+        .await;
+        (out, thread, sink)
+    }
+
+    fn retry_events(sink: &VecSink) -> Vec<(u32, u32)> {
+        sink.0
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::Retrying { attempt, max, .. } => Some((*attempt, *max)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assistant_texts(thread: &crate::agent::Thread) -> Vec<String> {
+        thread
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .flat_map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| b.as_text().map(String::from))
+            })
+            .collect()
+    }
+
+    /// 503 之后再发一次就好了：这一轮照常收尾，而不是把错误交给用户。
+    #[tokio::test]
+    async fn a_503_is_retried_and_the_turn_goes_on() {
+        let provider = Flaky::new(vec![
+            Step::Refuse(unavailable()),
+            Step::Refuse(unavailable()),
+            ok_frames("好了"),
+        ]);
+        let (out, thread, sink) = run_flaky(&provider, &fast_retry(5)).await;
+        assert!(matches!(out.unwrap().0, TurnOutcome::Assistant));
+        assert_eq!(provider.calls(), 3);
+        assert_eq!(retry_events(&sink), vec![(1, 5), (2, 5)]);
+        assert_eq!(assistant_texts(&thread), vec!["好了"]);
+    }
+
+    /// 流读到一半断了：那半截不进历史，重发之后只留完整的那一份。
+    #[tokio::test]
+    async fn a_stream_cut_midway_is_retried_without_keeping_the_partial() {
+        let provider = Flaky::new(vec![
+            Step::Frames(vec![
+                Ok(StreamChunk::text("说到一")),
+                Err(LLMError::Network {
+                    message: "connection reset".into(),
+                    // 读流时断线，这一位上游未必填对 —— 按类别也要认。
+                    ctx: ErrorContext::default(),
+                }),
+            ]),
+            ok_frames("完整的回答"),
+        ]);
+        let (out, thread, sink) = run_flaky(&provider, &fast_retry(5)).await;
+        assert!(matches!(out.unwrap().0, TurnOutcome::Assistant));
+        assert_eq!(assistant_texts(&thread), vec!["完整的回答"]);
+        // 半截正文要先封口、再报重试：宿主靠这个顺序撤掉它。
+        let order: Vec<&str> = sink
+            .0
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::AssistantTextDelta(_) => Some("delta"),
+                UiEvent::AssistantTextEnd => Some("end"),
+                UiEvent::Retrying { .. } => Some("retry"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["delta", "end", "retry", "delta", "end"]);
+    }
+
+    /// 厂商在流里报错、流也没正常收尾（Anthropic 的 overloaded_error）：同样重发。
+    #[tokio::test]
+    async fn an_in_stream_error_without_finish_is_retried() {
+        let provider = Flaky::new(vec![
+            Step::Frames(vec![Ok(StreamChunk::Error {
+                error: "Overloaded".into(),
+            })]),
+            ok_frames("ok"),
+        ]);
+        let (out, thread, sink) = run_flaky(&provider, &fast_retry(5)).await;
+        assert!(matches!(out.unwrap().0, TurnOutcome::Assistant));
+        assert_eq!(retry_events(&sink).len(), 1);
+        assert_eq!(assistant_texts(&thread), vec!["ok"]);
+    }
+
+    /// 鉴权错重发多少次都一样：只试一次，原样交出去。
+    #[tokio::test]
+    async fn hopeless_errors_are_not_retried() {
+        let provider = Flaky::new(vec![Step::Refuse(LLMError::Auth {
+            message: "bad key".into(),
+            ctx: ErrorContext::default().with_status(401),
+        })]);
+        let (out, _, sink) = run_flaky(&provider, &fast_retry(5)).await;
+        assert!(out.is_err());
+        assert_eq!(provider.calls(), 1);
+        assert!(retry_events(&sink).is_empty());
+    }
+
+    /// 额度用完还不行：把最后那次的错误交出去，一共发了 1 + max_retries 次。
+    #[tokio::test]
+    async fn gives_up_after_max_retries() {
+        let provider = Flaky::new(vec![
+            Step::Refuse(unavailable()),
+            Step::Refuse(unavailable()),
+            Step::Refuse(unavailable()),
+        ]);
+        let (out, _, sink) = run_flaky(&provider, &fast_retry(2)).await;
+        let err = out.unwrap_err();
+        assert!(err.to_string().contains("503"), "{err}");
+        assert_eq!(provider.calls(), 3);
+        assert_eq!(retry_events(&sink), vec![(1, 2), (2, 2)]);
+    }
+
+    /// `max_retries = 0` 关掉重试。
+    #[tokio::test]
+    async fn zero_max_retries_disables_retrying() {
+        let provider = Flaky::new(vec![Step::Refuse(unavailable())]);
+        let (out, _, sink) = run_flaky(&provider, &fast_retry(0)).await;
+        assert!(out.is_err());
+        assert_eq!(provider.calls(), 1);
+        assert!(retry_events(&sink).is_empty());
+    }
+
+    /// 等重试的这段也听取消：按了停止不用把退避等完。
+    #[tokio::test]
+    async fn cancelling_during_backoff_stops_at_once() {
+        let provider = Flaky::new(vec![Step::Refuse(unavailable())]);
+        let cfg = AgentConfig {
+            max_retries: 5,
+            retry_backoff_ms: 20_000,
+            ..Default::default()
+        };
+        let cancel = CancelToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            c.set();
+        });
+        let mut thread = crate::agent::Thread::new("x");
+        let mut sink = VecSink::default();
+        let (m, o, tools) = (model(100_000), opts(), ToolRegistry::empty());
+        let run = run_turn(
+            &mut thread,
+            &provider,
+            &m,
+            &cfg,
+            &o,
+            &tools,
+            &mut sink,
+            &cancel,
+        );
+        let (outcome, _) = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("取消没有打断退避")
+            .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Cancelled));
+        assert_eq!(provider.calls(), 1);
+    }
+
+    /// 退避翻倍、有上限；上游点名要等更久时听它的（也有上限）。
+    #[test]
+    fn retry_delay_backs_off_and_honours_retry_after() {
+        let cfg = AgentConfig {
+            retry_backoff_ms: 1000,
+            ..Default::default()
+        };
+        let ms = |attempt, err: Option<&crate::CarterError>| {
+            retry_delay(&cfg, attempt, err).as_millis() as u64
+        };
+        assert_eq!(ms(1, None), 1000);
+        assert_eq!(ms(2, None), 2000);
+        assert_eq!(ms(3, None), 4000);
+        assert_eq!(ms(20, None), MAX_RETRY_DELAY_MS);
+        let limited = |after| {
+            crate::CarterError::from(LLMError::RateLimit {
+                message: "slow down".into(),
+                retry_after_ms: Some(after),
+                ctx: ErrorContext::retryable().with_status(429),
+            })
+        };
+        assert_eq!(ms(1, Some(&limited(7000))), 7000);
+        assert_eq!(ms(1, Some(&limited(600_000))), MAX_RETRY_AFTER_MS);
     }
 }

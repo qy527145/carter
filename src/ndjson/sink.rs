@@ -74,6 +74,17 @@ impl UiSink for NdjsonSink {
             UiEvent::ModelChanged(model) => Event::ModelChanged { model },
             UiEvent::Divider(label) => Event::Divider { label },
             UiEvent::Idle => Event::Idle,
+            UiEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                error,
+            } => Event::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                error,
+            },
             UiEvent::TurnUsage { usage, cost, model } => Event::TurnUsage {
                 usage: WireUsage::from(&usage),
                 cost,

@@ -94,6 +94,14 @@ pub enum Event {
         call_id: String,
         agents: Vec<WireAgent>,
     },
+    /// 模型请求遇到暂时性错误，`delay_ms` 之后自动重发（第 `attempt` 次，共 `max` 次）。
+    /// 这一次请求已经发出来的 `text_delta` / `thinking_delta` 作废，host 应该撤掉。
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay_ms: u64,
+        error: String,
+    },
     /// 致命错误（一般紧随其后 carter 退出）。
     #[allow(dead_code)] // 暂未在 runner 主动构造；保留供将来 fatal error 透传给 host
     Error { message: String },
